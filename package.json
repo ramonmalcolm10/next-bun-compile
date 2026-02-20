@@ -1,0 +1,40 @@
+{
+  "name": "next-bun-compile",
+  "version": "0.0.1",
+  "description": "Next.js Build Adapter that compiles your app into a Bun single-file executable",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "next-bun-compile": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "bun build src/index.ts src/generate.ts src/compile.ts src/cli.ts --outdir dist --target node",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "next": ">=16.0.0"
+  },
+  "devDependencies": {
+    "next": "16.1.6",
+    "@types/node": "^20",
+    "typescript": "^5"
+  },
+  "keywords": ["nextjs", "bun", "compile", "standalone", "executable", "adapter"],
+  "license": "MIT",
+  "homepage": "https://github.com/ramonmalcolm10/next-bun-compile#readme",
+  "bugs": {
+    "url": "https://github.com/ramonmalcolm10/next-bun-compile/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramonmalcolm10/next-bun-compile.git"
+  }
+}
