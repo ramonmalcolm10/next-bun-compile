@@ -1,16 +1,29 @@
 import { join } from "node:path";
 import type { NextAdapter } from "next/dist/build/adapter/build-complete";
 
+// Packages that use dynamic require() calls which break in compiled binaries.
+// Users can add more via transpilePackages in their next.config.
+const knownTranspilePackages = ["pino", "pino-pretty"];
+
 const adapter: NextAdapter = {
   name: "next-bun-compile",
 
-  modifyConfig(config) {
+  modifyConfig(config, { phase }) {
+    if (phase !== "phase-production-build") return config;
+
     if (config.output !== "standalone") {
       console.warn(
         'next-bun-compile: Setting output to "standalone" (required for compilation)'
       );
       config.output = "standalone";
     }
+
+    const existing = config.transpilePackages ?? [];
+    const toAdd = knownTranspilePackages.filter((p) => !existing.includes(p));
+    if (toAdd.length > 0) {
+      config.transpilePackages = [...existing, ...toAdd];
+    }
+
     return config;
   },
 

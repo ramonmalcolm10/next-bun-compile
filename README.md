@@ -77,6 +77,29 @@ The binary is fully self-contained — static assets, public files, and the Next
 
 Some modules can't be resolved at compile time but are never reached in production (dev servers, optional dependencies). The adapter creates no-op stubs for these **only if** the real module isn't installed. If you actually use `@opentelemetry/api` or `critters`, the real package gets bundled instead.
 
+## Troubleshooting
+
+### Packages with dynamic `require()` calls (e.g. pino)
+
+Some packages like `pino` use dynamic `require()` calls internally (for worker threads, transports, etc.). Turbopack can't resolve these at build time, so they fail at runtime inside the compiled binary with errors like:
+
+```
+Failed to load external module pino-142500b1eb3f4baf: Cannot find package ...
+```
+
+**Fix:** Add the package to `transpilePackages` in your `next.config.ts`:
+
+```ts
+const nextConfig: NextConfig = {
+  transpilePackages: ["pino", "pino-pretty"],
+  experimental: {
+    adapterPath: require.resolve("next-bun-compile"),
+  },
+};
+```
+
+This forces Turbopack to fully compile the package source rather than deferring dynamic requires to runtime.
+
 ## Support
 
 If this saved you time, consider supporting the project:
