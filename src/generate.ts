@@ -103,16 +103,32 @@ export function generateEntryPoint(options: GenerateOptions): void {
     urlPath: `/${f.relativePath}`,
   }));
 
-  const allAssets = [...staticFiles, ...publicFiles];
+  // Check build context for assetPrefix — if set, static assets are served
+  // from a CDN and don't need to be embedded in the binary.
+  const ctx = JSON.parse(
+    readFileSync(join(distDir, "bun-compile-ctx.json"), "utf-8")
+  );
+  const { assetPrefix } = ctx;
+
+  const assetsToEmbed = assetPrefix
+    ? publicFiles
+    : [...staticFiles, ...publicFiles];
+
+  if (assetPrefix) {
+    console.log(
+      `next-bun-compile: assetPrefix detected — skipping ${staticFiles.length} static assets (served from CDN)`
+    );
+  }
+
   console.log(
-    `next-bun-compile: Found ${staticFiles.length} static + ${publicFiles.length} public = ${allAssets.length} assets`
+    `next-bun-compile: Embedding ${assetsToEmbed.length} assets (${assetPrefix ? "public only" : `${staticFiles.length} static + ${publicFiles.length} public`})`
   );
 
   // Generate assets.generated.js
   const imports: string[] = [];
   const mapEntries: string[] = [];
 
-  for (const asset of allAssets) {
+  for (const asset of assetsToEmbed) {
     const varName = toVarName(asset.urlPath);
     const importPath = relative(standaloneDir, asset.absolutePath).replace(
       /\\/g,
@@ -144,7 +160,7 @@ export function generateEntryPoint(options: GenerateOptions): void {
   }
 
   // Build extraction map for embedded assets
-  const assetExtractions = allAssets.map((a) => {
+  const assetExtractions = assetsToEmbed.map((a) => {
     const diskPath = a.urlPath.startsWith("/_next/static/")
       ? ".next/static/" + a.relativePath
       : "public/" + a.relativePath;
@@ -194,5 +210,4 @@ extractAssets().then(() => {
 `;
 
   writeFileSync(join(standaloneDir, "server-entry.js"), serverEntry);
-  console.log("next-bun-compile: Generated server-entry.js + assets.generated.js");
 }

@@ -62,6 +62,21 @@ The binary is fully self-contained — static assets, public files, and the Next
 | `HOSTNAME` | `0.0.0.0` | Server hostname |
 | `KEEP_ALIVE_TIMEOUT` | — | HTTP keep-alive timeout (ms) |
 
+### CDN / `assetPrefix`
+
+If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/static/`) are served from your CDN instead of the origin server. The adapter detects this automatically and skips embedding static assets in the binary — only public files are embedded. This results in a smaller binary.
+
+```ts
+const nextConfig: NextConfig = {
+  assetPrefix: "https://cdn.example.com",
+  experimental: {
+    adapterPath: require.resolve("next-bun-compile"),
+  },
+};
+```
+
+You'll need to upload `.next/static/` to your CDN separately.
+
 ## How It Works
 
 1. **Adapter hook** — `modifyConfig()` sets `output: "standalone"` automatically so you don't need to configure it

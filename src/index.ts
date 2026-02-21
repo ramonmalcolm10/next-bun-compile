@@ -38,6 +38,7 @@ const adapter: NextAdapter = {
       JSON.stringify({
         distDir: ctx.distDir,
         projectDir: ctx.projectDir,
+        assetPrefix: ctx.config.assetPrefix || "",
       })
     );
   },
