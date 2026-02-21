@@ -77,6 +77,20 @@ const nextConfig: NextConfig = {
 
 You'll need to upload `.next/static/` to your CDN separately.
 
+## Performance
+
+The compiled binary uses Bun's `--bytecode` flag to pre-compile JavaScript to bytecode at build time, skipping the parsing step at startup. Code is also minified and dead code paths (dev-only modules, non-turbo runtimes) are eliminated via `--define` flags.
+
+Benchmarks on a real Next.js app (both running on Bun's runtime):
+
+| | Standalone | Compiled Binary |
+|---|---|---|
+| **Startup** | 84ms | **45ms (1.9x faster)** |
+| **Memory (RSS)** | 60 MB | 72 MB |
+| **Size** | 91 MB (directory) | 99 MB (single file) |
+
+Startup improvements scale with codebase size — larger applications benefit more since there's more code to parse.
+
 ## How It Works
 
 1. **Adapter hook** — `modifyConfig()` sets `output: "standalone"` automatically so you don't need to configure it
