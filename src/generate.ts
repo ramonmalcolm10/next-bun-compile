@@ -94,13 +94,13 @@ export function generateEntryPoint(options: GenerateOptions): void {
   const staticDir = join(distDir, "static");
   const staticFiles = walkDir(staticDir).map((f) => ({
     ...f,
-    urlPath: `/_next/static/${f.relativePath}`,
+    urlPath: `/_next/static/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
   const publicDir = join(projectDir, "public");
   const publicFiles = walkDir(publicDir).map((f) => ({
     ...f,
-    urlPath: `/${f.relativePath}`,
+    urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
   // Check build context for assetPrefix — if set, static assets are served
