@@ -8,8 +8,8 @@ const knownTranspilePackages = ["pino", "pino-pretty"];
 const adapter: NextAdapter = {
   name: "next-bun-compile",
 
-  modifyConfig(config, { phase }) {
-    if (phase !== "phase-production-build") return config;
+  modifyConfig(config, ctx) {
+    if (ctx?.phase && ctx.phase !== "phase-production-build") return config;
 
     if (config.output !== "standalone") {
       console.warn(
