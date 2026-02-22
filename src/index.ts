@@ -9,7 +9,19 @@ const adapter: NextAdapter = {
   name: "next-bun-compile",
 
   modifyConfig(config, ctx) {
-    if (ctx?.phase && ctx.phase !== "phase-production-build") return config;
+    if (!ctx) {
+      throw new Error(
+        "next-bun-compile: Next.js 16+ is required. Please upgrade your Next.js version."
+      );
+    }
+
+    if (ctx.phase !== "phase-production-build") return config;
+
+    if (process.argv.includes("--webpack")) {
+      throw new Error(
+        "next-bun-compile: Webpack builds are not supported. Remove --webpack to use Turbopack (default)."
+      );
+    }
 
     if (config.output !== "standalone") {
       console.warn(
@@ -27,11 +39,7 @@ const adapter: NextAdapter = {
     return config;
   },
 
-  // onBuildComplete runs BEFORE standalone output is written (Next.js alpha API).
-  // We save the context so the CLI can use it, but the actual compilation
-  // must happen after `next build` finishes via the `next-bun-compile` CLI.
   async onBuildComplete(ctx) {
-    // Store build context for the CLI to pick up
     const { writeFileSync } = await import("node:fs");
     writeFileSync(
       join(ctx.distDir, "bun-compile-ctx.json"),
