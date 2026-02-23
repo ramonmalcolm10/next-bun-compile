@@ -4,10 +4,11 @@ import { join } from "node:path";
 interface CompileOptions {
   standaloneDir: string;
   outfile: string;
+  extraArgs?: string[];
 }
 
 export function compile(options: CompileOptions): void {
-  const { standaloneDir, outfile } = options;
+  const { standaloneDir, outfile, extraArgs = [] } = options;
   const entryPoint = join(standaloneDir, "server-entry.js");
 
   const args = [
@@ -26,6 +27,7 @@ export function compile(options: CompileOptions): void {
     'process.env.NEXT_RUNTIME="nodejs"',
     "--outfile",
     outfile,
+    ...extraArgs,
   ];
 
   console.log(`next-bun-compile: Compiling to ${outfile}...`);

@@ -54,6 +54,18 @@ bun run build    # Builds Next.js + compiles to ./server
 
 The binary is fully self-contained — static assets, public files, and the Next.js server are all embedded. Just copy it anywhere and run.
 
+### Cross-Compilation
+
+Any flags passed to `next-bun-compile` are forwarded to `bun build --compile`. Use `--target` to cross-compile for a different platform:
+
+```bash
+next-bun-compile --target=bun-linux-x64
+next-bun-compile --target=bun-linux-arm64
+next-bun-compile --target=bun-windows-x64
+```
+
+See the [Bun cross-compilation docs](https://bun.sh/docs/bundler/executables#cross-compile) for all available targets.
+
 ### Environment Variables
 
 | Variable | Default | Description |
