@@ -85,10 +85,40 @@ function generateStubs(standaloneDir: string): void {
   }
 }
 
+/**
+ * Patch require-hook.js so require.resolve calls don't crash in compiled binaries.
+ * Next.js eagerly resolves packages like styled-jsx at startup, which fails when
+ * there's no node_modules on disk (deployed compiled binary).
+ */
+function patchRequireHook(standaloneDir: string): void {
+  const hookPath = join(
+    standaloneDir,
+    "node_modules/next/dist/server/require-hook.js"
+  );
+  if (!existsSync(hookPath)) return;
+
+  let content = readFileSync(hookPath, "utf-8");
+
+  const target =
+    "let resolve = process.env.NEXT_MINIMAL ? __non_webpack_require__.resolve : require.resolve;";
+  if (!content.includes(target)) return;
+
+  content = content.replace(
+    target,
+    "let _resolve = process.env.NEXT_MINIMAL ? __non_webpack_require__.resolve : require.resolve;\nlet resolve = (id) => { try { return _resolve(id); } catch { return ''; } };"
+  );
+
+  writeFileSync(hookPath, content);
+  console.log(
+    "next-bun-compile: Patched require-hook.js for compiled binary compatibility"
+  );
+}
+
 export function generateEntryPoint(options: GenerateOptions): void {
   const { standaloneDir, distDir, projectDir } = options;
 
   generateStubs(standaloneDir);
+  patchRequireHook(standaloneDir);
 
   // Discover assets
   const staticDir = join(distDir, "static");
@@ -103,6 +133,13 @@ export function generateEntryPoint(options: GenerateOptions): void {
     urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
+  // Discover runtime files from standalone .next/ (BUILD_ID, manifests, server chunks)
+  const standaloneNextDir = join(standaloneDir, ".next");
+  const runtimeFiles = walkDir(standaloneNextDir).map((f) => ({
+    ...f,
+    urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
+  }));
+
   // Check build context for assetPrefix — if set, static assets are served
   // from a CDN and don't need to be embedded in the binary.
   const ctx = JSON.parse(
@@ -111,8 +148,8 @@ export function generateEntryPoint(options: GenerateOptions): void {
   const { assetPrefix } = ctx;
 
   const assetsToEmbed = assetPrefix
-    ? publicFiles
-    : [...staticFiles, ...publicFiles];
+    ? [...publicFiles, ...runtimeFiles]
+    : [...staticFiles, ...publicFiles, ...runtimeFiles];
 
   if (assetPrefix) {
     console.log(
@@ -121,7 +158,7 @@ export function generateEntryPoint(options: GenerateOptions): void {
   }
 
   console.log(
-    `next-bun-compile: Embedding ${assetsToEmbed.length} assets (${assetPrefix ? "public only" : `${staticFiles.length} static + ${publicFiles.length} public`})`
+    `next-bun-compile: Embedding ${assetsToEmbed.length} assets (${staticFiles.length} static + ${publicFiles.length} public + ${runtimeFiles.length} runtime)`
   );
 
   // Generate assets.generated.js
@@ -161,9 +198,14 @@ export function generateEntryPoint(options: GenerateOptions): void {
 
   // Build extraction map for embedded assets
   const assetExtractions = assetsToEmbed.map((a) => {
-    const diskPath = a.urlPath.startsWith("/_next/static/")
-      ? ".next/static/" + a.relativePath
-      : "public/" + a.relativePath;
+    let diskPath: string;
+    if (a.urlPath.startsWith("__runtime/")) {
+      diskPath = a.urlPath.slice("__runtime/".length);
+    } else if (a.urlPath.startsWith("/_next/static/")) {
+      diskPath = ".next/static/" + a.relativePath;
+    } else {
+      diskPath = "public/" + a.relativePath;
+    }
     return [a.urlPath, diskPath];
   });
 
