@@ -23,5 +23,5 @@ if (existsSync(ctxPath)) {
   console.log("next-bun-compile: Using build context from adapter");
 }
 
-generateEntryPoint({ standaloneDir, distDir, projectDir });
-compile({ standaloneDir, outfile: join(projectDir, "server"), extraArgs });
+const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+compile({ serverDir, outfile: join(projectDir, "server"), extraArgs });

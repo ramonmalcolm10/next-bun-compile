@@ -2,14 +2,14 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
 interface CompileOptions {
-  standaloneDir: string;
+  serverDir: string;
   outfile: string;
   extraArgs?: string[];
 }
 
 export function compile(options: CompileOptions): void {
-  const { standaloneDir, outfile, extraArgs = [] } = options;
-  const entryPoint = join(standaloneDir, "server-entry.js");
+  const { serverDir, outfile, extraArgs = [] } = options;
+  const entryPoint = join(serverDir, "server-entry.js");
 
   const args = [
     "build",

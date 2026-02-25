@@ -46,38 +46,77 @@ function toVarName(filePath: string): string {
  * module doesn't already exist — so if a user actually installs the
  * dependency (e.g. @opentelemetry/api), the real one gets bundled.
  */
+/**
+ * Find all real locations of a package inside node_modules/, including
+ * bun's hoisted `.bun/<pkg>@version/node_modules/<pkg>/` layout.
+ */
+function findPackageDirs(
+  nodeModulesDir: string,
+  pkg: string
+): string[] {
+  const dirs: string[] = [];
+
+  // Direct path: node_modules/<pkg>/
+  const direct = join(nodeModulesDir, pkg);
+  if (existsSync(direct)) dirs.push(direct);
+
+  // Bun hoisted layout: node_modules/.bun/<pkg>@*\/node_modules/<pkg>/
+  const bunDir = join(nodeModulesDir, ".bun");
+  if (existsSync(bunDir)) {
+    const scope = pkg.startsWith("@") ? pkg.split("/")[0] + "+" + pkg.split("/")[1] : pkg;
+    for (const entry of readdirSync(bunDir)) {
+      if (!entry.startsWith(scope + "@")) continue;
+      const hoisted = join(bunDir, entry, "node_modules", pkg);
+      if (existsSync(hoisted)) dirs.push(hoisted);
+    }
+  }
+
+  return dirs;
+}
+
 function generateStubs(standaloneDir: string): void {
-  const stubs: Array<{ path: string; content: string }> = [
+  const stubs: Array<{ pkg: string; subpath: string; content: string }> = [
     // Dev-only — guarded by runtime `options.dev` / `opts.dev`, not env vars
     {
-      path: "node_modules/next/dist/server/dev/next-dev-server.js",
+      pkg: "next",
+      subpath: "dist/server/dev/next-dev-server.js",
       content: "module.exports = { default: null };",
     },
     {
-      path: "node_modules/next/dist/server/lib/router-utils/setup-dev-bundler.js",
+      pkg: "next",
+      subpath: "dist/server/lib/router-utils/setup-dev-bundler.js",
       content: "module.exports = {};",
     },
     // Optional deps — loaded in try/catch or conditional require at runtime
     {
-      path: "node_modules/@opentelemetry/api/index.js",
+      pkg: "@opentelemetry/api",
+      subpath: "index.js",
       content: "throw new Error('not installed');",
     },
     {
-      path: "node_modules/critters/index.js",
+      pkg: "critters",
+      subpath: "index.js",
       content: "module.exports = {};",
     },
   ];
 
+  const nodeModulesDir = join(standaloneDir, "node_modules");
   let count = 0;
   for (const stub of stubs) {
-    const fullPath = join(standaloneDir, stub.path);
-    if (!existsSync(fullPath)) {
-      const dir = join(fullPath, "..");
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
+    const pkgDirs = findPackageDirs(nodeModulesDir, stub.pkg);
+    // If the package isn't installed at all, create stub at the default location
+    if (pkgDirs.length === 0) pkgDirs.push(join(nodeModulesDir, stub.pkg));
+
+    for (const pkgDir of pkgDirs) {
+      const fullPath = join(pkgDir, stub.subpath);
+      if (!existsSync(fullPath)) {
+        const dir = join(fullPath, "..");
+        if (!existsSync(dir)) {
+          mkdirSync(dir, { recursive: true });
+        }
+        writeFileSync(fullPath, stub.content);
+        count++;
       }
-      writeFileSync(fullPath, stub.content);
-      count++;
     }
   }
   if (count > 0) {
@@ -86,32 +125,75 @@ function generateStubs(standaloneDir: string): void {
 }
 
 /**
+ * Locate the directory containing server.js inside the standalone output.
+ * For regular projects this is standaloneDir itself. For Turborepo monorepos,
+ * Next.js nests the app (e.g. standalone/apps/web/server.js).
+ */
+function findServerDir(standaloneDir: string): string {
+  // Fast path: regular (non-monorepo) layout
+  if (existsSync(join(standaloneDir, "server.js"))) {
+    return standaloneDir;
+  }
+
+  // Monorepo layout: search subdirectories (skip node_modules)
+  function search(dir: string): string | null {
+    if (!existsSync(dir)) return null;
+    for (const entry of readdirSync(dir)) {
+      if (entry === "node_modules") continue;
+      const full = join(dir, entry);
+      if (!statSync(full).isDirectory()) continue;
+      if (existsSync(join(full, "server.js"))) return full;
+      const found = search(full);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const found = search(standaloneDir);
+  if (!found) {
+    throw new Error(
+      "next-bun-compile: Could not find server.js in standalone output"
+    );
+  }
+
+  const rel = relative(standaloneDir, found);
+  console.log(
+    `next-bun-compile: Monorepo layout detected — server.js found at ${rel}/`
+  );
+  return found;
+}
+
+/**
  * Patch require-hook.js so require.resolve calls don't crash in compiled binaries.
  * Next.js eagerly resolves packages like styled-jsx at startup, which fails when
  * there's no node_modules on disk (deployed compiled binary).
  */
 function patchRequireHook(standaloneDir: string): void {
-  const hookPath = join(
-    standaloneDir,
-    "node_modules/next/dist/server/require-hook.js"
-  );
-  if (!existsSync(hookPath)) return;
-
-  let content = readFileSync(hookPath, "utf-8");
+  const nodeModulesDir = join(standaloneDir, "node_modules");
+  const nextDirs = findPackageDirs(nodeModulesDir, "next");
 
   const target =
     "let resolve = process.env.NEXT_MINIMAL ? __non_webpack_require__.resolve : require.resolve;";
-  if (!content.includes(target)) return;
+  const replacement =
+    "let _resolve = process.env.NEXT_MINIMAL ? __non_webpack_require__.resolve : require.resolve;\nlet resolve = (id) => { try { return _resolve(id); } catch { return ''; } };";
 
-  content = content.replace(
-    target,
-    "let _resolve = process.env.NEXT_MINIMAL ? __non_webpack_require__.resolve : require.resolve;\nlet resolve = (id) => { try { return _resolve(id); } catch { return ''; } };"
-  );
+  let patched = 0;
+  for (const nextDir of nextDirs) {
+    const hookPath = join(nextDir, "dist/server/require-hook.js");
+    if (!existsSync(hookPath)) continue;
 
-  writeFileSync(hookPath, content);
-  console.log(
-    "next-bun-compile: Patched require-hook.js for compiled binary compatibility"
-  );
+    let content = readFileSync(hookPath, "utf-8");
+    if (!content.includes(target)) continue;
+
+    content = content.replace(target, replacement);
+    writeFileSync(hookPath, content);
+    patched++;
+  }
+  if (patched > 0) {
+    console.log(
+      "next-bun-compile: Patched require-hook.js for compiled binary compatibility"
+    );
+  }
 }
 
 /**
@@ -119,8 +201,11 @@ function patchRequireHook(standaloneDir: string): void {
  * then recursively trace their require() dependencies. Returns the full
  * set of files that must exist on disk for SSR and route handlers to work.
  */
-function collectExternalModules(standaloneDir: string): string[] {
-  const chunksDir = join(standaloneDir, ".next/server/chunks");
+function collectExternalModules(
+  standaloneDir: string,
+  serverDir: string
+): string[] {
+  const chunksDir = join(serverDir, ".next/server/chunks");
   if (!existsSync(chunksDir)) return [];
 
   // Scan all server chunks (SSR + route handlers) for require("next/...") references
@@ -167,8 +252,9 @@ function collectExternalModules(standaloneDir: string): string[] {
   return [...deps];
 }
 
-export function generateEntryPoint(options: GenerateOptions): void {
+export function generateEntryPoint(options: GenerateOptions): string {
   const { standaloneDir, distDir, projectDir } = options;
+  const serverDir = findServerDir(standaloneDir);
 
   generateStubs(standaloneDir);
   patchRequireHook(standaloneDir);
@@ -187,7 +273,7 @@ export function generateEntryPoint(options: GenerateOptions): void {
   }));
 
   // Discover runtime files from standalone .next/ (BUILD_ID, manifests, server chunks)
-  const standaloneNextDir = join(standaloneDir, ".next");
+  const standaloneNextDir = join(serverDir, ".next");
   const runtimeFiles = walkDir(standaloneNextDir).map((f) => ({
     ...f,
     urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
@@ -196,9 +282,9 @@ export function generateEntryPoint(options: GenerateOptions): void {
   // Copy external modules into .next/__external/ so they get embedded as
   // regular file assets (JS files in node_modules/ conflict with bun's bundler).
   // At runtime these are extracted to .next/node_modules/ for SSR chunk resolution.
-  const externalModules = collectExternalModules(standaloneDir);
+  const externalModules = collectExternalModules(standaloneDir, serverDir);
   const externalPaths = ["next/package.json", ...externalModules];
-  const externalDir = join(standaloneDir, ".next/__external");
+  const externalDir = join(serverDir, ".next/__external");
   for (const mod of externalPaths) {
     const src = join(standaloneDir, "node_modules", mod);
     if (!existsSync(src)) continue;
@@ -244,7 +330,7 @@ export function generateEntryPoint(options: GenerateOptions): void {
 
   for (const asset of assetsToEmbed) {
     const varName = toVarName(asset.urlPath);
-    const importPath = relative(standaloneDir, asset.absolutePath).replace(
+    const importPath = relative(serverDir, asset.absolutePath).replace(
       /\\/g,
       "/"
     );
@@ -255,13 +341,13 @@ export function generateEntryPoint(options: GenerateOptions): void {
   }
 
   writeFileSync(
-    join(standaloneDir, "assets.generated.js"),
+    join(serverDir, "assets.generated.js"),
     `${imports.join("\n")}\nexport const assetMap = new Map([\n${mapEntries.join("\n")}\n]);\n`
   );
 
   // Extract nextConfig from standalone server.js
   const standaloneServerSrc = readFileSync(
-    join(standaloneDir, "server.js"),
+    join(serverDir, "server.js"),
     "utf-8"
   );
   const configMatch = standaloneServerSrc.match(
@@ -328,5 +414,7 @@ extractAssets().then(() => {
 }).catch((err) => { console.error(err); process.exit(1); });
 `;
 
-  writeFileSync(join(standaloneDir, "server-entry.js"), serverEntry);
+  writeFileSync(join(serverDir, "server-entry.js"), serverEntry);
+
+  return serverDir;
 }
