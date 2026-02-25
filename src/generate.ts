@@ -115,19 +115,19 @@ function patchRequireHook(standaloneDir: string): void {
 }
 
 /**
- * Scan SSR chunks for externalRequire() calls to next/dist/* modules,
+ * Scan server chunks for externalRequire() calls to next/dist/* modules,
  * then recursively trace their require() dependencies. Returns the full
- * set of files that must exist on disk for SSR to work.
+ * set of files that must exist on disk for SSR and route handlers to work.
  */
 function collectExternalModules(standaloneDir: string): string[] {
-  const chunksDir = join(standaloneDir, ".next/server/chunks/ssr");
+  const chunksDir = join(standaloneDir, ".next/server/chunks");
   if (!existsSync(chunksDir)) return [];
 
-  // Scan all SSR chunks for require("next/...") references
+  // Scan all server chunks (SSR + route handlers) for require("next/...") references
   const seeds = new Set<string>();
-  for (const entry of readdirSync(chunksDir)) {
-    if (!entry.endsWith(".js")) continue;
-    const content = readFileSync(join(chunksDir, entry), "utf-8");
+  for (const { absolutePath } of walkDir(chunksDir)) {
+    if (!absolutePath.endsWith(".js")) continue;
+    const content = readFileSync(absolutePath, "utf-8");
     for (const match of content.matchAll(/require\("(next\/dist\/[^"]+)"\)/g)) {
       seeds.add(match[1]);
     }
