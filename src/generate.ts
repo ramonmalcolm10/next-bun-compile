@@ -114,6 +114,59 @@ function patchRequireHook(standaloneDir: string): void {
   );
 }
 
+/**
+ * Scan SSR chunks for externalRequire() calls to next/dist/* modules,
+ * then recursively trace their require() dependencies. Returns the full
+ * set of files that must exist on disk for SSR to work.
+ */
+function collectExternalModules(standaloneDir: string): string[] {
+  const chunksDir = join(standaloneDir, ".next/server/chunks/ssr");
+  if (!existsSync(chunksDir)) return [];
+
+  // Scan all SSR chunks for require("next/...") references
+  const seeds = new Set<string>();
+  for (const entry of readdirSync(chunksDir)) {
+    if (!entry.endsWith(".js")) continue;
+    const content = readFileSync(join(chunksDir, entry), "utf-8");
+    for (const match of content.matchAll(/require\("(next\/dist\/[^"]+)"\)/g)) {
+      seeds.add(match[1]);
+    }
+  }
+
+  // Recursively trace require() deps within node_modules/
+  const deps = new Set<string>();
+  function trace(file: string): void {
+    if (deps.has(file)) return;
+    let fullPath = join(standaloneDir, "node_modules", file);
+    // Resolve directories to their index file and package.json
+    if (existsSync(fullPath) && statSync(fullPath).isDirectory()) {
+      const pkgJson = join(fullPath, "package.json");
+      if (existsSync(pkgJson)) {
+        deps.add(file + "/package.json");
+      }
+      file = file + "/index.js";
+      fullPath = join(standaloneDir, "node_modules", file);
+    }
+    if (!existsSync(fullPath)) return;
+    deps.add(file);
+    const content = readFileSync(fullPath, "utf-8");
+    for (const match of content.matchAll(/require\("([^"]+)"\)/g)) {
+      const req = match[1];
+      let resolved: string | undefined;
+      if (req.startsWith(".")) {
+        resolved = join(file, "..", req).replace(/\\/g, "/");
+        if (!resolved.endsWith(".js")) resolved += ".js";
+      } else if (req.startsWith("next/")) {
+        resolved = req;
+        if (!resolved.endsWith(".js")) resolved += ".js";
+      }
+      if (resolved) trace(resolved);
+    }
+  }
+  for (const seed of seeds) trace(seed);
+  return [...deps];
+}
+
 export function generateEntryPoint(options: GenerateOptions): void {
   const { standaloneDir, distDir, projectDir } = options;
 
@@ -139,6 +192,30 @@ export function generateEntryPoint(options: GenerateOptions): void {
     ...f,
     urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
   }));
+
+  // Copy external modules into .next/__external/ so they get embedded as
+  // regular file assets (JS files in node_modules/ conflict with bun's bundler).
+  // At runtime these are extracted to .next/node_modules/ for SSR chunk resolution.
+  const externalModules = collectExternalModules(standaloneDir);
+  const externalPaths = ["next/package.json", ...externalModules];
+  const externalDir = join(standaloneDir, ".next/__external");
+  for (const mod of externalPaths) {
+    const src = join(standaloneDir, "node_modules", mod);
+    if (!existsSync(src)) continue;
+    const dest = join(externalDir, mod);
+    mkdirSync(join(dest, ".."), { recursive: true });
+    writeFileSync(dest, readFileSync(src));
+    runtimeFiles.push({
+      absolutePath: dest,
+      relativePath: `__external/${mod}`,
+      urlPath: `__runtime/.next/node_modules/${mod.replace(/\\/g, "/")}`,
+    });
+  }
+  if (externalModules.length > 0) {
+    console.log(
+      `next-bun-compile: Embedding ${externalModules.length} external modules for SSR`
+    );
+  }
 
   // Check build context for assetPrefix — if set, static assets are served
   // from a CDN and don't need to be embedded in the binary.
