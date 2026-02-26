@@ -16,7 +16,7 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "bun build src/index.ts src/generate.ts src/compile.ts src/cli.ts --outdir dist --target node",
+    "build": "bun build src/index.ts src/cli.ts --outdir dist --target node --splitting",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
