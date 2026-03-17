@@ -191,6 +191,49 @@ describe("generateEntryPoint", () => {
     ).toThrow("Could not find server.js");
   });
 
+  test("pnpm monorepo layout: stubs placed in .pnpm/ store", () => {
+    const root = join(tmpBase, "pnpm-mono");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    const pnpmNextDir =
+      "node_modules/.pnpm/next@16.1.6_react@19.2.3/node_modules/next";
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/apps/admin/server.js": MOCK_SERVER_JS,
+      ".next/standalone/apps/admin/.next/BUILD_ID": "pnpm-build",
+      ".next/standalone/apps/admin/.next/server/chunks/ssr.js": `// chunk`,
+      // pnpm hoisted layout — next lives under .pnpm/
+      [`.next/standalone/${pnpmNextDir}/package.json`]: MOCK_NEXT_PKG,
+      [`.next/standalone/${pnpmNextDir}/dist/server/require-hook.js`]: MOCK_REQUIRE_HOOK,
+      [`.next/standalone/${pnpmNextDir}/dist/server/next.js`]:
+        `require('./dev/next-dev-server');`,
+      "public/favicon.ico": "icon",
+    });
+
+    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    expect(serverDir).toBe(join(standaloneDir, "apps/admin"));
+
+    // Stubs should be created in the .pnpm/ hoisted path
+    expect(
+      existsSync(
+        join(standaloneDir, pnpmNextDir, "dist/server/dev/next-dev-server.js")
+      )
+    ).toBe(true);
+    expect(
+      existsSync(
+        join(
+          standaloneDir,
+          pnpmNextDir,
+          "dist/server/lib/router-utils/setup-dev-bundler.js"
+        )
+      )
+    ).toBe(true);
+  });
+
   test("deeply nested monorepo layout (packages/apps/web)", () => {
     const root = join(tmpBase, "deep-mono");
     const distDir = join(root, ".next");

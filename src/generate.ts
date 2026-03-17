@@ -48,7 +48,8 @@ function toVarName(filePath: string): string {
  */
 /**
  * Find all real locations of a package inside node_modules/, including
- * bun's hoisted `.bun/<pkg>@version/node_modules/<pkg>/` layout.
+ * hoisted layouts used by bun (.bun/) and pnpm (.pnpm/).
+ * Both use: node_modules/.<manager>/<pkg>@version/node_modules/<pkg>/
  */
 function findPackageDirs(
   nodeModulesDir: string,
@@ -60,13 +61,16 @@ function findPackageDirs(
   const direct = join(nodeModulesDir, pkg);
   if (existsSync(direct)) dirs.push(direct);
 
-  // Bun hoisted layout: node_modules/.bun/<pkg>@*\/node_modules/<pkg>/
-  const bunDir = join(nodeModulesDir, ".bun");
-  if (existsSync(bunDir)) {
-    const scope = pkg.startsWith("@") ? pkg.split("/")[0] + "+" + pkg.split("/")[1] : pkg;
-    for (const entry of readdirSync(bunDir)) {
-      if (!entry.startsWith(scope + "@")) continue;
-      const hoisted = join(bunDir, entry, "node_modules", pkg);
+  // Hoisted layouts (.bun/ and .pnpm/)
+  const prefix = pkg.startsWith("@")
+    ? pkg.split("/")[0] + "+" + pkg.split("/")[1]
+    : pkg;
+  for (const store of [".bun", ".pnpm"]) {
+    const storeDir = join(nodeModulesDir, store);
+    if (!existsSync(storeDir)) continue;
+    for (const entry of readdirSync(storeDir)) {
+      if (!entry.startsWith(prefix + "@")) continue;
+      const hoisted = join(storeDir, entry, "node_modules", pkg);
       if (existsSync(hoisted)) dirs.push(hoisted);
     }
   }
