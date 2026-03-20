@@ -27,13 +27,23 @@ Add the adapter to your `next.config.ts`:
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  experimental: {
-    adapterPath: require.resolve("next-bun-compile"),
-  },
+  adapterPath: require.resolve("next-bun-compile"),
 };
 
 export default nextConfig;
 ```
+
+<details>
+<summary>Using Next.js 16.1? Use the experimental config instead</summary>
+
+```ts
+const nextConfig: NextConfig = {
+  experimental: {
+    adapterPath: require.resolve("next-bun-compile"),
+  },
+};
+```
+</details>
 
 Update your build script in `package.json`:
 
@@ -81,9 +91,7 @@ If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/
 ```ts
 const nextConfig: NextConfig = {
   assetPrefix: "https://cdn.example.com",
-  experimental: {
-    adapterPath: require.resolve("next-bun-compile"),
-  },
+  adapterPath: require.resolve("next-bun-compile"),
 };
 ```
 
@@ -133,9 +141,7 @@ Failed to load external module pino-142500b1eb3f4baf: Cannot find package ...
 ```ts
 const nextConfig: NextConfig = {
   transpilePackages: ["pino", "pino-pretty"],
-  experimental: {
-    adapterPath: require.resolve("next-bun-compile"),
-  },
+  adapterPath: require.resolve("next-bun-compile"),
 };
 ```
 

@@ -201,59 +201,108 @@ function patchRequireHook(standaloneDir: string): void {
 }
 
 /**
- * Scan server chunks for externalRequire() calls to next/dist/* modules,
- * then recursively trace their require() dependencies. Returns the full
- * set of files that must exist on disk for SSR and route handlers to work.
+ * Collect all files under node_modules/ in the standalone output.
+ * Next.js standalone already tree-shakes to only what's needed at runtime.
+ * Skips .bun/.pnpm store dirs and next-bun-compile itself.
+ */
+/**
+ * Returns array of {mod, src} where mod is the canonical module path
+ * (e.g. "next/dist/server/next.js") and src is the absolute path on disk.
  */
 function collectExternalModules(
-  standaloneDir: string,
-  serverDir: string
-): string[] {
-  const chunksDir = join(serverDir, ".next/server/chunks");
-  if (!existsSync(chunksDir)) return [];
+  standaloneDir: string
+): Array<{ mod: string; src: string }> {
+  const nodeModulesDir = join(standaloneDir, "node_modules");
+  if (!existsSync(nodeModulesDir)) return [];
 
-  // Scan all server chunks (SSR + route handlers) for require("next/...") references
-  const seeds = new Set<string>();
-  for (const { absolutePath } of walkDir(chunksDir)) {
-    if (!absolutePath.endsWith(".js")) continue;
-    const content = readFileSync(absolutePath, "utf-8");
-    for (const match of content.matchAll(/require\("(next\/dist\/[^"]+)"\)/g)) {
-      seeds.add(match[1]);
+  // Collect all package directories, including those in .bun/.pnpm stores
+  const pkgRoots = new Map<string, string>(); // pkg name -> absolute path
+
+  function addPkg(name: string, path: string) {
+    if (!pkgRoots.has(name)) pkgRoots.set(name, path);
+  }
+
+  function scanDir(dir: string) {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir)) {
+      if (entry.startsWith(".") || entry === "next-bun-compile") continue;
+      const entryPath = join(dir, entry);
+      if (!statSync(entryPath).isDirectory()) continue;
+      if (entry.startsWith("@")) {
+        for (const sub of readdirSync(entryPath)) {
+          const subPath = join(entryPath, sub);
+          if (statSync(subPath).isDirectory()) addPkg(`${entry}/${sub}`, subPath);
+        }
+      } else {
+        addPkg(entry, entryPath);
+      }
     }
   }
 
-  // Recursively trace require() deps within node_modules/
-  const deps = new Set<string>();
-  function trace(file: string): void {
-    if (deps.has(file)) return;
-    let fullPath = join(standaloneDir, "node_modules", file);
-    // Resolve directories to their index file and package.json
-    if (existsSync(fullPath) && statSync(fullPath).isDirectory()) {
-      const pkgJson = join(fullPath, "package.json");
-      if (existsSync(pkgJson)) {
-        deps.add(file + "/package.json");
-      }
-      file = file + "/index.js";
-      fullPath = join(standaloneDir, "node_modules", file);
-    }
-    if (!existsSync(fullPath)) return;
-    deps.add(file);
-    const content = readFileSync(fullPath, "utf-8");
-    for (const match of content.matchAll(/require\("([^"]+)"\)/g)) {
-      const req = match[1];
-      let resolved: string | undefined;
-      if (req.startsWith(".")) {
-        resolved = join(file, "..", req).replace(/\\/g, "/");
-        if (!resolved.endsWith(".js")) resolved += ".js";
-      } else if (req.startsWith("next/")) {
-        resolved = req;
-        if (!resolved.endsWith(".js")) resolved += ".js";
-      }
-      if (resolved) trace(resolved);
+  scanDir(nodeModulesDir);
+
+  for (const store of [".bun", ".pnpm"]) {
+    const storeDir = join(nodeModulesDir, store);
+    if (!existsSync(storeDir)) continue;
+    for (const storeEntry of readdirSync(storeDir)) {
+      const nested = join(storeDir, storeEntry, "node_modules");
+      if (existsSync(nested)) scanDir(nested);
     }
   }
-  for (const seed of seeds) trace(seed);
-  return [...deps];
+
+  const results: Array<{ mod: string; src: string }> = [];
+  for (const [name, pkgPath] of pkgRoots) {
+    for (const f of walkDir(pkgPath)) {
+      results.push({
+        mod: `${name}/${f.relativePath.replace(/\\/g, "/")}`,
+        src: f.absolutePath,
+      });
+    }
+  }
+  return results;
+}
+
+/**
+ * Fix module resolution issues in standalone node_modules for bun's compiled
+ * binary, which doesn't support package.json "main" for directory requires
+ * or "exports" maps.
+ */
+function fixModuleResolution(standaloneDir: string): void {
+  const nodeModulesDir = join(standaloneDir, "node_modules");
+
+  // 1. Create index.js shims for next/dist/compiled/* packages whose
+  //    package.json "main" isn't index.js (e.g. source-map -> source-map.js)
+  for (const pkgDir of findPackageDirs(nodeModulesDir, "next")) {
+    const compiledDir = join(pkgDir, "dist/compiled");
+    if (!existsSync(compiledDir)) continue;
+    for (const entry of readdirSync(compiledDir)) {
+      const dir = join(compiledDir, entry);
+      if (!statSync(dir).isDirectory()) continue;
+      const pkgJsonPath = join(dir, "package.json");
+      const indexPath = join(dir, "index.js");
+      if (!existsSync(pkgJsonPath) || existsSync(indexPath)) continue;
+      const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
+      if (pkg.main && pkg.main !== "index.js") {
+        writeFileSync(indexPath, `module.exports = require("./${pkg.main}");`);
+      }
+    }
+  }
+
+  // 2. Create filesystem shims for packages using "exports" maps that bun's
+  //    compiled binary can't resolve (e.g. @swc/helpers/_/X -> cjs/X.cjs)
+  for (const helpersDir of findPackageDirs(nodeModulesDir, "@swc/helpers")) {
+    const cjsDir = join(helpersDir, "cjs");
+    if (!existsSync(cjsDir)) continue;
+    for (const file of readdirSync(cjsDir)) {
+      if (!file.endsWith(".cjs")) continue;
+      const name = file.slice(0, -4);
+      const shimDir = join(helpersDir, "_", name);
+      const shimFile = join(shimDir, "index.js");
+      if (existsSync(shimFile)) continue;
+      mkdirSync(shimDir, { recursive: true });
+      writeFileSync(shimFile, `module.exports = require("../../cjs/${file}");`);
+    }
+  }
 }
 
 export function generateEntryPoint(options: GenerateOptions): string {
@@ -262,6 +311,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
 
   generateStubs(standaloneDir);
   patchRequireHook(standaloneDir);
+  fixModuleResolution(standaloneDir);
 
   // Discover assets
   const staticDir = join(distDir, "static");
@@ -286,11 +336,9 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // Copy external modules into .next/__external/ so they get embedded as
   // regular file assets (JS files in node_modules/ conflict with bun's bundler).
   // At runtime these are extracted to .next/node_modules/ for SSR chunk resolution.
-  const externalModules = collectExternalModules(standaloneDir, serverDir);
-  const externalPaths = ["next/package.json", ...externalModules];
+  const externalModules = collectExternalModules(standaloneDir);
   const externalDir = join(serverDir, ".next/__external");
-  for (const mod of externalPaths) {
-    const src = join(standaloneDir, "node_modules", mod);
+  for (const { mod, src } of externalModules) {
     if (!existsSync(src)) continue;
     const dest = join(externalDir, mod);
     mkdirSync(join(dest, ".."), { recursive: true });
