@@ -27,7 +27,7 @@ Add the adapter to your `next.config.ts`:
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  adapterPath: require.resolve("next-bun-compile"),
+  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 
 export default nextConfig;
@@ -39,7 +39,7 @@ export default nextConfig;
 ```ts
 const nextConfig: NextConfig = {
   experimental: {
-    adapterPath: require.resolve("next-bun-compile"),
+    adapterPath: import.meta.resolve("next-bun-compile"),
   },
 };
 ```
@@ -91,7 +91,7 @@ If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/
 ```ts
 const nextConfig: NextConfig = {
   assetPrefix: "https://cdn.example.com",
-  adapterPath: require.resolve("next-bun-compile"),
+  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 
@@ -128,6 +128,16 @@ Some modules can't be resolved at compile time but are never reached in producti
 
 ## Troubleshooting
 
+### Stale standalone output after upgrading Next.js
+
+Next.js doesn't clean the standalone output directory between builds. If you upgrade Next.js versions, stale files from the old version can cause runtime errors like `Cannot find module 'next/dist/compiled/source-map'`.
+
+**Fix:** Clean the standalone output before rebuilding:
+
+```bash
+rm -rf .next/standalone && bun next build && next-bun-compile
+```
+
 ### Packages with dynamic `require()` calls (e.g. pino)
 
 Some packages like `pino` use dynamic `require()` calls internally (for worker threads, transports, etc.). Turbopack can't resolve these at build time, so they fail at runtime inside the compiled binary with errors like:
@@ -141,7 +151,7 @@ Failed to load external module pino-142500b1eb3f4baf: Cannot find package ...
 ```ts
 const nextConfig: NextConfig = {
   transpilePackages: ["pino", "pino-pretty"],
-  adapterPath: require.resolve("next-bun-compile"),
+  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 
