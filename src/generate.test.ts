@@ -66,8 +66,25 @@ describe("generateEntryPoint", () => {
 
     // server-entry.js should contain valid content
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain("assetMap");
     expect(entry).toContain('const nextConfig = {"env":{}}');
+    // Virtual loader: hooks Module._resolveFilename + _extensions and boots
+    // Next.js via Module.createRequire so JS/JSON modules stream from /$bunfs/
+    // without being extracted to disk
+    expect(entry).toContain("Module._resolveFilename");
+    expect(entry).toContain("Module.createRequire");
+    expect(entry).toContain("virtualMap");
+    // fs hooks for static-handler stream + readdir enumeration
+    expect(entry).toContain("createReadStream");
+    expect(entry).toContain("virtualDirs");
+    expect(entry).toContain("readdir");
+
+    // assets.generated.js should declare virtualMap + eagerExtract (.node only)
+    const assets = readFileSync(
+      join(standaloneDir, "assets.generated.js"),
+      "utf-8"
+    );
+    expect(assets).toContain("export const virtualMap");
+    expect(assets).toContain("export const eagerExtract");
   });
 
   test("monorepo layout: returns nested serverDir", () => {
@@ -104,7 +121,7 @@ describe("generateEntryPoint", () => {
 
     // server-entry.js should still have valid content
     const entry = readFileSync(join(expectedServerDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain("assetMap");
+    expect(entry).toContain("virtualMap");
     expect(entry).toContain('const nextConfig = {"env":{}}');
   });
 
@@ -137,7 +154,7 @@ describe("generateEntryPoint", () => {
     expect(assets).not.toContain("apps/web/.next/BUILD_ID");
   });
 
-  test("monorepo layout: external modules read from standalone root node_modules", () => {
+  test("monorepo layout: externals from standalone root node_modules are virtualized", () => {
     const root = join(tmpBase, "monorepo-externals");
     const distDir = join(root, ".next");
     const standaloneDir = join(distDir, "standalone");
@@ -162,15 +179,19 @@ describe("generateEntryPoint", () => {
     const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
     expect(serverDir).toBe(join(standaloneDir, "apps/web"));
 
-    // External modules should be copied into serverDir/.next/__external/
+    // External modules are NOT copied to disk — they're embedded in the
+    // virtual map at .next/node_modules/<mod> (where Next.js's chunks
+    // walking up from .next/server/ will find them through the resolver)
     expect(
-      existsSync(join(serverDir, ".next/__external/next/dist/compiled/react/index.js"))
-    ).toBe(true);
-
-    // NOT into standaloneDir/.next/__external/
-    expect(
-      existsSync(join(standaloneDir, ".next/__external"))
+      existsSync(join(serverDir, ".next/__external"))
     ).toBe(false);
+
+    const assets = readFileSync(join(serverDir, "assets.generated.js"), "utf-8");
+    expect(assets).toContain(".next/node_modules/next/dist/compiled/react/index.js");
+    expect(assets).toContain(".next/node_modules/next/package.json");
+    // Externals belong in the virtualMap, not eager/lazy extraction
+    const virtualBlock = assets.split("export const eagerExtract")[0];
+    expect(virtualBlock).toContain(".next/node_modules/next/dist/compiled/react/index.js");
   });
 
   test("throws when server.js not found anywhere", () => {

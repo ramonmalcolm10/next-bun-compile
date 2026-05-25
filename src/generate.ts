@@ -201,65 +201,52 @@ function patchRequireHook(standaloneDir: string): void {
 }
 
 /**
- * Collect all files under node_modules/ in the standalone output.
- * Next.js standalone already tree-shakes to only what's needed at runtime.
- * Skips .bun/.pnpm store dirs and next-bun-compile itself.
+ * Recursively collect every file under standaloneDir/node_modules/.
+ *
+ * Files are placed at .next/node_modules/<rel> at runtime — that's where
+ * Next.js's chunks (which live in .next/server/) walk up to find externals.
+ *
+ * Hoisted package managers (bun's .bun/, pnpm's .pnpm/) put real package
+ * files at .bun/<pkg>@<ver>/node_modules/<pkg>/ and rely on top-level
+ * symlinks. Standalone output doesn't preserve those symlinks, so we
+ * synthesize aliases: each .bun/.pnpm-stored file gets a SECOND virtual
+ * map entry at the flat top-level path. This lets our custom resolver's
+ * standard node_modules walk find packages that only physically live in
+ * the hoisted store.
  */
-/**
- * Returns array of {mod, src} where mod is the canonical module path
- * (e.g. "next/dist/server/next.js") and src is the absolute path on disk.
- */
-function collectExternalModules(
+function collectNodeModulesFiles(
   standaloneDir: string
-): Array<{ mod: string; src: string }> {
-  const nodeModulesDir = join(standaloneDir, "node_modules");
-  if (!existsSync(nodeModulesDir)) return [];
+): Array<{ absolutePath: string; relativePath: string }> {
+  const nmDir = join(standaloneDir, "node_modules");
+  if (!existsSync(nmDir)) return [];
+  const out: Array<{ absolutePath: string; relativePath: string }> = [];
+  const seen = new Set<string>();
 
-  // Collect all package directories, including those in .bun/.pnpm stores
-  const pkgRoots = new Map<string, string>(); // pkg name -> absolute path
-
-  function addPkg(name: string, path: string) {
-    if (!pkgRoots.has(name)) pkgRoots.set(name, path);
+  function add(rel: string, abs: string) {
+    if (seen.has(rel)) return;
+    seen.add(rel);
+    out.push({ absolutePath: abs, relativePath: rel });
   }
 
-  function scanDir(dir: string) {
-    if (!existsSync(dir)) return;
-    for (const entry of readdirSync(dir)) {
-      if (entry.startsWith(".") || entry === "next-bun-compile") continue;
-      const entryPath = join(dir, entry);
-      if (!statSync(entryPath).isDirectory()) continue;
-      if (entry.startsWith("@")) {
-        for (const sub of readdirSync(entryPath)) {
-          const subPath = join(entryPath, sub);
-          if (statSync(subPath).isDirectory()) addPkg(`${entry}/${sub}`, subPath);
-        }
-      } else {
-        addPkg(entry, entryPath);
-      }
-    }
+  // Pattern: .bun/<pkg>@<ver>[+...]/node_modules/<actualPath>
+  //          .pnpm/<pkg>@<ver>[+...]/node_modules/<actualPath>
+  // The bare path inside is the "logical" package location.
+  const hoistedRe = /^(?:\.bun|\.pnpm)\/[^/]+\/node_modules\/(.+)$/;
+
+  for (const f of walkDir(nmDir)) {
+    if (f.relativePath.startsWith("next-bun-compile/")) continue;
+    const rel = f.relativePath.replace(/\\/g, "/");
+
+    // Always add the literal store path (preserves any code that
+    // require()s through the explicit .bun/.pnpm path)
+    add(".next/node_modules/" + rel, f.absolutePath);
+
+    // If this is a hoisted-store entry, also expose it at the flat path
+    const m = rel.match(hoistedRe);
+    if (m) add(".next/node_modules/" + m[1], f.absolutePath);
   }
 
-  scanDir(nodeModulesDir);
-
-  for (const store of [".bun", ".pnpm"]) {
-    const storeDir = join(nodeModulesDir, store);
-    if (!existsSync(storeDir)) continue;
-    for (const storeEntry of readdirSync(storeDir)) {
-      const nested = join(storeDir, storeEntry, "node_modules");
-      if (existsSync(nested)) scanDir(nested);
-    }
-  }
-
-  const results: Array<{ mod: string; src: string }> = [];
-  for (const [name, pkgPath] of pkgRoots) {
-    for (const f of walkDir(pkgPath)) {
-      results.push({
-        mod: `${name}/${f.relativePath.replace(/\\/g, "/")}`,
-        src: f.absolutePath,
-      });
-    }
-  }
-  return results;
+  return out;
 }
 
 /**
@@ -313,75 +300,113 @@ export function generateEntryPoint(options: GenerateOptions): string {
   patchRequireHook(standaloneDir);
   fixModuleResolution(standaloneDir);
 
-  // Discover assets
-  const staticDir = join(distDir, "static");
-  const staticFiles = walkDir(staticDir).map((f) => ({
-    ...f,
-    urlPath: `/_next/static/${f.relativePath.replace(/\\/g, "/")}`,
-  }));
+  // ─── Collect every file that needs to live in the binary ───────────────
+  //
+  // Each AssetEntry has a relativePath measured from baseDir at runtime —
+  // i.e. the path the file would have if we extracted it. The virtual loader
+  // serves modules from these paths without ever writing them to disk.
+  type Asset = { absolutePath: string; relativePath: string };
+  const assets: Asset[] = [];
 
-  const publicDir = join(projectDir, "public");
-  const publicFiles = walkDir(publicDir).map((f) => ({
-    ...f,
-    urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
-  }));
-
-  // Discover runtime files from standalone .next/ (BUILD_ID, manifests, server chunks)
-  const standaloneNextDir = join(serverDir, ".next");
-  const runtimeFiles = walkDir(standaloneNextDir).map((f) => ({
-    ...f,
-    urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
-  }));
-
-  // Copy external modules into .next/__external/ so they get embedded as
-  // regular file assets (JS files in node_modules/ conflict with bun's bundler).
-  // At runtime these are extracted to .next/node_modules/ for SSR chunk resolution.
-  const externalModules = collectExternalModules(standaloneDir);
-  const externalDir = join(serverDir, ".next/__external");
-  for (const { mod, src } of externalModules) {
-    if (!existsSync(src)) continue;
-    const dest = join(externalDir, mod);
-    mkdirSync(join(dest, ".."), { recursive: true });
-    writeFileSync(dest, readFileSync(src));
-    runtimeFiles.push({
-      absolutePath: dest,
-      relativePath: `__external/${mod}`,
-      urlPath: `__runtime/.next/node_modules/${mod.replace(/\\/g, "/")}`,
+  // 1. Standalone server tree (everything under serverDir except node_modules)
+  for (const f of walkDir(serverDir)) {
+    if (
+      f.relativePath === "server.js" ||
+      f.relativePath === "server-entry.js" ||
+      f.relativePath === "assets.generated.js"
+    )
+      continue;
+    if (
+      f.relativePath === "node_modules" ||
+      f.relativePath.startsWith("node_modules/") ||
+      f.relativePath.startsWith("node_modules\\")
+    )
+      continue;
+    assets.push({
+      absolutePath: f.absolutePath,
+      relativePath: f.relativePath.replace(/\\/g, "/"),
     });
   }
-  if (externalModules.length > 0) {
-    console.log(
-      `next-bun-compile: Embedding ${externalModules.length} external modules for SSR`
-    );
+
+  // 2. node_modules → placed at .next/node_modules/ where Next.js's chunks
+  //    (under .next/server/) walk up to find externals
+  for (const f of collectNodeModulesFiles(standaloneDir)) {
+    assets.push(f);
   }
 
-  // Check build context for assetPrefix — if set, static assets are served
-  // from a CDN and don't need to be embedded in the binary.
-  const ctx = JSON.parse(
-    readFileSync(join(distDir, "bun-compile-ctx.json"), "utf-8")
-  );
-  const { assetPrefix } = ctx;
+  // 3. Static (.next/static/)
+  for (const f of walkDir(join(distDir, "static"))) {
+    assets.push({
+      absolutePath: f.absolutePath,
+      relativePath: ".next/static/" + f.relativePath.replace(/\\/g, "/"),
+    });
+  }
 
-  const assetsToEmbed = assetPrefix
-    ? [...publicFiles, ...runtimeFiles]
-    : [...staticFiles, ...publicFiles, ...runtimeFiles];
+  // 4. Public files
+  for (const f of walkDir(join(projectDir, "public"))) {
+    assets.push({
+      absolutePath: f.absolutePath,
+      relativePath: "public/" + f.relativePath.replace(/\\/g, "/"),
+    });
+  }
 
-  if (assetPrefix) {
-    console.log(
-      `next-bun-compile: assetPrefix detected — skipping ${staticFiles.length} static assets (served from CDN)`
-    );
+  // assetPrefix → static files served from CDN; skip embedding them.
+  // The adapter writes this context during build; missing it is fine —
+  // we just default to no CDN.
+  const ctxPath = join(distDir, "bun-compile-ctx.json");
+  const assetPrefix: string = existsSync(ctxPath)
+    ? JSON.parse(readFileSync(ctxPath, "utf-8")).assetPrefix || ""
+    : "";
+
+  // ─── Categorize each asset by access pattern ───────────────────────────
+  // - virtual: loaded via require()/fs hooks against /$bunfs/, never touches disk
+  // - eager: extracted before boot (.node native addons need real disk for dlopen)
+  // - lazy: extracted after server starts (HTTP-served via Next.js's `send`
+  //   module, which uses callback fs APIs that bun's compiled binary can't
+  //   serve from /$bunfs/ reliably)
+  // - skip: never needed at runtime
+  type Category = "virtual" | "eager" | "lazy" | "skip";
+  function categorize(rel: string): Category {
+    if (rel.endsWith(".map")) return "skip";
+    if (rel.endsWith(".d.ts")) return "skip";
+    if (rel.endsWith(".node")) return "eager";
+    if (rel.startsWith(".next/static/")) return "lazy";
+    if (rel.startsWith("public/")) return "lazy";
+    if (
+      rel.endsWith(".html") ||
+      rel.endsWith(".rsc") ||
+      rel.endsWith(".meta") ||
+      rel.endsWith(".body")
+    )
+      return "lazy";
+    return "virtual";
+  }
+
+  const virtualAssets: Asset[] = [];
+  const eagerAssets: Asset[] = [];
+  const lazyAssets: Asset[] = [];
+
+  for (const a of assets) {
+    if (assetPrefix && a.relativePath.startsWith(".next/static/")) continue;
+    const cat = categorize(a.relativePath);
+    if (cat === "skip") continue;
+    if (cat === "eager") eagerAssets.push(a);
+    else if (cat === "lazy") lazyAssets.push(a);
+    else virtualAssets.push(a);
   }
 
   console.log(
-    `next-bun-compile: Embedding ${assetsToEmbed.length} assets (${staticFiles.length} static + ${publicFiles.length} public + ${runtimeFiles.length} runtime)`
+    `next-bun-compile: ${virtualAssets.length} virtual, ${eagerAssets.length} eager, ${lazyAssets.length} lazy`
   );
 
-  // Generate assets.generated.js
+  // ─── Generate assets.generated.js ──────────────────────────────────────
   const imports: string[] = [];
-  const mapEntries: string[] = [];
+  const virtualEntries: string[] = [];
+  const eagerEntries: string[] = [];
+  const lazyEntries: string[] = [];
 
-  for (const asset of assetsToEmbed) {
-    const varName = toVarName(asset.urlPath);
+  function emit(asset: Asset, target: string[]) {
+    const varName = toVarName(asset.relativePath);
     const importPath = relative(serverDir, asset.absolutePath).replace(
       /\\/g,
       "/"
@@ -389,12 +414,26 @@ export function generateEntryPoint(options: GenerateOptions): string {
     imports.push(
       `import ${varName} from "./${importPath}" with { type: "file" };`
     );
-    mapEntries.push(`  ["${asset.urlPath}", ${varName}],`);
+    target.push(`  ["${asset.relativePath}", ${varName}],`);
   }
+
+  for (const a of virtualAssets) emit(a, virtualEntries);
+  for (const a of eagerAssets) emit(a, eagerEntries);
+  for (const a of lazyAssets) emit(a, lazyEntries);
 
   writeFileSync(
     join(serverDir, "assets.generated.js"),
-    `${imports.join("\n")}\nexport const assetMap = new Map([\n${mapEntries.join("\n")}\n]);\n`
+    `${imports.join("\n")}
+export const virtualMap = new Map([
+${virtualEntries.join("\n")}
+]);
+export const eagerExtract = new Map([
+${eagerEntries.join("\n")}
+]);
+export const lazyExtract = new Map([
+${lazyEntries.join("\n")}
+]);
+`
   );
 
   // Extract nextConfig from standalone server.js
@@ -411,23 +450,31 @@ export function generateEntryPoint(options: GenerateOptions): string {
     );
   }
 
-  // Build extraction map for embedded assets
-  const assetExtractions = assetsToEmbed.map((a) => {
-    let diskPath: string;
-    if (a.urlPath.startsWith("__runtime/")) {
-      diskPath = a.urlPath.slice("__runtime/".length);
-    } else if (a.urlPath.startsWith("/_next/static/")) {
-      diskPath = ".next/static/" + a.relativePath;
-    } else {
-      diskPath = "public/" + a.relativePath;
-    }
-    return [a.urlPath, diskPath];
-  });
-
-  // Generate server-entry.js
-  const serverEntry = `import { assetMap } from "./assets.generated.js";
-const path = require("path");
+  // ─── Generate server-entry.js (virtual loader) ─────────────────────────
+  //
+  // Architecture: we don't extract JS/JSON files. Instead we build a custom
+  // Node-style resolver against an in-memory map of "logical disk path →
+  // /$bunfs/ source" and load modules via Module._compile(readFileSync(vfs)).
+  //
+  // Why this works in bun's compiled binary:
+  //   - Bun's *native* require() bypasses Node's Module API (so JS hooks
+  //     don't intercept top-level require() calls)
+  //   - But Module.createRequire(...) returns a Node-compat require that DOES
+  //     go through Module._resolveFilename + Module._extensions hooks, AND
+  //     propagates them to nested requires inside loaded modules.
+  //   - fs.readFileSync works on /$bunfs/ paths, so we can stream module
+  //     source straight from the binary.
+  //
+  // Only native addons (.node) get extracted — required by process.dlopen.
+  // Everything else (JS, JSON, CSS, fonts, HTML, RSC, manifests, etc.)
+  // streams from /$bunfs/ via fs hooks: readFileSync/promises.readFile for
+  // module loading and manifests, createReadStream for HTTP-served assets,
+  // readdirSync/promises.readdir so Next.js's static-folder enumeration sees
+  // virtual files at startup.
+  const serverEntry = `import { virtualMap, eagerExtract, lazyExtract } from "./assets.generated.js";
+const Module = require("module");
 const fs = require("fs");
+const path = require("path");
 
 const baseDir = path.dirname(process.execPath);
 process.chdir(baseDir);
@@ -436,34 +483,314 @@ process.env.NODE_ENV = "production";
 const nextConfig = ${configMatch[1]};
 process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(nextConfig);
 
-const currentPort = parseInt(process.env.PORT, 10) || 3000;
-const hostname = process.env.HOSTNAME || "0.0.0.0";
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const HOST = process.env.HOSTNAME || "0.0.0.0";
 let keepAliveTimeout = parseInt(process.env.KEEP_ALIVE_TIMEOUT, 10);
 if (Number.isNaN(keepAliveTimeout) || !Number.isFinite(keepAliveTimeout) || keepAliveTimeout < 0) {
   keepAliveTimeout = undefined;
 }
 
-const extractions = ${JSON.stringify(assetExtractions)};
-async function extractAssets() {
-  let n = 0;
-  for (const [urlPath, diskPath] of extractions) {
-    const fullPath = path.join(baseDir, diskPath);
-    if (fs.existsSync(fullPath)) continue;
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    const embedded = assetMap.get(urlPath);
-    if (embedded) { await Bun.write(fullPath, Bun.file(embedded)); n++; }
+// Resolve relative virtualMap keys to absolute logical paths (baseDir-rooted).
+// Lazy-extracted files also go in moduleMap so fs hooks (createReadStream,
+// stat, readdir) can serve them from /$bunfs/ before the on-disk copy lands —
+// avoiding the race where the server is up but lazy extraction is still running.
+const moduleMap = new Map();
+for (const [rel, vfs] of virtualMap) moduleMap.set(path.join(baseDir, rel), vfs);
+for (const [rel, vfs] of lazyExtract) moduleMap.set(path.join(baseDir, rel), vfs);
+
+// Build a virtual directory tree from moduleMap keys so readdir hooks can
+// answer "what's in this dir?". Each entry tracks whether it's a file or a
+// subdirectory.
+const virtualDirs = new Map(); // dirAbsPath -> Map<basename, "file" | "dir">
+for (const filePath of moduleMap.keys()) {
+  let p = filePath;
+  while (true) {
+    const parent = path.dirname(p);
+    if (parent === p) break;
+    let entries = virtualDirs.get(parent);
+    if (!entries) { entries = new Map(); virtualDirs.set(parent, entries); }
+    const name = path.basename(p);
+    const type = p === filePath ? "file" : "dir";
+    if (!entries.has(name) || (entries.get(name) === "file" && type === "dir")) {
+      entries.set(name, type);
+    }
+    p = parent;
   }
-  if (n > 0) console.log(\`Extracted \${n} assets\`);
 }
 
-extractAssets().then(() => {
-  require("next");
-  const { startServer } = require("next/dist/server/lib/start-server");
-  return startServer({
-    dir: baseDir, isDev: false, config: nextConfig,
-    hostname, port: currentPort, allowRetry: false, keepAliveTimeout,
+// ─── Custom Node resolver against the virtual filesystem ────────────────
+function tryFile(p) {
+  if (moduleMap.has(p)) return p;
+  for (const ext of [".js", ".cjs", ".mjs", ".json"]) {
+    if (moduleMap.has(p + ext)) return p + ext;
+  }
+  return null;
+}
+function tryDir(p) {
+  const pkgPath = path.join(p, "package.json");
+  if (moduleMap.has(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(moduleMap.get(pkgPath), "utf8"));
+      const main = pkg.main || pkg.module;
+      if (main) {
+        const mainAbs = path.join(p, main);
+        const f = tryFile(mainAbs);
+        if (f) return f;
+        const d = tryDir(mainAbs);
+        if (d) return d;
+      }
+    } catch {}
+  }
+  for (const ext of [".js", ".cjs", ".mjs", ".json"]) {
+    const idx = path.join(p, "index" + ext);
+    if (moduleMap.has(idx)) return idx;
+  }
+  return null;
+}
+function resolveAny(p) { return tryFile(p) || tryDir(p); }
+
+// When parent.filename is missing (the very first call from createRequire,
+// or any module loaded outside our chain), root the walk at <baseDir>/.next.
+// Without this, the walker starts at <baseDir>, looks for <baseDir>/node_modules/<pkg>
+// (not in our virtual map) and falls through to bun's fallback resolver — which on
+// developer machines finds the host's REAL on-disk install at the project root,
+// silently hijacking the entire require chain to non-virtual files.
+const virtualRoot = path.join(baseDir, ".next");
+const DEBUG = process.env.NEXT_BUN_DEBUG === "1";
+const origResolve = Module._resolveFilename;
+Module._resolveFilename = function (request, parent, ...rest) {
+  if (typeof request !== "string" || request.startsWith("node:")) {
+    return origResolve.call(this, request, parent, ...rest);
+  }
+  if (DEBUG) console.error("[resolve]", request, "from", parent && parent.filename);
+  if (path.isAbsolute(request)) {
+    const r = resolveAny(request);
+    if (r) return r;
+  } else if (request.startsWith("./") || request.startsWith("../")) {
+    const fromDir = parent && parent.filename ? path.dirname(parent.filename) : virtualRoot;
+    const r = resolveAny(path.resolve(fromDir, request));
+    if (r) return r;
+  } else {
+    let dir = parent && parent.filename ? path.dirname(parent.filename) : virtualRoot;
+    while (true) {
+      const r = resolveAny(path.join(dir, "node_modules", request));
+      if (r) return r;
+      const next = path.dirname(dir);
+      if (next === dir) break;
+      dir = next;
+    }
+  }
+  if (DEBUG) console.error("  -> FALLBACK", request);
+  return origResolve.call(this, request, parent, ...rest);
+};
+
+// ─── Loaders ────────────────────────────────────────────────────────────
+function loadVirtual(mod, filename) {
+  const content = fs.readFileSync(moduleMap.get(filename), "utf8");
+  if (filename.endsWith(".json") || filename.endsWith(".jsonc")) {
+    mod.exports = JSON.parse(content);
+  } else {
+    mod._compile(content, filename);
+  }
+}
+const origJs = Module._extensions[".js"];
+Module._extensions[".js"] = function (mod, filename) {
+  if (moduleMap.has(filename)) return loadVirtual(mod, filename);
+  return origJs.call(this, mod, filename);
+};
+Module._extensions[".cjs"] = Module._extensions[".js"];
+Module._extensions[".mjs"] = Module._extensions[".js"];
+const origJson = Module._extensions[".json"];
+Module._extensions[".json"] = function (mod, filename) {
+  if (moduleMap.has(filename)) return loadVirtual(mod, filename);
+  return origJson.call(this, mod, filename);
+};
+
+// ─── fs hooks ───────────────────────────────────────────────────────────
+// Bun's compiled binary special-cases readFileSync/promises.readFile/statSync
+// on /$bunfs/ paths but does NOT support openSync, open, or createReadStream
+// — those fail with ENOENT. So we redirect read+stat APIs by substituting the
+// VFS path, but for stream APIs we synthesize a Node Readable backed by
+// Bun.file(vfs).stream() instead of round-tripping through fs.openSync.
+function redirect(fn) {
+  return function (p, ...rest) {
+    if (typeof p === "string" && moduleMap.has(p)) return fn.call(fs, moduleMap.get(p), ...rest);
+    return fn.call(fs, p, ...rest);
+  };
+}
+const origReadSync = fs.readFileSync;
+fs.readFileSync = redirect(origReadSync);
+fs.readFile = redirect(fs.readFile);
+fs.stat = redirect(fs.stat);
+fs.lstat = redirect(fs.lstat);
+fs.access = redirect(fs.access);
+fs.statSync = redirect(fs.statSync);
+fs.lstatSync = redirect(fs.lstatSync);
+fs.accessSync = redirect(fs.accessSync);
+fs.realpathSync = redirect(fs.realpathSync);
+const origExistsSync = fs.existsSync;
+fs.existsSync = function (p) {
+  if (typeof p === "string" && moduleMap.has(p)) return true;
+  return origExistsSync.call(fs, p);
+};
+if (fs.promises) {
+  fs.promises.readFile = redirect(fs.promises.readFile);
+  fs.promises.stat = redirect(fs.promises.stat);
+  fs.promises.lstat = redirect(fs.promises.lstat);
+  fs.promises.access = redirect(fs.promises.access);
+}
+
+// fs.createReadStream — used by Next.js's static handler to send /_next/static
+// and public/ assets. Bun.file().stream() is the only way to read /$bunfs/
+// streamingly; wrap it in a Node Readable. Also support {start,end} for HTTP
+// Range requests.
+const { Readable } = require("stream");
+const origCreateReadStream = fs.createReadStream;
+fs.createReadStream = function (p, opts) {
+  if (typeof p === "string" && moduleMap.has(p)) {
+    if (DEBUG) console.error("[stream]", p);
+    try {
+      const file = Bun.file(moduleMap.get(p));
+      const start = opts && opts.start !== undefined ? opts.start : 0;
+      const end = opts && opts.end !== undefined ? opts.end + 1 : file.size;
+      const slice = start === 0 && end === file.size ? file : file.slice(start, end);
+      return Readable.fromWeb(slice.stream());
+    } catch (e) {
+      if (DEBUG) console.error("[stream-error]", p, e);
+      throw e;
+    }
+  }
+  return origCreateReadStream.call(fs, p, opts);
+};
+
+// ─── readdir hooks ──────────────────────────────────────────────────────
+// Next.js's recursiveReadDir uses fs.promises.readdir({withFileTypes:true})
+// to enumerate static/, public/, and prerender folders at startup. Without
+// these hooks, the static handler registers nothing and every /_next/static
+// request 404s.
+function makeDirent(name, type) {
+  return {
+    name,
+    isFile: () => type === "file",
+    isDirectory: () => type === "dir",
+    isSymbolicLink: () => false,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+  };
+}
+function mergeDir(realResult, virtEntries, withFileTypes) {
+  if (!virtEntries) return realResult;
+  const real = Array.isArray(realResult) ? realResult : [];
+  if (withFileTypes) {
+    const realNames = new Set(real.map((d) => (typeof d === "string" ? d : d.name)));
+    const out = [...real];
+    for (const [name, type] of virtEntries) {
+      if (!realNames.has(name)) out.push(makeDirent(name, type));
+    }
+    return out;
+  } else {
+    const set = new Set(real);
+    for (const [name] of virtEntries) set.add(name);
+    return [...set];
+  }
+}
+const origReaddirSync = fs.readdirSync;
+fs.readdirSync = function (p, opts) {
+  const key = typeof p === "string" ? p : p.toString();
+  const virt = virtualDirs.get(key);
+  if (!virt) return origReaddirSync.call(fs, p, opts);
+  let real = [];
+  try { real = origReaddirSync.call(fs, p, opts); } catch {}
+  const wft = !!(opts && (typeof opts === "object" ? opts.withFileTypes : false));
+  return mergeDir(real, virt, wft);
+};
+const origReaddir = fs.readdir;
+fs.readdir = function (p, opts, cb) {
+  if (typeof opts === "function") { cb = opts; opts = undefined; }
+  const key = typeof p === "string" ? p : p.toString();
+  const virt = virtualDirs.get(key);
+  if (!virt) return origReaddir.call(fs, p, opts, cb);
+  origReaddir.call(fs, p, opts, (err, real) => {
+    const wft = !!(opts && typeof opts === "object" && opts.withFileTypes);
+    cb(null, mergeDir(err ? [] : real, virt, wft));
   });
-}).catch((err) => { console.error(err); process.exit(1); });
+};
+if (fs.promises && fs.promises.readdir) {
+  const origReaddirP = fs.promises.readdir;
+  fs.promises.readdir = async function (p, opts) {
+    const key = typeof p === "string" ? p : p.toString();
+    const virt = virtualDirs.get(key);
+    if (DEBUG) console.error("[readdir]", key, "virt?", !!virt, "n=", virt ? virt.size : 0);
+    if (!virt) return origReaddirP.call(fs.promises, p, opts);
+    let real = [];
+    try { real = await origReaddirP.call(fs.promises, p, opts); } catch {}
+    const wft = !!(opts && typeof opts === "object" && opts.withFileTypes);
+    return mergeDir(real, virt, wft);
+  };
+}
+
+// ─── Eager extraction (.node native modules — must be on disk for dlopen) ─
+for (const [rel, vfs] of eagerExtract) {
+  const dest = path.join(baseDir, rel);
+  if (!fs.existsSync(dest)) {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, fs.readFileSync(vfs));
+  }
+}
+
+// Surface request-time errors that Next.js silently buries into 500s
+if (process.env.NEXT_BUN_DEBUG === "1") {
+  process.on("uncaughtException", (e) => console.error("[uncaught]", e && e.stack || e));
+  process.on("unhandledRejection", (e) => console.error("[unhandled]", e && e.stack || e));
+  // Patch console.error so even logs Next.js sends elsewhere surface
+  const origStderr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = function (...a) { return origStderr(...a); };
+}
+
+// ─── Boot via Node-compat require chain ─────────────────────────────────
+// boot.js lives at <baseDir>/.next/boot.js so the resolver's walk-up finds
+// <baseDir>/.next/node_modules/* — which is where externals are virtualized
+const customRequire = Module.createRequire(path.join(baseDir, ".next/boot.js"));
+
+// Lazy extraction (HTTP-served files: static, public, html, rsc, meta, body).
+// We kick it off in parallel with Next.js boot so the boot path isn't blocked
+// on disk I/O. The marker file lets warm restarts skip extraction entirely.
+function extractLazy() {
+  if (lazyExtract.size === 0) return Promise.resolve();
+  const markerPath = path.join(baseDir, ".next-bun-extracted");
+  const binStat = fs.statSync(process.execPath);
+  const marker = binStat.mtimeMs + "|" + binStat.size + "|" + lazyExtract.size;
+  try { if (fs.readFileSync(markerPath, "utf8") === marker) return Promise.resolve(); } catch {}
+  const dirs = new Set();
+  for (const [rel] of lazyExtract) dirs.add(path.dirname(rel));
+  for (const d of dirs) fs.mkdirSync(path.join(baseDir, d), { recursive: true });
+  const tasks = [];
+  for (const [rel, vfs] of lazyExtract) {
+    tasks.push(Bun.write(path.join(baseDir, rel), Bun.file(vfs)));
+  }
+  return Promise.all(tasks).then(() => {
+    try { fs.writeFileSync(markerPath, marker); } catch {}
+  });
+}
+
+(async () => {
+  // Kick off lazy extraction in parallel — Next.js's boot doesn't need these
+  const lazyDone = extractLazy();
+  const { startServer } = customRequire("next/dist/server/lib/start-server");
+  await startServer({
+    dir: baseDir,
+    isDev: false,
+    config: nextConfig,
+    hostname: HOST,
+    port: PORT,
+    allowRetry: false,
+    keepAliveTimeout,
+  });
+  // Don't await lazyDone — server is up; extraction continues in background
+  lazyDone.catch((e) => console.error("[lazy-extract]", e));
+})().catch((err) => { console.error(err); process.exit(1); });
 `;
 
   writeFileSync(join(serverDir, "server-entry.js"), serverEntry);
