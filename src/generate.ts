@@ -5,6 +5,7 @@ import {
   readdirSync,
   statSync,
   mkdirSync,
+  type Stats,
 } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash } from "node:crypto";
@@ -13,6 +14,25 @@ interface GenerateOptions {
   standaloneDir: string;
   distDir: string;
   projectDir: string;
+}
+
+/**
+ * statSync that returns null instead of throwing on EPERM/EACCES/ENOENT.
+ * Bun's hoisted store (node_modules/.bun/<pkg>@<ver>/node_modules/<dep>) uses
+ * symlinks pointing to other entries in the same store. On Windows those
+ * targets can be locked and statSync throws EPERM (bun#4533) — leaving the
+ * symlink unwalkable. The real package files always exist at their canonical
+ * .bun/<dep>@<ver>/node_modules/<dep>/ path, so skipping the unstattable
+ * entry doesn't lose data.
+ */
+function tryStat(p: string): Stats | null {
+  try {
+    return statSync(p);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOENT") return null;
+    throw err;
+  }
 }
 
 /** Recursively collect all files under a directory */
@@ -24,7 +44,9 @@ function walkDir(
   if (!existsSync(dir)) return results;
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
-    if (statSync(full).isDirectory()) {
+    const stat = tryStat(full);
+    if (!stat) continue;
+    if (stat.isDirectory()) {
       results.push(...walkDir(full, base));
     } else {
       results.push({ absolutePath: full, relativePath: relative(base, full) });
@@ -145,7 +167,8 @@ function findServerDir(standaloneDir: string): string {
     for (const entry of readdirSync(dir)) {
       if (entry === "node_modules") continue;
       const full = join(dir, entry);
-      if (!statSync(full).isDirectory()) continue;
+      const stat = tryStat(full);
+      if (!stat || !stat.isDirectory()) continue;
       if (existsSync(join(full, "server.js"))) return full;
       const found = search(full);
       if (found) return found;
@@ -227,11 +250,13 @@ function collectExternalModules(
     for (const entry of readdirSync(dir)) {
       if (entry.startsWith(".") || entry === "next-bun-compile") continue;
       const entryPath = join(dir, entry);
-      if (!statSync(entryPath).isDirectory()) continue;
+      const stat = tryStat(entryPath);
+      if (!stat || !stat.isDirectory()) continue;
       if (entry.startsWith("@")) {
         for (const sub of readdirSync(entryPath)) {
           const subPath = join(entryPath, sub);
-          if (statSync(subPath).isDirectory()) addPkg(`${entry}/${sub}`, subPath);
+          const subStat = tryStat(subPath);
+          if (subStat && subStat.isDirectory()) addPkg(`${entry}/${sub}`, subPath);
         }
       } else {
         addPkg(entry, entryPath);
@@ -277,7 +302,8 @@ function fixModuleResolution(standaloneDir: string): void {
     if (!existsSync(compiledDir)) continue;
     for (const entry of readdirSync(compiledDir)) {
       const dir = join(compiledDir, entry);
-      if (!statSync(dir).isDirectory()) continue;
+      const stat = tryStat(dir);
+      if (!stat || !stat.isDirectory()) continue;
       const pkgJsonPath = join(dir, "package.json");
       const indexPath = join(dir, "index.js");
       if (!existsSync(pkgJsonPath) || existsSync(indexPath)) continue;

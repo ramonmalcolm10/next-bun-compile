@@ -1,5 +1,12 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { generateEntryPoint } from "./generate.js";
 
@@ -231,6 +238,54 @@ describe("generateEntryPoint", () => {
           "dist/server/lib/router-utils/setup-dev-bundler.js"
         )
       )
+    ).toBe(true);
+  });
+
+  test("tolerates unstattable symlinks in node_modules (Windows EPERM, bun#4533)", () => {
+    const root = join(tmpBase, "broken-symlink");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "sym-build",
+      ".next/standalone/.next/server/chunks/ssr.js": `// chunk`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      // The .bun hoisted store: next@<ver>/node_modules/<dep> entries are
+      // symlinks to other store entries. Simulate one whose target is missing
+      // (this throws ENOENT on stat — equivalent to Windows' EPERM on locked
+      // symlinks). The real `react` package is reachable via its canonical
+      // .bun/react@<ver>/node_modules/react/ path below.
+      ".next/standalone/node_modules/.bun/next@16.2.0/node_modules/next/package.json":
+        MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/.bun/react@19.0.0/node_modules/react/package.json":
+        JSON.stringify({ name: "react", version: "19.0.0" }),
+      ".next/standalone/node_modules/.bun/react@19.0.0/node_modules/react/index.js":
+        `module.exports = {};`,
+      "public/favicon.ico": "icon",
+    });
+
+    // Dangling symlink — points to a path that never exists
+    const reactLink = join(
+      standaloneDir,
+      "node_modules/.bun/next@16.2.0/node_modules/react"
+    );
+    symlinkSync(
+      join(standaloneDir, "node_modules/.bun/__missing__/node_modules/react"),
+      reactLink
+    );
+
+    expect(() =>
+      generateEntryPoint({ standaloneDir, distDir, projectDir })
+    ).not.toThrow();
+
+    // The real react (reachable via its canonical .bun path) still embeds
+    expect(
+      existsSync(join(standaloneDir, ".next/__external/react/index.js"))
     ).toBe(true);
   });
 
