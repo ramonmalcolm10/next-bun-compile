@@ -178,12 +178,23 @@ function generateStubs(standaloneDir: string): void {
  */
 function findTurbopackAliases(
   standaloneNextDir: string
-): Array<{ alias: string; target: string }> {
-  const seen = new Map<string, string>();
+): Array<{ alias: string; target: string; subpaths: string[] }> {
+  const seen = new Map<
+    string,
+    { target: string; subpaths: Set<string> }
+  >();
+  const ensure = (alias: string) => {
+    let e = seen.get(alias);
+    if (!e) {
+      e = { target: alias.replace(/-[0-9a-f]{16}$/, ""), subpaths: new Set() };
+      seen.set(alias, e);
+    }
+    return e;
+  };
 
   const serverDir = join(standaloneNextDir, "server");
   if (existsSync(serverDir)) {
-    const re = /["']([^"'\s/]+-[0-9a-f]{16})(?:\/[^"'\s]+)?["']/g;
+    const re = /["']([^"'\s/]+-[0-9a-f]{16})(?:\/([^"'\s]+))?["']/g;
     for (const f of walkDir(serverDir)) {
       if (!f.absolutePath.endsWith(".js")) continue;
       let content: string;
@@ -194,9 +205,8 @@ function findTurbopackAliases(
       }
       let m;
       while ((m = re.exec(content))) {
-        const alias = m[1];
-        if (seen.has(alias)) continue;
-        seen.set(alias, alias.replace(/-[0-9a-f]{16}$/, ""));
+        const entry = ensure(m[1]);
+        if (m[2]) entry.subpaths.add(m[2]);
       }
     }
   }
@@ -209,37 +219,138 @@ function findTurbopackAliases(
       const aliasPath = join(nodeModulesDir, name);
       try {
         if (!lstatSync(aliasPath).isSymbolicLink()) continue;
-        seen.set(name, basename(realpathSync(aliasPath)));
+        seen.set(name, {
+          target: basename(realpathSync(aliasPath)),
+          subpaths: new Set(),
+        });
       } catch {
         continue;
       }
     }
   }
 
-  return Array.from(seen, ([alias, target]) => ({ alias, target }));
+  return Array.from(seen, ([alias, { target, subpaths }]) => ({
+    alias,
+    target,
+    subpaths: Array.from(subpaths),
+  }));
 }
 
 /**
- * Rewrite every literal `"<alias>"` reference in the server chunks to its
- * canonical name. After this pass, the chunks no longer reference the
- * mangled aliases at all, so no `.next/node_modules/<alias>/` shim is
- * needed at runtime — the chunk's own `require(...)`/`import(...)` calls
- * resolve directly against the canonical packages extracted by
- * `collectExternalModules`.
+ * For each alias spec (top-level or subpath), determine the concrete file
+ * the canonical package would resolve to — by reading `package.json` /
+ * looking for the file with the right extension. Returns a map of
+ *   "<alias>"          → ".next/node_modules/<target>/<resolvedMain>"
+ *   "<alias>/<sub>"    → ".next/node_modules/<target>/<resolvedSub>"
+ *
+ * Used by rewriteTurbopackAliases to replace mangled-alias references in
+ * server chunks with absolute file paths (anchored on the runtime
+ * `__NBC_BASE__` placeholder), so bun's compiled-binary resolver can
+ * stat+load the file directly without any node_modules walk.
+ */
+function buildCanonicalResolutions(
+  externalRoot: string,
+  aliases: Array<{ alias: string; target: string; subpaths: string[] }>
+): Map<string, string> {
+  const out = new Map<string, string>();
+
+  const findFile = (
+    dir: string,
+    candidates: string[]
+  ): string | null => {
+    for (const c of candidates) {
+      if (!c) continue;
+      const p = join(dir, c);
+      if (existsSync(p) && statSync(p).isFile()) return c.replace(/\\/g, "/");
+    }
+    return null;
+  };
+
+  const resolveMain = (canonicalDir: string): string | null => {
+    const pkgPath = join(canonicalDir, "package.json");
+    let main = "index.js";
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+        if (typeof pkg.main === "string") main = pkg.main;
+      } catch {}
+    }
+    return findFile(canonicalDir, [
+      main,
+      main + ".js",
+      main + ".cjs",
+      main + ".mjs",
+      join(main, "index.js"),
+      join(main, "index.cjs"),
+      join(main, "index.mjs"),
+      "index.js",
+      "index.cjs",
+      "index.mjs",
+    ]);
+  };
+
+  const resolveSub = (canonicalDir: string, sub: string): string | null => {
+    const stripped = sub.replace(/\.(?:js|cjs|mjs|json)$/, "");
+    return findFile(canonicalDir, [
+      sub,
+      stripped + ".js",
+      stripped + ".mjs",
+      stripped + ".cjs",
+      stripped + ".json",
+      join(stripped, "index.js"),
+      join(stripped, "index.mjs"),
+      join(stripped, "index.cjs"),
+    ]);
+  };
+
+  for (const { alias, target, subpaths } of aliases) {
+    const canonicalDir = join(externalRoot, target);
+    if (!existsSync(canonicalDir)) continue;
+
+    const main = resolveMain(canonicalDir);
+    if (main) {
+      out.set(alias, `.next/node_modules/${target}/${main}`);
+    }
+    for (const sub of subpaths) {
+      const file = resolveSub(canonicalDir, sub);
+      if (file) {
+        out.set(`${alias}/${sub}`, `.next/node_modules/${target}/${file}`);
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Replace every literal `"<alias>"` or `"<alias>/<sub>"` reference in the
+ * server chunks with the absolute file path of the canonical target,
+ * anchored on a `__NBC_BASE__` placeholder that's substituted with the
+ * real baseDir at runtime extraction time.
+ *
+ * Why absolute paths and not canonical package names: bun's compiled-
+ * binary resolver fails to walk node_modules from server chunk locations
+ * in some Linux/Docker configurations even when the canonical package
+ * is right there on disk. Direct file paths bypass the walk entirely —
+ * bun just stats and loads the file.
  */
 function rewriteTurbopackAliases(
   standaloneNextDir: string,
-  aliases: Array<{ alias: string; target: string }>
+  aliases: Array<{ alias: string }>,
+  resolutions: Map<string, string>
 ): void {
-  if (aliases.length === 0) return;
+  if (aliases.length === 0 || resolutions.size === 0) return;
   const serverDir = join(standaloneNextDir, "server");
   if (!existsSync(serverDir)) return;
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Capture the WHOLE quoted spec — alias name or alias-name/sub/path —
+  // so we can look it up in the resolutions map and swap the literal.
   const pattern = new RegExp(
-    "([\"'])(" + aliases.map((a) => escape(a.alias)).join("|") + ")(?=[/\"'])",
+    "([\"'])((?:" +
+      aliases.map((a) => escape(a.alias)).join("|") +
+      ")(?:/[^\"']+)?)\\1",
     "g"
   );
-  const targetByAlias = new Map(aliases.map((a) => [a.alias, a.target]));
   let rewritten = 0;
   for (const f of walkDir(serverDir)) {
     if (!f.absolutePath.endsWith(".js")) continue;
@@ -249,7 +360,11 @@ function rewriteTurbopackAliases(
     } catch {
       continue;
     }
-    const next = content.replace(pattern, (_m, q, alias) => q + targetByAlias.get(alias)!);
+    const next = content.replace(pattern, (match, quote, spec) => {
+      const rel = resolutions.get(spec);
+      if (!rel) return match;
+      return `${quote}__NBC_BASE__/${rel}${quote}`;
+    });
     if (next !== content) {
       writeFileSync(f.absolutePath, next);
       rewritten++;
@@ -464,13 +579,14 @@ export function generateEntryPoint(options: GenerateOptions): string {
     urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
-  // Rewrite turbopack-mangled alias references in server chunks before
-  // anything else reads the chunks — discovery and embedding both rely on
-  // the rewritten content. After this pass the chunks reference the
-  // canonical package names directly, and no alias shim is needed.
+  // Resolve every mangled-alias reference in server chunks to the absolute
+  // file path of its canonical target. The replacement carries a
+  // `__NBC_BASE__` placeholder for baseDir, swapped in at runtime extract
+  // time. After this pass, chunks call `require("<abs path>")` directly,
+  // bypassing bun's compiled-binary node_modules walk (which fails on
+  // some Linux configurations).
   const standaloneNextDir = join(serverDir, ".next");
   const turbopackAliases = findTurbopackAliases(standaloneNextDir);
-  rewriteTurbopackAliases(standaloneNextDir, turbopackAliases);
   const aliasNames = new Set(turbopackAliases.map((a) => a.alias));
   const runtimeFiles = walkDir(standaloneNextDir)
     .filter((f) => {
@@ -506,6 +622,21 @@ export function generateEntryPoint(options: GenerateOptions): string {
       `next-bun-compile: Embedding ${externalModules.length} external modules for SSR`
     );
   }
+
+  // Discover the actual file each alias should resolve to (main from
+  // package.json for top-level, the matching .js/.mjs/.cjs file for each
+  // subpath), then rewrite the chunks to embed those absolute paths.
+  // Runs AFTER collectExternalModules so we can read the extracted
+  // canonical packages from `__external/`.
+  const canonicalResolutions = buildCanonicalResolutions(
+    externalDir,
+    turbopackAliases
+  );
+  rewriteTurbopackAliases(
+    standaloneNextDir,
+    turbopackAliases,
+    canonicalResolutions
+  );
 
   // Check build context for assetPrefix — if set, static assets are served
   // from a CDN and don't need to be embedded in the binary.
@@ -603,7 +734,20 @@ async function extractAssets() {
     if (fs.existsSync(fullPath)) continue;
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
     const embedded = assetMap.get(urlPath);
-    if (embedded) { await Bun.write(fullPath, Bun.file(embedded)); n++; }
+    if (!embedded) continue;
+    // Server chunks may contain __NBC_BASE__ placeholders injected at
+    // build time by rewriteTurbopackAliases. Substitute the real baseDir
+    // before writing so bun resolves the absolute paths at chunk load.
+    if (diskPath.startsWith(".next/server/")) {
+      const text = await Bun.file(embedded).text();
+      if (text.indexOf("__NBC_BASE__") !== -1) {
+        await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
+        n++;
+        continue;
+      }
+    }
+    await Bun.write(fullPath, Bun.file(embedded));
+    n++;
   }
   if (n > 0) console.log(\`Extracted \${n} assets\`);
 }

@@ -332,19 +332,19 @@ describe("generateEntryPoint", () => {
     // Mangled references gone
     expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
     expect(chunk).not.toContain("prettier-285d8f1d6bb5f650");
-    // Canonical references in their place
-    expect(chunk).toContain('a.x("sharp"');
-    expect(chunk).toContain('require("sharp")');
-    expect(chunk).toContain('a.y("prettier/plugins/html")');
+    // Absolute-path placeholders in their place; runtime substitutes baseDir
+    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/sharp/index.js"');
+    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/prettier/plugins/html.js"');
 
     // Canonical packages still embedded so the rewritten requires resolve
     const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
     expect(assets).toContain("sharp/index.js");
     expect(assets).toContain("prettier/plugins/html.js");
 
-    // No runtime alias map left behind
+    // Runtime extractAssets must substitute the placeholder before writing chunks
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
-    expect(entry).not.toContain("turbopackAliases");
+    expect(entry).toContain("__NBC_BASE__");
+    expect(entry).toContain(".next/server/");
   });
 
   test("discovers aliases from chunk literals even without build-time symlinks", () => {
@@ -381,7 +381,7 @@ describe("generateEntryPoint", () => {
 
     const chunk = readFileSync(join(root, chunkPath), "utf-8");
     expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
-    expect(chunk).toContain('require("sharp")');
+    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/sharp/index.js"');
   });
 
   test("deeply nested monorepo layout (packages/apps/web)", () => {
