@@ -289,107 +289,28 @@ describe("generateEntryPoint", () => {
     ).toBe(true);
   });
 
-  test("recreates turbopack mangled-alias symlinks (.next/node_modules/<pkg>-<hash>)", () => {
-    const root = join(tmpBase, "turbopack-alias");
+  test("rewrites turbopack mangled-alias references in server chunks", () => {
+    // Turbopack emits chunks that reference externalized packages by mangled
+    // names like `sharp-457ea9eae1af1a9c`. bun's compiled-binary resolver
+    // can't navigate any shim placed under `.next/node_modules/<mangled>/`,
+    // so the build rewrites the chunks themselves to point at the canonical
+    // names — `require("sharp")` instead of `require("sharp-457...")`. Then
+    // bun's standard node_modules walk from the chunk's on-disk location
+    // resolves cleanly.
+    const root = join(tmpBase, "turbopack-alias-rewrite");
     const distDir = join(root, ".next");
     const standaloneDir = join(distDir, "standalone");
     const projectDir = root;
 
+    const chunkPath =
+      ".next/standalone/.next/server/chunks/ssr/[root-of-the-server].js";
     scaffold(root, {
       ".next/bun-compile-ctx.json": MOCK_CTX,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
-      ".next/standalone/.next/BUILD_ID": "alias-build",
-      // Turbopack-compiled chunk references the mangled external name
-      ".next/standalone/.next/server/chunks/ssr.js":
-        `require("sharp-457ea9eae1af1a9c");`,
-      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
-      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
-      // Real sharp package lives in the .bun hoisted store
-      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
-        JSON.stringify({ name: "sharp", version: "0.34.5", main: "lib/index.js" }),
-      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/lib/index.js":
-        "module.exports = {};",
-      "public/favicon.ico": "icon",
-    });
-
-    // Next.js creates this symlink so the mangled require() resolves at build
-    mkdirSync(join(standaloneDir, ".next/node_modules"), { recursive: true });
-    symlinkSync(
-      "../../node_modules/.bun/sharp@0.34.5/node_modules/sharp",
-      join(standaloneDir, ".next/node_modules/sharp-457ea9eae1af1a9c"),
-      "dir"
-    );
-
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
-
-    // Canonical sharp must still be embedded (alias points to it at runtime)
-    const assets = readFileSync(join(serverDir, "assets.generated.js"), "utf-8");
-    expect(assets).toContain("sharp/lib/index.js");
-
-    // Files under the mangled-alias symlink should NOT be duplicated into the
-    // bundle — they'd double the binary footprint of every aliased package
-    expect(assets).not.toContain("sharp-457ea9eae1af1a9c/lib");
-
-    // Runtime entry must recreate the alias so require("sharp-457...") resolves
-    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp",[]]');
-  });
-
-  test("discovers turbopack aliases from chunk require() literals when symlink is absent", () => {
-    // In some Linux/Docker builds, Next.js doesn't create the
-    // .next/node_modules/<mangled> symlinks even though the emitted chunks
-    // still call require("<name>-<hash>"). Discovery must fall back to
-    // grepping the chunks themselves.
-    const root = join(tmpBase, "turbopack-alias-no-symlink");
-    const distDir = join(root, ".next");
-    const standaloneDir = join(distDir, "standalone");
-    const projectDir = root;
-
-    scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
-      ".next/static/app.js": "// static",
-      ".next/standalone/server.js": MOCK_SERVER_JS,
-      ".next/standalone/.next/BUILD_ID": "no-symlink-build",
-      // Realistic turbopack chunk shape: thunk wraps the require call
-      ".next/standalone/.next/server/chunks/ssr/page.js":
-        `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"))`,
-      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
-      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
-      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
-        JSON.stringify({ name: "sharp", version: "0.34.5", main: "lib/index.js" }),
-      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/lib/index.js":
-        "module.exports = {};",
-      "public/favicon.ico": "icon",
-    });
-
-    // NOTE: no .next/node_modules/sharp-457... symlink is created
-
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
-
-    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp",[]]');
-  });
-
-  test("collects subpath references from import()/require() in chunks", () => {
-    // Turbopack can emit subpath imports against mangled aliases, e.g.
-    // `import("prettier-285d8f1d6bb5f650/plugins/html")`. The runtime
-    // shim must materialize a file at the subpath so it resolves.
-    const root = join(tmpBase, "turbopack-alias-subpath");
-    const distDir = join(root, ".next");
-    const standaloneDir = join(distDir, "standalone");
-    const projectDir = root;
-
-    scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
-      ".next/static/app.js": "// static",
-      ".next/standalone/server.js": MOCK_SERVER_JS,
-      ".next/standalone/.next/BUILD_ID": "subpath-build",
-      // Realistic chunk shape: turbopack's runtime helpers pass mangled
-      // ids as bare strings — `a.x(...)` for externalRequire, `a.y(...)` for
-      // externalImport. No literal require()/import() wraps the id, which
-      // is the case the regex needs to handle.
-      ".next/standalone/.next/server/chunks/ssr/page.js":
+      ".next/standalone/.next/BUILD_ID": "rewrite-build",
+      // Realistic chunk shape: turbopack helpers (a.x/a.y) and a literal require
+      [chunkPath]:
         `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"));\n` +
         `let p=await a.y("prettier-285d8f1d6bb5f650/plugins/html");`,
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
@@ -405,15 +326,62 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
-    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
+    generateEntryPoint({ standaloneDir, distDir, projectDir });
 
-    // Sharp: no subpaths used
-    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp",[]]');
-    // Prettier: the html subpath was discovered
-    expect(entry).toContain(
-      '["prettier-285d8f1d6bb5f650","prettier",["plugins/html"]]'
-    );
+    const chunk = readFileSync(join(root, chunkPath), "utf-8");
+    // Mangled references gone
+    expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
+    expect(chunk).not.toContain("prettier-285d8f1d6bb5f650");
+    // Canonical references in their place
+    expect(chunk).toContain('a.x("sharp"');
+    expect(chunk).toContain('require("sharp")');
+    expect(chunk).toContain('a.y("prettier/plugins/html")');
+
+    // Canonical packages still embedded so the rewritten requires resolve
+    const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+    expect(assets).toContain("sharp/index.js");
+    expect(assets).toContain("prettier/plugins/html.js");
+
+    // No runtime alias map left behind
+    const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+    expect(entry).not.toContain("turbopackAliases");
+  });
+
+  test("discovers aliases from chunk literals even without build-time symlinks", () => {
+    // On some Linux/Docker builds, Next.js doesn't create the
+    // .next/node_modules/<mangled> symlinks. Discovery must fall back to
+    // scanning the chunks themselves; otherwise the rewrite pass produces
+    // no changes and the chunks still reference the mangled names.
+    const root = join(tmpBase, "turbopack-alias-no-symlink");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    const chunkPath = ".next/standalone/.next/server/chunks/ssr/page.js";
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "no-symlink-build",
+      [chunkPath]:
+        `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"))`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
+        JSON.stringify({ name: "sharp", main: "index.js" }),
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/index.js":
+        "module.exports = {};",
+      "public/favicon.ico": "icon",
+    });
+
+    // No `.next/node_modules/sharp-457...` symlink — discovery must come
+    // from the chunk literal scan alone.
+
+    generateEntryPoint({ standaloneDir, distDir, projectDir });
+
+    const chunk = readFileSync(join(root, chunkPath), "utf-8");
+    expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
+    expect(chunk).toContain('require("sharp")');
   });
 
   test("deeply nested monorepo layout (packages/apps/web)", () => {
