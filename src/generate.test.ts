@@ -336,6 +336,41 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp"]');
   });
 
+  test("discovers turbopack aliases from chunk require() literals when symlink is absent", () => {
+    // In some Linux/Docker builds, Next.js doesn't create the
+    // .next/node_modules/<mangled> symlinks even though the emitted chunks
+    // still call require("<name>-<hash>"). Discovery must fall back to
+    // grepping the chunks themselves.
+    const root = join(tmpBase, "turbopack-alias-no-symlink");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "no-symlink-build",
+      // Realistic turbopack chunk shape: thunk wraps the require call
+      ".next/standalone/.next/server/chunks/ssr/page.js":
+        `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"))`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
+        JSON.stringify({ name: "sharp", version: "0.34.5", main: "lib/index.js" }),
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/lib/index.js":
+        "module.exports = {};",
+      "public/favicon.ico": "icon",
+    });
+
+    // NOTE: no .next/node_modules/sharp-457... symlink is created
+
+    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+
+    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
+    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp"]');
+  });
+
   test("deeply nested monorepo layout (packages/apps/web)", () => {
     const root = join(tmpBase, "deep-mono");
     const distDir = join(root, ".next");
