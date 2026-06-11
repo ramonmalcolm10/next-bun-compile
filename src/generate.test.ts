@@ -333,7 +333,7 @@ describe("generateEntryPoint", () => {
 
     // Runtime entry must recreate the alias so require("sharp-457...") resolves
     const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp"]');
+    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp",[]]');
   });
 
   test("discovers turbopack aliases from chunk require() literals when symlink is absent", () => {
@@ -368,7 +368,52 @@ describe("generateEntryPoint", () => {
     const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
 
     const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp"]');
+    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp",[]]');
+  });
+
+  test("collects subpath references from import()/require() in chunks", () => {
+    // Turbopack can emit subpath imports against mangled aliases, e.g.
+    // `import("prettier-285d8f1d6bb5f650/plugins/html")`. The runtime
+    // shim must materialize a file at the subpath so it resolves.
+    const root = join(tmpBase, "turbopack-alias-subpath");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "subpath-build",
+      // Realistic chunk shape: turbopack's runtime helpers pass mangled
+      // ids as bare strings — `a.x(...)` for externalRequire, `a.y(...)` for
+      // externalImport. No literal require()/import() wraps the id, which
+      // is the case the regex needs to handle.
+      ".next/standalone/.next/server/chunks/ssr/page.js":
+        `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"));\n` +
+        `let p=await a.y("prettier-285d8f1d6bb5f650/plugins/html");`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
+        JSON.stringify({ name: "sharp", main: "index.js" }),
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/index.js":
+        "module.exports = {};",
+      ".next/standalone/node_modules/.bun/prettier@3.8.4/node_modules/prettier/package.json":
+        JSON.stringify({ name: "prettier" }),
+      ".next/standalone/node_modules/.bun/prettier@3.8.4/node_modules/prettier/plugins/html.js":
+        "module.exports = {};",
+      "public/favicon.ico": "icon",
+    });
+
+    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
+
+    // Sharp: no subpaths used
+    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp",[]]');
+    // Prettier: the html subpath was discovered
+    expect(entry).toContain(
+      '["prettier-285d8f1d6bb5f650","prettier",["plugins/html"]]'
+    );
   });
 
   test("deeply nested monorepo layout (packages/apps/web)", () => {

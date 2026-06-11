@@ -170,12 +170,33 @@ function generateStubs(standaloneDir: string): void {
  */
 function findTurbopackAliases(
   standaloneNextDir: string
-): Array<{ alias: string; target: string }> {
-  const seen = new Map<string, string>();
+): Array<{ alias: string; target: string; subpaths: string[] }> {
+  const seen = new Map<
+    string,
+    { target: string; subpaths: Set<string> }
+  >();
+
+  const ensure = (alias: string) => {
+    let entry = seen.get(alias);
+    if (!entry) {
+      entry = {
+        target: alias.replace(/-[0-9a-f]{16}$/, ""),
+        subpaths: new Set(),
+      };
+      seen.set(alias, entry);
+    }
+    return entry;
+  };
 
   const serverDir = join(standaloneNextDir, "server");
   if (existsSync(serverDir)) {
-    const re = /require\(["']([^"'\s/]+-[0-9a-f]{16})["']\)/g;
+    // Match any string literal of the shape `"<name>-<16 hex>[/<subpath>]"`.
+    // Turbopack passes mangled ids to its runtime helpers as bare strings
+    // (e.g. `a.y("prettier-.../plugins/html")`), so a regex anchored to
+    // `require(...)`/`import(...)` misses the externalImport call sites.
+    // The 16-hex suffix is selective enough that false positives in JS
+    // chunks are vanishingly unlikely.
+    const re = /["']([^"'\s/]+-[0-9a-f]{16})(?:\/([^"'\s]+))?["']/g;
     for (const f of walkDir(serverDir)) {
       if (!f.absolutePath.endsWith(".js")) continue;
       let content: string;
@@ -186,29 +207,35 @@ function findTurbopackAliases(
       }
       let m;
       while ((m = re.exec(content))) {
-        const alias = m[1];
-        if (seen.has(alias)) continue;
-        seen.set(alias, alias.replace(/-[0-9a-f]{16}$/, ""));
+        const entry = ensure(m[1]);
+        if (m[2]) entry.subpaths.add(m[2]);
       }
     }
   }
 
   const nodeModulesDir = join(standaloneNextDir, "node_modules");
   if (existsSync(nodeModulesDir)) {
-    for (const entry of readdirSync(nodeModulesDir)) {
-      if (!/-[0-9a-f]{16}$/.test(entry)) continue;
-      if (seen.has(entry)) continue;
-      const aliasPath = join(nodeModulesDir, entry);
+    for (const name of readdirSync(nodeModulesDir)) {
+      if (!/-[0-9a-f]{16}$/.test(name)) continue;
+      if (seen.has(name)) continue;
+      const aliasPath = join(nodeModulesDir, name);
       try {
         if (!lstatSync(aliasPath).isSymbolicLink()) continue;
-        seen.set(entry, basename(realpathSync(aliasPath)));
+        seen.set(name, {
+          target: basename(realpathSync(aliasPath)),
+          subpaths: new Set(),
+        });
       } catch {
         continue;
       }
     }
   }
 
-  return Array.from(seen, ([alias, target]) => ({ alias, target }));
+  return Array.from(seen, ([alias, { target, subpaths }]) => ({
+    alias,
+    target,
+    subpaths: Array.from(subpaths),
+  }));
 }
 
 /**
@@ -540,7 +567,7 @@ if (Number.isNaN(keepAliveTimeout) || !Number.isFinite(keepAliveTimeout) || keep
 }
 
 const extractions = ${JSON.stringify(assetExtractions)};
-const turbopackAliases = ${JSON.stringify(turbopackAliases.map((a) => [a.alias, a.target]))};
+const turbopackAliases = ${JSON.stringify(turbopackAliases.map((a) => [a.alias, a.target, a.subpaths]))};
 async function extractAssets() {
   let n = 0;
   for (const [urlPath, diskPath] of extractions) {
@@ -550,18 +577,34 @@ async function extractAssets() {
     const embedded = assetMap.get(urlPath);
     if (embedded) { await Bun.write(fullPath, Bun.file(embedded)); n++; }
   }
-  for (const [alias, target] of turbopackAliases) {
+  for (const [alias, target, subpaths] of turbopackAliases) {
     const aliasPath = path.join(baseDir, ".next/node_modules", alias);
-    if (fs.existsSync(aliasPath)) continue;
-    fs.mkdirSync(aliasPath, { recursive: true });
-    fs.writeFileSync(
-      path.join(aliasPath, "package.json"),
-      JSON.stringify({ name: alias, main: "index.js" })
-    );
-    fs.writeFileSync(
-      path.join(aliasPath, "index.js"),
-      "module.exports = require(" + JSON.stringify(target) + ");"
-    );
+    if (!fs.existsSync(aliasPath)) {
+      fs.mkdirSync(aliasPath, { recursive: true });
+      fs.writeFileSync(
+        path.join(aliasPath, "package.json"),
+        JSON.stringify({ name: alias, main: "index.js" })
+      );
+      // Relative path bypasses bun's package-name resolver, which doesn't
+      // walk up to the parent node_modules from inside an alias directory.
+      fs.writeFileSync(
+        path.join(aliasPath, "index.js"),
+        "module.exports = require(" + JSON.stringify("../" + target) + ");"
+      );
+    }
+    for (const sub of subpaths) {
+      const subKey = sub.replace(/\\.js$/, "");
+      const shimFile = path.join(aliasPath, subKey + ".js");
+      if (fs.existsSync(shimFile)) continue;
+      fs.mkdirSync(path.dirname(shimFile), { recursive: true });
+      const canonicalFile = path.join(baseDir, ".next/node_modules", target, subKey);
+      const rel = path.relative(path.dirname(shimFile), canonicalFile);
+      const spec = rel.startsWith(".") ? rel : "./" + rel;
+      fs.writeFileSync(
+        shimFile,
+        "module.exports = require(" + JSON.stringify(spec) + ");"
+      );
+    }
   }
   if (n > 0) console.log(\`Extracted \${n} assets\`);
 }
