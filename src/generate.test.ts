@@ -289,30 +289,28 @@ describe("generateEntryPoint", () => {
     ).toBe(true);
   });
 
-  test("rewrites turbopack mangled-alias references in server chunks", () => {
-    // Turbopack emits chunks that reference externalized packages by mangled
-    // names like `sharp-457ea9eae1af1a9c`. bun's compiled-binary resolver
-    // can't navigate any shim placed under `.next/node_modules/<mangled>/`,
-    // so the build rewrites the chunks themselves to point at the canonical
-    // names — `require("sharp")` instead of `require("sharp-457...")`. Then
-    // bun's standard node_modules walk from the chunk's on-disk location
-    // resolves cleanly.
-    const root = join(tmpBase, "turbopack-alias-rewrite");
+  test("injects turbopack alias→canonical map into runtime hook", () => {
+    // The runtime Module._resolveFilename hook redirects mangled aliases
+    // (`sharp-457...` → `sharp`) before resolution, so chunks calling
+    // `require("sharp-457...")` end up loading the canonical package.
+    // The build embeds the alias map for the hook to consult; chunk
+    // contents are left untouched.
+    const root = join(tmpBase, "turbopack-alias-map");
     const distDir = join(root, ".next");
     const standaloneDir = join(distDir, "standalone");
     const projectDir = root;
 
     const chunkPath =
       ".next/standalone/.next/server/chunks/ssr/[root-of-the-server].js";
+    const chunkSource =
+      `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"));\n` +
+      `let p=await a.y("prettier-285d8f1d6bb5f650/plugins/html");`;
     scaffold(root, {
       ".next/bun-compile-ctx.json": MOCK_CTX,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
-      ".next/standalone/.next/BUILD_ID": "rewrite-build",
-      // Realistic chunk shape: turbopack helpers (a.x/a.y) and a literal require
-      [chunkPath]:
-        `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"));\n` +
-        `let p=await a.y("prettier-285d8f1d6bb5f650/plugins/html");`,
+      ".next/standalone/.next/BUILD_ID": "alias-map-build",
+      [chunkPath]: chunkSource,
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
       ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
       ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
@@ -328,30 +326,27 @@ describe("generateEntryPoint", () => {
 
     generateEntryPoint({ standaloneDir, distDir, projectDir });
 
+    // Chunk content is untouched — the hook handles redirection at runtime
     const chunk = readFileSync(join(root, chunkPath), "utf-8");
-    // Mangled references gone
-    expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
-    expect(chunk).not.toContain("prettier-285d8f1d6bb5f650");
-    // Absolute-path placeholders in their place; runtime substitutes baseDir
-    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/sharp/index.js"');
-    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/prettier/plugins/html.js"');
+    expect(chunk).toBe(chunkSource);
 
-    // Canonical packages still embedded so the rewritten requires resolve
+    // Canonical packages still embedded so the redirected requires resolve
     const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
     expect(assets).toContain("sharp/index.js");
     expect(assets).toContain("prettier/plugins/html.js");
 
-    // Runtime extractAssets must substitute the placeholder before writing chunks
+    // Server entry embeds the alias map and the resolver hook
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
-    expect(entry).toContain("__NBC_BASE__");
-    expect(entry).toContain(".next/server/");
+    expect(entry).toContain("__nbcAliases");
+    expect(entry).toContain('"sharp-457ea9eae1af1a9c":"sharp"');
+    expect(entry).toContain('"prettier-285d8f1d6bb5f650":"prettier"');
+    expect(entry).toContain("Module._resolveFilename");
   });
 
   test("discovers aliases from chunk literals even without build-time symlinks", () => {
     // On some Linux/Docker builds, Next.js doesn't create the
     // .next/node_modules/<mangled> symlinks. Discovery must fall back to
-    // scanning the chunks themselves; otherwise the rewrite pass produces
-    // no changes and the chunks still reference the mangled names.
+    // scanning the chunks themselves.
     const root = join(tmpBase, "turbopack-alias-no-symlink");
     const distDir = join(root, ".next");
     const standaloneDir = join(distDir, "standalone");
@@ -379,9 +374,8 @@ describe("generateEntryPoint", () => {
 
     generateEntryPoint({ standaloneDir, distDir, projectDir });
 
-    const chunk = readFileSync(join(root, chunkPath), "utf-8");
-    expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
-    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/sharp/index.js"');
+    const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+    expect(entry).toContain('"sharp-457ea9eae1af1a9c":"sharp"');
   });
 
   test("deeply nested monorepo layout (packages/apps/web)", () => {
