@@ -585,11 +585,13 @@ async function extractAssets() {
         path.join(aliasPath, "package.json"),
         JSON.stringify({ name: alias, main: "index.js" })
       );
-      // Relative path bypasses bun's package-name resolver, which doesn't
-      // walk up to the parent node_modules from inside an alias directory.
+      // Absolute path. bun's compiled-binary resolver won't traverse "."/".."
+      // segments out of a dynamically-written shim (presumably tied to the
+      // module's original compile-time location, not its on-disk path), so
+      // a literal absolute target is the only thing that resolves reliably.
       fs.writeFileSync(
         path.join(aliasPath, "index.js"),
-        "module.exports = require(" + JSON.stringify("../" + target) + ");"
+        "module.exports = require(" + JSON.stringify(path.join(baseDir, ".next/node_modules", target)) + ");"
       );
     }
     for (const sub of subpaths) {
@@ -597,12 +599,9 @@ async function extractAssets() {
       const shimFile = path.join(aliasPath, subKey + ".js");
       if (fs.existsSync(shimFile)) continue;
       fs.mkdirSync(path.dirname(shimFile), { recursive: true });
-      const canonicalFile = path.join(baseDir, ".next/node_modules", target, subKey);
-      const rel = path.relative(path.dirname(shimFile), canonicalFile);
-      const spec = rel.startsWith(".") ? rel : "./" + rel;
       fs.writeFileSync(
         shimFile,
-        "module.exports = require(" + JSON.stringify(spec) + ");"
+        "module.exports = require(" + JSON.stringify(path.join(baseDir, ".next/node_modules", target, subKey)) + ");"
       );
     }
   }
