@@ -711,10 +711,102 @@ export function generateEntryPoint(options: GenerateOptions): string {
   const serverEntry = `import { assetMap } from "./assets.generated.js";
 const path = require("path");
 const fs = require("fs");
+const Module = require("module");
 
 const baseDir = path.dirname(process.execPath);
 process.chdir(baseDir);
 process.env.NODE_ENV = "production";
+
+// Install a fallback Module._resolveFilename hook. bun's compiled-binary
+// resolver doesn't walk node_modules from inside a node_modules entry, so
+// once execution enters an extracted package (sharp/lib/index.js → require
+// of detect-libc, @img/sharp-linux-x64/sharp.node, etc.) bun gives up. This
+// hook runs ONLY when bun's resolver throws and reimplements Node-compatible
+// resolution from scratch — walk node_modules, read package.json main,
+// honor exports maps. Generic: every externalized package's internal deps
+// get resolved without per-package patching.
+const __nbcOrigResolveFilename = Module._resolveFilename;
+function __nbcStatFile(p) {
+  try { return fs.statSync(p).isFile() ? p : null; } catch { return null; }
+}
+function __nbcResolveMain(pkgDir, pkgJson) {
+  const main = pkgJson && typeof pkgJson.main === "string" ? pkgJson.main : "index.js";
+  return __nbcStatFile(path.join(pkgDir, main))
+    || __nbcStatFile(path.join(pkgDir, main + ".js"))
+    || __nbcStatFile(path.join(pkgDir, main + ".cjs"))
+    || __nbcStatFile(path.join(pkgDir, main + ".mjs"))
+    || __nbcStatFile(path.join(pkgDir, main, "index.js"))
+    || __nbcStatFile(path.join(pkgDir, "index.js"))
+    || __nbcStatFile(path.join(pkgDir, "index.cjs"));
+}
+function __nbcResolveSubpath(pkgDir, pkgJson, sub) {
+  // Honor exports map (CJS-relevant conditions only)
+  if (pkgJson && pkgJson.exports && typeof pkgJson.exports === "object") {
+    const key = "./" + sub;
+    const entry = pkgJson.exports[key];
+    if (entry) {
+      let target = typeof entry === "string"
+        ? entry
+        : entry.require || entry.node || entry.default;
+      if (typeof target === "string" && target.startsWith("./")) {
+        const f = __nbcStatFile(path.join(pkgDir, target.slice(2)));
+        if (f) return f;
+      }
+    }
+  }
+  return __nbcStatFile(path.join(pkgDir, sub))
+    || __nbcStatFile(path.join(pkgDir, sub + ".js"))
+    || __nbcStatFile(path.join(pkgDir, sub + ".cjs"))
+    || __nbcStatFile(path.join(pkgDir, sub + ".mjs"))
+    || __nbcStatFile(path.join(pkgDir, sub + ".json"))
+    || __nbcStatFile(path.join(pkgDir, sub, "index.js"))
+    || __nbcStatFile(path.join(pkgDir, sub, "index.cjs"));
+}
+function __nbcResolvePackage(request, fromDir) {
+  let pkgName, sub = "";
+  if (request[0] === "@") {
+    const m = request.match(/^(@[^/]+\\/[^/]+)(?:\\/(.+))?$/);
+    if (!m) return null;
+    pkgName = m[1]; sub = m[2] || "";
+  } else {
+    const idx = request.indexOf("/");
+    if (idx === -1) { pkgName = request; }
+    else { pkgName = request.slice(0, idx); sub = request.slice(idx + 1); }
+  }
+  let dir = fromDir;
+  while (dir.length > 1) {
+    const pkgDir = path.join(dir, "node_modules", pkgName);
+    if (fs.existsSync(pkgDir)) {
+      let pkgJson = null;
+      const pkgJsonPath = path.join(pkgDir, "package.json");
+      if (fs.existsSync(pkgJsonPath)) {
+        try { pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8")); } catch {}
+      }
+      const resolved = sub
+        ? __nbcResolveSubpath(pkgDir, pkgJson, sub)
+        : __nbcResolveMain(pkgDir, pkgJson);
+      if (resolved) return resolved;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+Module._resolveFilename = function(request, parent, isMain, options) {
+  try {
+    return __nbcOrigResolveFilename.call(this, request, parent, isMain, options);
+  } catch (err) {
+    // Only attempt fallback for bare package specifiers
+    if (typeof request !== "string" || request[0] === "." || request[0] === "/" || /^[a-z]+:/.test(request)) {
+      throw err;
+    }
+    const fromDir = parent && parent.filename ? path.dirname(parent.filename) : process.cwd();
+    const resolved = __nbcResolvePackage(request, fromDir);
+    if (resolved) return resolved;
+    throw err;
+  }
+};
 
 const nextConfig = ${configMatch[1]};
 process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(nextConfig);
