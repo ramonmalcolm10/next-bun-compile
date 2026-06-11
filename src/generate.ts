@@ -553,20 +553,15 @@ async function extractAssets() {
   for (const [alias, target] of turbopackAliases) {
     const aliasPath = path.join(baseDir, ".next/node_modules", alias);
     if (fs.existsSync(aliasPath)) continue;
-    fs.mkdirSync(path.dirname(aliasPath), { recursive: true });
-    try {
-      fs.symlinkSync(target, aliasPath, "dir");
-    } catch {
-      fs.mkdirSync(aliasPath, { recursive: true });
-      fs.writeFileSync(
-        path.join(aliasPath, "package.json"),
-        JSON.stringify({ name: alias, main: "index.js" })
-      );
-      fs.writeFileSync(
-        path.join(aliasPath, "index.js"),
-        "module.exports = require(" + JSON.stringify(target) + ");"
-      );
-    }
+    fs.mkdirSync(aliasPath, { recursive: true });
+    fs.writeFileSync(
+      path.join(aliasPath, "package.json"),
+      JSON.stringify({ name: alias, main: "index.js" })
+    );
+    fs.writeFileSync(
+      path.join(aliasPath, "index.js"),
+      "module.exports = require(" + JSON.stringify(target) + ");"
+    );
   }
   if (n > 0) console.log(\`Extracted \${n} assets\`);
 }
