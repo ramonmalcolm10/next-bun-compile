@@ -326,11 +326,17 @@ describe("generateEntryPoint", () => {
 
     generateEntryPoint({ standaloneDir, distDir, projectDir });
 
-    // Chunk content is untouched — the hook handles redirection at runtime
+    // ESM `import()` doesn't go through the Module hook, so chunk text is
+    // rewritten to canonical names for the ESM resolver. The CJS hook
+    // still handles any require() that ends up mangled.
     const chunk = readFileSync(join(root, chunkPath), "utf-8");
-    expect(chunk).toBe(chunkSource);
+    expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
+    expect(chunk).not.toContain("prettier-285d8f1d6bb5f650");
+    expect(chunk).toContain('a.x("sharp"');
+    expect(chunk).toContain('require("sharp")');
+    expect(chunk).toContain('a.y("prettier/plugins/html")');
 
-    // Canonical packages still embedded so the redirected requires resolve
+    // Canonical packages embedded
     const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
     expect(assets).toContain("sharp/index.js");
     expect(assets).toContain("prettier/plugins/html.js");
