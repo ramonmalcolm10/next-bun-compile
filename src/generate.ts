@@ -153,33 +153,62 @@ function generateStubs(standaloneDir: string): void {
 }
 
 /**
- * Next.js with turbopack emits server chunks that reference externalized
- * packages by mangled names like `sharp-457ea9eae1af1a9c`, and creates
- * symlinks at `.next/node_modules/<mangled>` pointing to the real package
- * so `require("sharp-457...")` resolves at runtime. The compiled binary
- * has no filesystem, so the symlinks need to be recreated after asset
- * extraction; embedding the symlinked files duplicates them and isn't
- * reliable through bun's bundler.
+ * Next.js with turbopack rewrites externalized requires to mangled names,
+ * e.g. `require("sharp")` becomes `require("sharp-457ea9eae1af1a9c")` in
+ * the emitted chunks. During `next start` Next.js relies on a symlink at
+ * `.next/node_modules/<mangled> -> ../../node_modules/<real>` for those
+ * requires to resolve. The compiled binary has no node_modules tree
+ * pre-baked on disk, so the aliases need to be materialized after asset
+ * extraction.
+ *
+ * Discovery: grep server chunks for `require("<name>-<16hex>")` literals.
+ * Works regardless of whether Next.js created the `.next/node_modules/<mangled>`
+ * symlink during build — it does on macOS but not on some Linux/Docker
+ * configurations. The canonical name is the mangled name with the trailing
+ * `-<16 hex>` content hash stripped. The build-time symlink is consulted
+ * as a fallback for aliases referenced outside literal `require()` calls.
  */
 function findTurbopackAliases(
   standaloneNextDir: string
 ): Array<{ alias: string; target: string }> {
-  const nodeModulesDir = join(standaloneNextDir, "node_modules");
-  if (!existsSync(nodeModulesDir)) return [];
+  const seen = new Map<string, string>();
 
-  const aliases: Array<{ alias: string; target: string }> = [];
-  for (const entry of readdirSync(nodeModulesDir)) {
-    if (!/-[0-9a-f]{16}$/.test(entry)) continue;
-    const aliasPath = join(nodeModulesDir, entry);
-    try {
-      if (!lstatSync(aliasPath).isSymbolicLink()) continue;
-      const target = basename(realpathSync(aliasPath));
-      aliases.push({ alias: entry, target });
-    } catch {
-      continue;
+  const serverDir = join(standaloneNextDir, "server");
+  if (existsSync(serverDir)) {
+    const re = /require\(["']([^"'\s/]+-[0-9a-f]{16})["']\)/g;
+    for (const f of walkDir(serverDir)) {
+      if (!f.absolutePath.endsWith(".js")) continue;
+      let content: string;
+      try {
+        content = readFileSync(f.absolutePath, "utf-8");
+      } catch {
+        continue;
+      }
+      let m;
+      while ((m = re.exec(content))) {
+        const alias = m[1];
+        if (seen.has(alias)) continue;
+        seen.set(alias, alias.replace(/-[0-9a-f]{16}$/, ""));
+      }
     }
   }
-  return aliases;
+
+  const nodeModulesDir = join(standaloneNextDir, "node_modules");
+  if (existsSync(nodeModulesDir)) {
+    for (const entry of readdirSync(nodeModulesDir)) {
+      if (!/-[0-9a-f]{16}$/.test(entry)) continue;
+      if (seen.has(entry)) continue;
+      const aliasPath = join(nodeModulesDir, entry);
+      try {
+        if (!lstatSync(aliasPath).isSymbolicLink()) continue;
+        seen.set(entry, basename(realpathSync(aliasPath)));
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return Array.from(seen, ([alias, target]) => ({ alias, target }));
 }
 
 /**
