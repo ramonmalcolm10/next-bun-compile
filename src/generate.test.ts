@@ -289,6 +289,53 @@ describe("generateEntryPoint", () => {
     ).toBe(true);
   });
 
+  test("recreates turbopack mangled-alias symlinks (.next/node_modules/<pkg>-<hash>)", () => {
+    const root = join(tmpBase, "turbopack-alias");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "alias-build",
+      // Turbopack-compiled chunk references the mangled external name
+      ".next/standalone/.next/server/chunks/ssr.js":
+        `require("sharp-457ea9eae1af1a9c");`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      // Real sharp package lives in the .bun hoisted store
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
+        JSON.stringify({ name: "sharp", version: "0.34.5", main: "lib/index.js" }),
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/lib/index.js":
+        "module.exports = {};",
+      "public/favicon.ico": "icon",
+    });
+
+    // Next.js creates this symlink so the mangled require() resolves at build
+    mkdirSync(join(standaloneDir, ".next/node_modules"), { recursive: true });
+    symlinkSync(
+      "../../node_modules/.bun/sharp@0.34.5/node_modules/sharp",
+      join(standaloneDir, ".next/node_modules/sharp-457ea9eae1af1a9c"),
+      "dir"
+    );
+
+    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+
+    // Canonical sharp must still be embedded (alias points to it at runtime)
+    const assets = readFileSync(join(serverDir, "assets.generated.js"), "utf-8");
+    expect(assets).toContain("sharp/lib/index.js");
+
+    // Files under the mangled-alias symlink should NOT be duplicated into the
+    // bundle — they'd double the binary footprint of every aliased package
+    expect(assets).not.toContain("sharp-457ea9eae1af1a9c/lib");
+
+    // Runtime entry must recreate the alias so require("sharp-457...") resolves
+    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
+    expect(entry).toContain('["sharp-457ea9eae1af1a9c","sharp"]');
+  });
+
   test("deeply nested monorepo layout (packages/apps/web)", () => {
     const root = join(tmpBase, "deep-mono");
     const distDir = join(root, ".next");
