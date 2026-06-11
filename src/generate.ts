@@ -155,48 +155,35 @@ function generateStubs(standaloneDir: string): void {
 /**
  * Next.js with turbopack rewrites externalized requires to mangled names,
  * e.g. `require("sharp")` becomes `require("sharp-457ea9eae1af1a9c")` in
- * the emitted chunks. During `next start` Next.js relies on a symlink at
- * `.next/node_modules/<mangled> -> ../../node_modules/<real>` for those
- * requires to resolve. The compiled binary has no node_modules tree
- * pre-baked on disk, so the aliases need to be materialized after asset
- * extraction.
+ * the emitted chunks, and Next.js writes a `.next/node_modules/<mangled>`
+ * symlink so `next start` resolves them. The compiled bun binary's
+ * resolver, however, won't resolve those mangled names from any kind of
+ * shim placed in `.next/node_modules/`: relative paths, absolute paths,
+ * directory paths, and package-name lookups have all failed in different
+ * ways in the compiled-binary code path.
  *
- * Discovery: grep server chunks for `require("<name>-<16hex>")` literals.
- * Works regardless of whether Next.js created the `.next/node_modules/<mangled>`
- * symlink during build — it does on macOS but not on some Linux/Docker
- * configurations. The canonical name is the mangled name with the trailing
- * `-<16 hex>` content hash stripped. The build-time symlink is consulted
- * as a fallback for aliases referenced outside literal `require()` calls.
+ * Solution: rewrite the chunks themselves before embedding. Every literal
+ * occurrence of `"<mangled>"` and `"<mangled>/<sub>"` in the chunk text
+ * is replaced with `"<canonical>"` / `"<canonical>/<sub>"`. The chunks
+ * then call `require("sharp")` / `import("prettier/plugins/html")`
+ * directly, which bun resolves through its normal node_modules walk from
+ * the chunk's on-disk location — the same path that successfully found
+ * the alias shim in earlier iterations.
+ *
+ * Discovery: scan chunks for `"<name>-<16 hex>[/<subpath>]"` string
+ * literals. The 16-hex content hash is selective enough that false
+ * positives in JS chunks are vanishingly unlikely. Build-time symlinks
+ * in `.next/node_modules/` are consulted as a secondary source for
+ * aliases that don't show up in any string literal.
  */
 function findTurbopackAliases(
   standaloneNextDir: string
-): Array<{ alias: string; target: string; subpaths: string[] }> {
-  const seen = new Map<
-    string,
-    { target: string; subpaths: Set<string> }
-  >();
-
-  const ensure = (alias: string) => {
-    let entry = seen.get(alias);
-    if (!entry) {
-      entry = {
-        target: alias.replace(/-[0-9a-f]{16}$/, ""),
-        subpaths: new Set(),
-      };
-      seen.set(alias, entry);
-    }
-    return entry;
-  };
+): Array<{ alias: string; target: string }> {
+  const seen = new Map<string, string>();
 
   const serverDir = join(standaloneNextDir, "server");
   if (existsSync(serverDir)) {
-    // Match any string literal of the shape `"<name>-<16 hex>[/<subpath>]"`.
-    // Turbopack passes mangled ids to its runtime helpers as bare strings
-    // (e.g. `a.y("prettier-.../plugins/html")`), so a regex anchored to
-    // `require(...)`/`import(...)` misses the externalImport call sites.
-    // The 16-hex suffix is selective enough that false positives in JS
-    // chunks are vanishingly unlikely.
-    const re = /["']([^"'\s/]+-[0-9a-f]{16})(?:\/([^"'\s]+))?["']/g;
+    const re = /["']([^"'\s/]+-[0-9a-f]{16})(?:\/[^"'\s]+)?["']/g;
     for (const f of walkDir(serverDir)) {
       if (!f.absolutePath.endsWith(".js")) continue;
       let content: string;
@@ -207,8 +194,9 @@ function findTurbopackAliases(
       }
       let m;
       while ((m = re.exec(content))) {
-        const entry = ensure(m[1]);
-        if (m[2]) entry.subpaths.add(m[2]);
+        const alias = m[1];
+        if (seen.has(alias)) continue;
+        seen.set(alias, alias.replace(/-[0-9a-f]{16}$/, ""));
       }
     }
   }
@@ -221,21 +209,57 @@ function findTurbopackAliases(
       const aliasPath = join(nodeModulesDir, name);
       try {
         if (!lstatSync(aliasPath).isSymbolicLink()) continue;
-        seen.set(name, {
-          target: basename(realpathSync(aliasPath)),
-          subpaths: new Set(),
-        });
+        seen.set(name, basename(realpathSync(aliasPath)));
       } catch {
         continue;
       }
     }
   }
 
-  return Array.from(seen, ([alias, { target, subpaths }]) => ({
-    alias,
-    target,
-    subpaths: Array.from(subpaths),
-  }));
+  return Array.from(seen, ([alias, target]) => ({ alias, target }));
+}
+
+/**
+ * Rewrite every literal `"<alias>"` reference in the server chunks to its
+ * canonical name. After this pass, the chunks no longer reference the
+ * mangled aliases at all, so no `.next/node_modules/<alias>/` shim is
+ * needed at runtime — the chunk's own `require(...)`/`import(...)` calls
+ * resolve directly against the canonical packages extracted by
+ * `collectExternalModules`.
+ */
+function rewriteTurbopackAliases(
+  standaloneNextDir: string,
+  aliases: Array<{ alias: string; target: string }>
+): void {
+  if (aliases.length === 0) return;
+  const serverDir = join(standaloneNextDir, "server");
+  if (!existsSync(serverDir)) return;
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    "([\"'])(" + aliases.map((a) => escape(a.alias)).join("|") + ")(?=[/\"'])",
+    "g"
+  );
+  const targetByAlias = new Map(aliases.map((a) => [a.alias, a.target]));
+  let rewritten = 0;
+  for (const f of walkDir(serverDir)) {
+    if (!f.absolutePath.endsWith(".js")) continue;
+    let content: string;
+    try {
+      content = readFileSync(f.absolutePath, "utf-8");
+    } catch {
+      continue;
+    }
+    const next = content.replace(pattern, (_m, q, alias) => q + targetByAlias.get(alias)!);
+    if (next !== content) {
+      writeFileSync(f.absolutePath, next);
+      rewritten++;
+    }
+  }
+  if (rewritten > 0) {
+    console.log(
+      `next-bun-compile: Rewrote turbopack-mangled aliases in ${rewritten} server chunks`
+    );
+  }
 }
 
 /**
@@ -440,14 +464,19 @@ export function generateEntryPoint(options: GenerateOptions): string {
     urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
-  // Discover runtime files from standalone .next/ (BUILD_ID, manifests, server chunks).
-  // Skip files reached through turbopack's mangled-alias symlinks — we recreate
-  // those as runtime symlinks/shims instead of embedding duplicate copies.
+  // Rewrite turbopack-mangled alias references in server chunks before
+  // anything else reads the chunks — discovery and embedding both rely on
+  // the rewritten content. After this pass the chunks reference the
+  // canonical package names directly, and no alias shim is needed.
   const standaloneNextDir = join(serverDir, ".next");
   const turbopackAliases = findTurbopackAliases(standaloneNextDir);
+  rewriteTurbopackAliases(standaloneNextDir, turbopackAliases);
   const aliasNames = new Set(turbopackAliases.map((a) => a.alias));
   const runtimeFiles = walkDir(standaloneNextDir)
     .filter((f) => {
+      // Skip files reached through alias symlinks — the canonical files are
+      // already extracted by collectExternalModules, and the chunks no
+      // longer reference the alias paths after rewriteTurbopackAliases.
       const m = f.relativePath.replace(/\\/g, "/").match(/^node_modules\/([^/]+)/);
       return !(m && aliasNames.has(m[1]));
     })
@@ -567,7 +596,6 @@ if (Number.isNaN(keepAliveTimeout) || !Number.isFinite(keepAliveTimeout) || keep
 }
 
 const extractions = ${JSON.stringify(assetExtractions)};
-const turbopackAliases = ${JSON.stringify(turbopackAliases.map((a) => [a.alias, a.target, a.subpaths]))};
 async function extractAssets() {
   let n = 0;
   for (const [urlPath, diskPath] of extractions) {
@@ -576,34 +604,6 @@ async function extractAssets() {
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
     const embedded = assetMap.get(urlPath);
     if (embedded) { await Bun.write(fullPath, Bun.file(embedded)); n++; }
-  }
-  for (const [alias, target, subpaths] of turbopackAliases) {
-    const aliasPath = path.join(baseDir, ".next/node_modules", alias);
-    if (!fs.existsSync(aliasPath)) {
-      fs.mkdirSync(aliasPath, { recursive: true });
-      fs.writeFileSync(
-        path.join(aliasPath, "package.json"),
-        JSON.stringify({ name: alias, main: "index.js" })
-      );
-      // Absolute path. bun's compiled-binary resolver won't traverse "."/".."
-      // segments out of a dynamically-written shim (presumably tied to the
-      // module's original compile-time location, not its on-disk path), so
-      // a literal absolute target is the only thing that resolves reliably.
-      fs.writeFileSync(
-        path.join(aliasPath, "index.js"),
-        "module.exports = require(" + JSON.stringify(path.join(baseDir, ".next/node_modules", target)) + ");"
-      );
-    }
-    for (const sub of subpaths) {
-      const subKey = sub.replace(/\\.js$/, "");
-      const shimFile = path.join(aliasPath, subKey + ".js");
-      if (fs.existsSync(shimFile)) continue;
-      fs.mkdirSync(path.dirname(shimFile), { recursive: true });
-      fs.writeFileSync(
-        shimFile,
-        "module.exports = require(" + JSON.stringify(path.join(baseDir, ".next/node_modules", target, subKey)) + ");"
-      );
-    }
   }
   if (n > 0) console.log(\`Extracted \${n} assets\`);
 }
