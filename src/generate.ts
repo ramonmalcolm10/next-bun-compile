@@ -236,6 +236,51 @@ function findTurbopackAliases(
   }));
 }
 
+/**
+ * Rewrite every literal `"<alias>"` reference in the server chunks to the
+ * canonical name. The runtime resolver hook (see server-entry) handles
+ * the CJS path, but ESM `import()` doesn't go through Module hooks — bun's
+ * own ESM resolver runs against whatever specifier the chunk passes, and
+ * it has no knowledge of the alias→canonical mapping. Rewriting at build
+ * time ensures `import("<mangled>/sub")` becomes `import("<target>/sub")`
+ * so bun's standard ESM walk + exports-map handling can resolve it.
+ */
+function rewriteTurbopackAliases(
+  standaloneNextDir: string,
+  aliases: Array<{ alias: string; target: string }>
+): void {
+  if (aliases.length === 0) return;
+  const serverDir = join(standaloneNextDir, "server");
+  if (!existsSync(serverDir)) return;
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Match the alias name followed immediately by `/`, `"`, or `'` — guards
+  // against any longer identifier that happens to start with the alias.
+  const pattern = new RegExp(
+    "([\"'])(" + aliases.map((a) => escape(a.alias)).join("|") + ")(?=[/\"'])",
+    "g"
+  );
+  const targetByAlias = new Map(aliases.map((a) => [a.alias, a.target]));
+  let rewritten = 0;
+  for (const f of walkDir(serverDir)) {
+    if (!f.absolutePath.endsWith(".js")) continue;
+    let content: string;
+    try {
+      content = readFileSync(f.absolutePath, "utf-8");
+    } catch {
+      continue;
+    }
+    const next = content.replace(pattern, (_m, q, alias) => q + targetByAlias.get(alias)!);
+    if (next !== content) {
+      writeFileSync(f.absolutePath, next);
+      rewritten++;
+    }
+  }
+  if (rewritten > 0) {
+    console.log(
+      `next-bun-compile: Rewrote turbopack-mangled aliases in ${rewritten} server chunks`
+    );
+  }
+}
 
 /**
  * Locate the directory containing server.js inside the standalone output.
@@ -440,10 +485,13 @@ export function generateEntryPoint(options: GenerateOptions): string {
   }));
 
   // Discover turbopack mangled aliases (e.g. `sharp-457ea9eae1af1a9c`).
-  // The chunks reference them as-is; the runtime hook (see server-entry)
-  // redirects each alias to its canonical name when bun's resolver fails.
+  // For ESM `import()` calls the chunks are rewritten in place — bun's ESM
+  // resolver doesn't go through our Module hook. For CJS `require()` calls
+  // the rewrite is belt-and-suspenders; the runtime hook in server-entry
+  // also redirects aliases by name as a fallback.
   const standaloneNextDir = join(serverDir, ".next");
   const turbopackAliases = findTurbopackAliases(standaloneNextDir);
+  rewriteTurbopackAliases(standaloneNextDir, turbopackAliases);
   const aliasNames = new Set(turbopackAliases.map((a) => a.alias));
   const runtimeFiles = walkDir(standaloneNextDir)
     .filter((f) => {
