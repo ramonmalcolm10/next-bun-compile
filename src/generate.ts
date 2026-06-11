@@ -4,10 +4,12 @@ import {
   existsSync,
   readdirSync,
   statSync,
+  lstatSync,
+  realpathSync,
   mkdirSync,
   type Stats,
 } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, basename } from "node:path";
 import { createHash } from "node:crypto";
 
 interface GenerateOptions {
@@ -148,6 +150,36 @@ function generateStubs(standaloneDir: string): void {
   if (count > 0) {
     console.log(`next-bun-compile: Created ${count} module stubs`);
   }
+}
+
+/**
+ * Next.js with turbopack emits server chunks that reference externalized
+ * packages by mangled names like `sharp-457ea9eae1af1a9c`, and creates
+ * symlinks at `.next/node_modules/<mangled>` pointing to the real package
+ * so `require("sharp-457...")` resolves at runtime. The compiled binary
+ * has no filesystem, so the symlinks need to be recreated after asset
+ * extraction; embedding the symlinked files duplicates them and isn't
+ * reliable through bun's bundler.
+ */
+function findTurbopackAliases(
+  standaloneNextDir: string
+): Array<{ alias: string; target: string }> {
+  const nodeModulesDir = join(standaloneNextDir, "node_modules");
+  if (!existsSync(nodeModulesDir)) return [];
+
+  const aliases: Array<{ alias: string; target: string }> = [];
+  for (const entry of readdirSync(nodeModulesDir)) {
+    if (!/-[0-9a-f]{16}$/.test(entry)) continue;
+    const aliasPath = join(nodeModulesDir, entry);
+    try {
+      if (!lstatSync(aliasPath).isSymbolicLink()) continue;
+      const target = basename(realpathSync(aliasPath));
+      aliases.push({ alias: entry, target });
+    } catch {
+      continue;
+    }
+  }
+  return aliases;
 }
 
 /**
@@ -352,12 +384,21 @@ export function generateEntryPoint(options: GenerateOptions): string {
     urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
-  // Discover runtime files from standalone .next/ (BUILD_ID, manifests, server chunks)
+  // Discover runtime files from standalone .next/ (BUILD_ID, manifests, server chunks).
+  // Skip files reached through turbopack's mangled-alias symlinks — we recreate
+  // those as runtime symlinks/shims instead of embedding duplicate copies.
   const standaloneNextDir = join(serverDir, ".next");
-  const runtimeFiles = walkDir(standaloneNextDir).map((f) => ({
-    ...f,
-    urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
-  }));
+  const turbopackAliases = findTurbopackAliases(standaloneNextDir);
+  const aliasNames = new Set(turbopackAliases.map((a) => a.alias));
+  const runtimeFiles = walkDir(standaloneNextDir)
+    .filter((f) => {
+      const m = f.relativePath.replace(/\\/g, "/").match(/^node_modules\/([^/]+)/);
+      return !(m && aliasNames.has(m[1]));
+    })
+    .map((f) => ({
+      ...f,
+      urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
+    }));
 
   // Copy external modules into .next/__external/ so they get embedded as
   // regular file assets (JS files in node_modules/ conflict with bun's bundler).
@@ -470,6 +511,7 @@ if (Number.isNaN(keepAliveTimeout) || !Number.isFinite(keepAliveTimeout) || keep
 }
 
 const extractions = ${JSON.stringify(assetExtractions)};
+const turbopackAliases = ${JSON.stringify(turbopackAliases.map((a) => [a.alias, a.target]))};
 async function extractAssets() {
   let n = 0;
   for (const [urlPath, diskPath] of extractions) {
@@ -478,6 +520,24 @@ async function extractAssets() {
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
     const embedded = assetMap.get(urlPath);
     if (embedded) { await Bun.write(fullPath, Bun.file(embedded)); n++; }
+  }
+  for (const [alias, target] of turbopackAliases) {
+    const aliasPath = path.join(baseDir, ".next/node_modules", alias);
+    if (fs.existsSync(aliasPath)) continue;
+    fs.mkdirSync(path.dirname(aliasPath), { recursive: true });
+    try {
+      fs.symlinkSync(target, aliasPath, "dir");
+    } catch {
+      fs.mkdirSync(aliasPath, { recursive: true });
+      fs.writeFileSync(
+        path.join(aliasPath, "package.json"),
+        JSON.stringify({ name: alias, main: "index.js" })
+      );
+      fs.writeFileSync(
+        path.join(aliasPath, "index.js"),
+        "module.exports = require(" + JSON.stringify(target) + ");"
+      );
+    }
   }
   if (n > 0) console.log(\`Extracted \${n} assets\`);
 }
