@@ -8,6 +8,8 @@ One command. One binary. No runtime dependencies.
 next build  # → ./server (single executable with embedded assets)
 ```
 
+**📖 Docs: [ramonmalcolm10.github.io/next-bun-compile](https://ramonmalcolm10.github.io/next-bun-compile/)**
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.3

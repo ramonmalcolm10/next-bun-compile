@@ -1,0 +1,108 @@
+---
+title: Troubleshooting
+description: Common errors and their fixes when building or running a next-bun-compile binary.
+---
+
+## Stale standalone output after upgrading Next.js
+
+Next.js doesn't clean its standalone output between builds. If you
+upgrade Next.js, stale files from the old version can cause runtime
+errors like `Cannot find module 'next/dist/compiled/source-map'`.
+
+**Fix.** Clean before rebuilding:
+
+```bash
+rm -rf .next/standalone && bun run build
+```
+
+## `Failed to load external module pino-...: Cannot find package`
+
+Some packages (`pino`, `pino-pretty`) use dynamic `require()` calls
+internally that Turbopack can't statically resolve. They get
+externalized with a mangled name that doesn't exist in your
+node_modules.
+
+**Fix.** Force them through the bundler with `transpilePackages`:
+
+```ts
+const nextConfig: NextConfig = {
+  transpilePackages: ["pino", "pino-pretty"],
+  adapterPath: import.meta.resolve("next-bun-compile"),
+};
+```
+
+See [transpilePackages guide](/next-bun-compile/guides/transpile-packages/).
+
+## `Could not load the "sharp" module using the linux-x64 runtime`
+
+Sharp loaded but couldn't dlopen its native binding. This is sharp's
+own error after exhausting its load paths — it's a runtime
+environment issue, not a next-bun-compile issue.
+
+**Fix.** Use a runner image with the libs sharp's prebuilt expects:
+
+- `gcr.io/distroless/cc-debian12:nonroot` — has `libstdc++` (the
+  `cc` variant). The plain `base` variant lacks `libstdc++` and
+  sharp won't load.
+- For text rendering (watermarks): also need fontconfig + a font
+  face. Full recipe in
+  [Distroless + sharp](/next-bun-compile/recipes/distroless-sharp/).
+
+## `Fontconfig error: Cannot load default config file`
+
+libvips (sharp's image engine) needs fontconfig + actual font files
+to render text. Distroless images don't include either.
+
+**Fix.** Copy them from the builder. See the recipe section in
+[Distroless + sharp](/next-bun-compile/recipes/distroless-sharp/).
+
+## Binary boots, then 500 on first request
+
+Often a missing env var your app needs at runtime — check what's
+required and ensure the deploy sets them. Common cases:
+
+- `DATABASE_URL` or similar (no value → driver crashes on first use)
+- Stripe / OAuth secrets your code expects
+
+**Diagnostic.** Set `NEXT_BUN_COMPILE_DEBUG=1` and re-run; the log
+will show every resolver-hook decision so you can rule out a
+resolution failure.
+
+## "Cannot find package 'X-abc123...'" with a 16-char hex suffix
+
+A turbopack-mangled alias the resolver couldn't redirect. The
+build-time validator should have warned about this — check the
+build log for:
+
+```
+next-bun-compile: ⚠ N of M turbopack alias reference(s) won't resolve at runtime:
+  ✗ X-abc123def456... → X
+```
+
+**Fix.** The canonical package isn't in the standalone tree. Either:
+
+- Add it as a dependency
+- Or add it to `transpilePackages` so it's bundled into the chunks
+  instead of externalized
+
+## Want to see what's happening at runtime?
+
+```bash
+NEXT_BUN_COMPILE_DEBUG=1 ./server
+```
+
+Logs every resolver-hook decision with parent-file context. See
+[Debug mode](/next-bun-compile/guides/debug-mode/) for output
+examples and how to read them.
+
+## Still stuck?
+
+Open an issue with:
+
+1. The error output
+2. `NEXT_BUN_COMPILE_DEBUG=1` log of the failing request (if it
+   happens at runtime)
+3. Your `next.config.ts`
+4. A list of native deps in your `package.json`
+
+[Open an issue →](https://github.com/ramonmalcolm10/next-bun-compile/issues/new)

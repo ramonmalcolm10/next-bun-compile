@@ -1,0 +1,112 @@
+---
+title: Distroless + sharp
+description: Complete Dockerfile recipe — compile a Next.js app that uses sharp, ship on gcr.io/distroless/cc-debian12 with fontconfig for libvips text rendering.
+---
+
+import { Code } from "@astrojs/starlight/components";
+
+A minimal Next.js app that uses `sharp` (the dep `next/image`
+server-side optimization pulls in), compiled to a single binary and
+shipped on `gcr.io/distroless/cc-debian12`. Final image ~80MB.
+
+This is the recipe **and** the e2e regression test — CI builds and
+boots it on every PR.
+
+The full working source is in
+[`examples/sharp/`](https://github.com/ramonmalcolm10/next-bun-compile/tree/main/examples/sharp)
+in the repo.
+
+## Dockerfile
+
+```dockerfile
+# Stage 1: Build the binary
+FROM oven/bun:1.3.14 AS builder
+
+WORKDIR /app
+
+COPY package.json bun.lock* ./
+RUN bun install --no-save
+
+COPY . .
+
+# Install fontconfig + fonts in the builder so we can copy the
+# artifacts into the distroless runner. The build itself doesn't
+# need them, but fc-cache populates /var/cache/fontconfig with a
+# fresh font cache the runner can use directly.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fontconfig fonts-dejavu-core \
+ && fc-cache -f \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN bun --bun run build
+
+# Stage 2: Run the compiled binary
+FROM gcr.io/distroless/cc-debian12:nonroot AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME="0.0.0.0"
+
+# Self-contained binary
+COPY --from=builder --chown=nonroot:nonroot /app/server ./
+
+# Fontconfig + fonts + the C libs libvips dlopens for text rendering.
+# cc-debian12 already has libstdc++ and libgcc; these complete the
+# set.
+COPY --from=builder /etc/fonts /etc/fonts
+COPY --from=builder /usr/share/fontconfig /usr/share/fontconfig
+COPY --from=builder /usr/share/fonts /usr/share/fonts
+COPY --from=builder /var/cache/fontconfig /var/cache/fontconfig
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libfontconfig.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libfreetype.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libexpat.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libpng16.so* /usr/lib/x86_64-linux-gnu/
+
+EXPOSE 3000
+CMD ["./server"]
+```
+
+## Why each piece
+
+| Block                                                | Why                                                                                                                                       |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `oven/bun:1.3.14` builder                            | Builds the binary. Debian-based so `apt-get` works.                                                                                       |
+| `apt-get install fontconfig fonts-dejavu-core`       | libvips needs fontconfig + a font face for text rendering (watermarks, captions). Skip if you only do non-text sharp ops.                |
+| `fc-cache -f`                                        | Populates `/var/cache/fontconfig` so the runner doesn't have to rebuild the cache on first text-render.                                  |
+| `bun --bun run build`                                | `next build` + `next-bun-compile` → `./server`.                                                                                          |
+| `gcr.io/distroless/cc-debian12:nonroot`              | Has glibc + libstdc++ + libgcc (the `cc` variant). The plain `base` variant lacks libstdc++ and sharp won't load.                       |
+| `COPY /etc/fonts /usr/share/fontconfig ... /var/cache/fontconfig` | All the data fontconfig expects. Drop if you don't render text.                                                            |
+| `COPY libfontconfig + libfreetype + libexpat + libpng16` | Runtime libs libvips dlopens. Same caveat as fonts.                                                                                  |
+
+## If you don't need text rendering
+
+Drop the `apt-get install fontconfig fonts-dejavu-core`, the
+`fc-cache` line, and all the `COPY /etc/fonts`-and-friends blocks.
+Shrinks the image by ~5MB.
+
+## Different font face
+
+Swap `fonts-dejavu-core` for whatever package provides the font your
+watermark text uses:
+
+- `fonts-liberation` (Arial/Helvetica/Times metric-compatible)
+- `fonts-noto-core` (Noto fonts, broad Unicode coverage)
+- `fonts-roboto`
+
+## Other architectures
+
+Pass `--target=bun-linux-arm64` to `next-bun-compile` in the build
+script. See [Cross-compilation](/next-bun-compile/guides/cross-compilation/).
+
+## Variants
+
+- **alpine + bun runtime instead.** If you want to skip compilation
+  altogether: use `oven/bun:1.3.14-alpine`, `apk add fontconfig
+  ttf-dejavu`, `COPY .next/standalone .`, `CMD ["bun",
+  "apps/web/server.js"]`. Larger image (~150MB), no compile step,
+  same resolution behavior because it's the standard bun runtime.
+
+- **Monorepo layout** with this same recipe — see
+  [Monorepo + sharp](/next-bun-compile/recipes/monorepo-sharp/).

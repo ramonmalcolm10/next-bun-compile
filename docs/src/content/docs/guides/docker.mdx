@@ -1,0 +1,88 @@
+---
+title: Docker
+description: How to package the compiled binary into a Docker image, with notes on base image choice and native dep support.
+---
+
+## Minimal: distroless without native deps
+
+If your app doesn't use native modules, the smallest viable image is
+`gcr.io/distroless/base-debian12:nonroot` — has glibc and not much
+else, ~25MB.
+
+```dockerfile
+FROM oven/bun:1.3.14 AS builder
+WORKDIR /app
+COPY package.json bun.lock* ./
+RUN bun install --no-save
+COPY . .
+RUN bun --bun run build
+
+FROM gcr.io/distroless/base-debian12:nonroot AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV HOSTNAME="0.0.0.0"
+COPY --from=builder --chown=nonroot:nonroot /app/server ./
+EXPOSE 3000
+CMD ["./server"]
+```
+
+## With native deps (sharp, bcrypt, etc.)
+
+Native modules need a `libstdc++` in the runner. Switch to
+`gcr.io/distroless/cc-debian12:nonroot` — same minimal style, but
+has `libstdc++` and `libgcc`:
+
+```dockerfile
+FROM gcr.io/distroless/cc-debian12:nonroot AS runner
+```
+
+For the full recipe (including fontconfig for libvips text
+rendering with sharp), see
+[Distroless + sharp](/next-bun-compile/recipes/distroless-sharp/).
+
+## Choosing a base image
+
+| Base image                                         | Size      | Has         | Use when                                                   |
+| -------------------------------------------------- | --------- | ----------- | ---------------------------------------------------------- |
+| `gcr.io/distroless/base-debian12:nonroot`          | ~25MB     | glibc, openssl | Pure-JS app, no native modules                          |
+| `gcr.io/distroless/cc-debian12:nonroot`            | ~30MB     | `cc` deps + libstdc++, libgcc | Any native dep (sharp, bcrypt, native query engines) |
+| `debian:12-slim`                                   | ~75MB     | full slim debian | Need apt-get for extra libs at runtime                |
+| `oven/bun:1.3.14-slim`                             | ~150MB    | bun runtime  | Skip the binary entirely; run with `bun --bun ./standalone/server.js` |
+
+## Multi-arch builds in CI
+
+GitHub Actions example for building both amd64 and arm64:
+
+```yaml
+- run: bun --bun run build --target=bun-linux-x64
+- run: mv server server-amd64
+- run: bun --bun run build --target=bun-linux-arm64
+- run: mv server server-arm64
+- uses: docker/buildx-action@v3
+- run: |
+    docker buildx build --platform linux/amd64,linux/arm64 \
+      --build-arg BINARY_AMD64=server-amd64 \
+      --build-arg BINARY_ARM64=server-arm64 \
+      -t myapp:latest --push .
+```
+
+The cross-compilation flags are documented in
+[Cross-compilation](/next-bun-compile/guides/cross-compilation/).
+
+## Why not just use `bun --bun ./server.js` instead?
+
+The standalone-with-bun-runtime path is a perfectly valid alternative
+to compiling a binary. Bigger image, simpler debug story, no
+compiled-binary resolver quirks.
+
+Use the binary when:
+
+- Image size matters (~30MB vs ~150MB)
+- Cold start matters (bytecode-precompiled boot is ~2x faster)
+- You want a single self-contained artifact
+
+Use bun + standalone when:
+
+- You want zero next-bun-compile-specific behavior
+- You're hitting edge cases the resolver hook doesn't handle
+  (please file an issue!)
