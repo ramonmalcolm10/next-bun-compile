@@ -74,31 +74,67 @@ function toVarName(filePath: string): string {
  * Find all real locations of a package inside node_modules/, including
  * hoisted layouts used by bun (.bun/) and pnpm (.pnpm/).
  * Both use: node_modules/.<manager>/<pkg>@version/node_modules/<pkg>/
+ *
+ * Walks the entire standalone tree to find every `node_modules/` directory,
+ * then checks for direct + hoisted-store locations in each. Necessary for
+ * monorepo-style standalone outputs where Next.js produces both a top-level
+ * `standalone/node_modules/` AND nested copies like
+ * `standalone/<app-path>/node_modules/` — the bundler resolves the nearest
+ * one, so stubs/shims have to be placed in every location.
  */
-function findPackageDirs(
-  nodeModulesDir: string,
-  pkg: string
-): string[] {
+function findPackageDirs(standaloneDir: string, pkg: string): string[] {
   const dirs: string[] = [];
-
-  // Direct path: node_modules/<pkg>/
-  const direct = join(nodeModulesDir, pkg);
-  if (existsSync(direct)) dirs.push(direct);
-
-  // Hoisted layouts (.bun/ and .pnpm/)
   const prefix = pkg.startsWith("@")
     ? pkg.split("/")[0] + "+" + pkg.split("/")[1]
     : pkg;
-  for (const store of [".bun", ".pnpm"]) {
-    const storeDir = join(nodeModulesDir, store);
-    if (!existsSync(storeDir)) continue;
-    for (const entry of readdirSync(storeDir)) {
-      if (!entry.startsWith(prefix + "@")) continue;
-      const hoisted = join(storeDir, entry, "node_modules", pkg);
-      if (existsSync(hoisted)) dirs.push(hoisted);
-    }
-  }
+  const seen = new Set<string>();
 
+  const checkNodeModules = (nodeModulesDir: string) => {
+    // Direct: node_modules/<pkg>/
+    const direct = join(nodeModulesDir, pkg);
+    if (existsSync(direct) && !seen.has(direct)) {
+      seen.add(direct);
+      dirs.push(direct);
+    }
+    // Hoisted stores: .bun/<pkg>@<ver>/node_modules/<pkg>/ etc.
+    for (const store of [".bun", ".pnpm"]) {
+      const storeDir = join(nodeModulesDir, store);
+      if (!existsSync(storeDir)) continue;
+      let entries: string[];
+      try {
+        entries = readdirSync(storeDir);
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.startsWith(prefix + "@")) continue;
+        const hoisted = join(storeDir, entry, "node_modules", pkg);
+        if (existsSync(hoisted) && !seen.has(hoisted)) {
+          seen.add(hoisted);
+          dirs.push(hoisted);
+        }
+      }
+    }
+  };
+
+  const walk = (dir: string) => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry);
+      if (entry === "node_modules") {
+        checkNodeModules(full);
+        continue; // don't descend into node_modules itself
+      }
+      const stat = tryStat(full);
+      if (stat && stat.isDirectory()) walk(full);
+    }
+  };
+  walk(standaloneDir);
   return dirs;
 }
 
@@ -131,7 +167,7 @@ function generateStubs(standaloneDir: string): void {
   const nodeModulesDir = join(standaloneDir, "node_modules");
   let count = 0;
   for (const stub of stubs) {
-    const pkgDirs = findPackageDirs(nodeModulesDir, stub.pkg);
+    const pkgDirs = findPackageDirs(standaloneDir, stub.pkg);
     // If the package isn't installed at all, create stub at the default location
     if (pkgDirs.length === 0) pkgDirs.push(join(nodeModulesDir, stub.pkg));
 
@@ -403,8 +439,7 @@ function findServerDir(standaloneDir: string): string {
  * there's no node_modules on disk (deployed compiled binary).
  */
 function patchRequireHook(standaloneDir: string): void {
-  const nodeModulesDir = join(standaloneDir, "node_modules");
-  const nextDirs = findPackageDirs(nodeModulesDir, "next");
+  const nextDirs = findPackageDirs(standaloneDir, "next");
 
   const target =
     "let resolve = process.env.NEXT_MINIMAL ? __non_webpack_require__.resolve : require.resolve;";
@@ -442,10 +477,12 @@ function patchRequireHook(standaloneDir: string): void {
 function collectExternalModules(
   standaloneDir: string
 ): Array<{ mod: string; src: string }> {
-  const nodeModulesDir = join(standaloneDir, "node_modules");
-  if (!existsSync(nodeModulesDir)) return [];
-
   // Collect all package directories, including those in .bun/.pnpm stores
+  // and nested node_modules anywhere in the standalone tree (monorepo
+  // layouts produce both `standalone/node_modules/` and
+  // `standalone/<app>/node_modules/`; only collecting the top-level one
+  // misses packages that are nested-only, like next.js's own runtime files
+  // when `file:` deps push the dep tree into a nested copy).
   const pkgRoots = new Map<string, string>(); // pkg name -> absolute path
 
   function addPkg(name: string, path: string) {
@@ -471,16 +508,33 @@ function collectExternalModules(
     }
   }
 
-  scanDir(nodeModulesDir);
-
-  for (const store of [".bun", ".pnpm"]) {
-    const storeDir = join(nodeModulesDir, store);
-    if (!existsSync(storeDir)) continue;
-    for (const storeEntry of readdirSync(storeDir)) {
-      const nested = join(storeDir, storeEntry, "node_modules");
-      if (existsSync(nested)) scanDir(nested);
+  // Walk the entire standalone tree and process every `node_modules/` we
+  // find (top-level, nested app dirs, etc.). Doesn't recurse into
+  // node_modules itself — the .bun/.pnpm hoisted stores are handled
+  // explicitly per node_modules.
+  function walkForNodeModules(dir: string) {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return; }
+    for (const entry of entries) {
+      const full = join(dir, entry);
+      if (entry === "node_modules") {
+        scanDir(full);
+        for (const store of [".bun", ".pnpm"]) {
+          const storeDir = join(full, store);
+          if (!existsSync(storeDir)) continue;
+          for (const storeEntry of readdirSync(storeDir)) {
+            const nested = join(storeDir, storeEntry, "node_modules");
+            if (existsSync(nested)) scanDir(nested);
+          }
+        }
+        continue;
+      }
+      const stat = tryStat(full);
+      if (stat && stat.isDirectory()) walkForNodeModules(full);
     }
   }
+  walkForNodeModules(standaloneDir);
+  if (pkgRoots.size === 0) return [];
 
   const results: Array<{ mod: string; src: string }> = [];
   for (const [name, pkgPath] of pkgRoots) {
@@ -500,11 +554,9 @@ function collectExternalModules(
  * or "exports" maps.
  */
 function fixModuleResolution(standaloneDir: string): void {
-  const nodeModulesDir = join(standaloneDir, "node_modules");
-
   // 1. Create index.js shims for next/dist/compiled/* packages whose
   //    package.json "main" isn't index.js (e.g. source-map -> source-map.js)
-  for (const pkgDir of findPackageDirs(nodeModulesDir, "next")) {
+  for (const pkgDir of findPackageDirs(standaloneDir, "next")) {
     const compiledDir = join(pkgDir, "dist/compiled");
     if (!existsSync(compiledDir)) continue;
     for (const entry of readdirSync(compiledDir)) {
@@ -523,7 +575,7 @@ function fixModuleResolution(standaloneDir: string): void {
 
   // 2. Create filesystem shims for packages using "exports" maps that bun's
   //    compiled binary can't resolve (e.g. @swc/helpers/_/X -> cjs/X.cjs)
-  for (const helpersDir of findPackageDirs(nodeModulesDir, "@swc/helpers")) {
+  for (const helpersDir of findPackageDirs(standaloneDir, "@swc/helpers")) {
     const cjsDir = join(helpersDir, "cjs");
     if (!existsSync(cjsDir)) continue;
     for (const file of readdirSync(cjsDir)) {
