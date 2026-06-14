@@ -337,6 +337,69 @@ function buildCanonicalResolutions(
 }
 
 /**
+ * Pre-flight check on alias resolutions. For every alias + subpath the
+ * chunks reference, verify that we found a concrete file to point at. If
+ * any didn't resolve, emit a loud warning at build time — the chunk will
+ * throw at runtime when the unresolved reference is hit, and surfacing
+ * it now (with the canonical name we tried to find) is much cheaper than
+ * a deploy round-trip. Returns the unresolved entries so callers/tests
+ * can act on them.
+ *
+ * Verbose mode (`NEXT_BUN_COMPILE_VERBOSE=1`) lists every alias along
+ * with the file it resolved to — useful for verifying exports-map
+ * handling picked the right variant (.mjs vs .js vs .cjs).
+ */
+function validateAliasResolutions(
+  aliases: Array<{ alias: string; target: string; subpaths: string[] }>,
+  resolutions: Map<string, string>
+): Array<{ ref: string; canonical: string }> {
+  const verbose = process.env.NEXT_BUN_COMPILE_VERBOSE === "1";
+  const all: Array<{ ref: string; canonical: string; file: string | null }> = [];
+  for (const { alias, target, subpaths } of aliases) {
+    all.push({ ref: alias, canonical: target, file: resolutions.get(alias) ?? null });
+    for (const sub of subpaths) {
+      const ref = `${alias}/${sub}`;
+      all.push({
+        ref,
+        canonical: `${target}/${sub}`,
+        file: resolutions.get(ref) ?? null,
+      });
+    }
+  }
+  const unresolved = all
+    .filter((e) => !e.file)
+    .map(({ ref, canonical }) => ({ ref, canonical }));
+
+  if (verbose && all.length > 0) {
+    console.log(
+      `next-bun-compile: Validating ${all.length} turbopack alias reference(s):`
+    );
+    for (const { ref, canonical, file } of all) {
+      if (file) {
+        const display = file.replace(/^\.next\/node_modules\//, "");
+        console.log(`  ✓ ${ref} → ${canonical} (${display})`);
+      } else {
+        console.log(`  ✗ ${ref} → ${canonical} (NOT FOUND)`);
+      }
+    }
+  }
+  if (unresolved.length > 0) {
+    console.warn(
+      `next-bun-compile: ⚠ ${unresolved.length} of ${all.length} turbopack alias reference(s) won't resolve at runtime:`
+    );
+    for (const { ref, canonical } of unresolved) {
+      console.warn(`  ✗ ${ref} → ${canonical}`);
+    }
+    console.warn(
+      `next-bun-compile: These chunks will throw at runtime when the reference is hit. ` +
+        `Either the package is missing from dependencies, or it's hidden behind a path the ` +
+        `standalone trace didn't include. Try adding to transpilePackages in next.config.`
+    );
+  }
+  return unresolved;
+}
+
+/**
  * Replace every literal `"<alias>"` or `"<alias>/<sub>"` in the server
  * chunks with the absolute file path of the canonical target, anchored on
  * a `__NBC_BASE__` placeholder that's substituted with the real baseDir
@@ -659,10 +722,13 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // package.json for top-level, the right extension for each subpath),
   // then rewrite chunk references to absolute file paths via the
   // __NBC_BASE__ placeholder. Substituted with baseDir at extract time.
+  // validateAliasResolutions warns about any that didn't resolve before
+  // we get to runtime — much cheaper than a deploy round-trip.
   const canonicalResolutions = buildCanonicalResolutions(
     externalDir,
     turbopackAliases
   );
+  validateAliasResolutions(turbopackAliases, canonicalResolutions);
   rewriteTurbopackAliases(standaloneNextDir, turbopackAliases, canonicalResolutions);
 
   // Check build context for assetPrefix — if set, static assets are served
@@ -759,6 +825,20 @@ process.env.NODE_ENV = "production";
 const __nbcAliases = ${JSON.stringify(
     Object.fromEntries(turbopackAliases.map((a) => [a.alias, a.target]))
   )};
+// Debug mode: set NEXT_BUN_COMPILE_DEBUG=1 to log every resolver-hook
+// decision (alias redirects, fallback walks, fallback failures). Off by
+// default so production logs stay clean; turn it on when reproducing a
+// resolution bug — that one log line is usually enough to know which
+// package was missing and where the walk gave up.
+const __nbcDebug = process.env.NEXT_BUN_COMPILE_DEBUG === "1";
+function __nbcLog(msg) { console.log("next-bun-compile [debug]:", msg); }
+if (__nbcDebug) {
+  const n = Object.keys(__nbcAliases).length;
+  __nbcLog(\`resolver hook installed; \${n} alias mapping(s):\`);
+  for (const [k, v] of Object.entries(__nbcAliases)) {
+    __nbcLog(\`  \${k} → \${v}\`);
+  }
+}
 const __nbcOrigResolveFilename = Module._resolveFilename;
 function __nbcStatFile(p) {
   try { return fs.statSync(p).isFile() ? p : null; } catch { return null; }
@@ -866,6 +946,10 @@ function __nbcRedirectAlias(request) {
 }
 Module._resolveFilename = function(request, parent, isMain, options) {
   const redirected = __nbcRedirectAlias(request);
+  if (__nbcDebug && redirected !== request) {
+    const from = parent && parent.filename ? parent.filename : "<unknown>";
+    __nbcLog(\`redirected "\${request}" → "\${redirected}" (from \${from})\`);
+  }
   try {
     return __nbcOrigResolveFilename.call(this, redirected, parent, isMain, options);
   } catch (err) {
@@ -875,7 +959,15 @@ Module._resolveFilename = function(request, parent, isMain, options) {
     }
     const fromDir = parent && parent.filename ? path.dirname(parent.filename) : process.cwd();
     const resolved = __nbcResolvePackage(redirected, fromDir);
-    if (resolved) return resolved;
+    if (resolved) {
+      if (__nbcDebug) {
+        __nbcLog(\`fallback resolved "\${redirected}" → \${resolved} (from \${fromDir})\`);
+      }
+      return resolved;
+    }
+    if (__nbcDebug) {
+      __nbcLog(\`fallback FAILED for "\${redirected}" (from \${fromDir}); throwing original ResolveMessage\`);
+    }
     throw err;
   }
 };
