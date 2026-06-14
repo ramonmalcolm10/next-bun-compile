@@ -868,12 +868,34 @@ function __nbcResolveSubpath(pkgDir, pkgJson, sub) {
       }
     }
   }
-  return __nbcStatFile(path.join(pkgDir, sub))
+  // Direct file forms
+  const direct = __nbcStatFile(path.join(pkgDir, sub))
     || __nbcStatFile(path.join(pkgDir, sub + ".js"))
     || __nbcStatFile(path.join(pkgDir, sub + ".cjs"))
     || __nbcStatFile(path.join(pkgDir, sub + ".mjs"))
-    || __nbcStatFile(path.join(pkgDir, sub + ".json"))
-    || __nbcStatFile(path.join(pkgDir, sub, "index.js"))
+    || __nbcStatFile(path.join(pkgDir, sub + ".json"));
+  if (direct) return direct;
+  // Subpath is a directory: read its own package.json + main (e.g.
+  // next/dist/compiled/source-map has main: "source-map.js"). Falls
+  // back to index.js / index.cjs lookup if no package.json.
+  const subDir = path.join(pkgDir, sub);
+  try {
+    if (fs.statSync(subDir).isDirectory()) {
+      const subPkgPath = path.join(subDir, "package.json");
+      if (fs.existsSync(subPkgPath)) {
+        try {
+          const subPkg = JSON.parse(fs.readFileSync(subPkgPath, "utf-8"));
+          const main = typeof subPkg.main === "string" ? subPkg.main : null;
+          if (main) {
+            const f = __nbcStatFile(path.join(subDir, main))
+              || __nbcStatFile(path.join(subDir, main + ".js"));
+            if (f) return f;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return __nbcStatFile(path.join(pkgDir, sub, "index.js"))
     || __nbcStatFile(path.join(pkgDir, sub, "index.cjs"));
 }
 function __nbcResolvePackage(request, fromDir) {
