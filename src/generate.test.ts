@@ -326,27 +326,30 @@ describe("generateEntryPoint", () => {
 
     generateEntryPoint({ standaloneDir, distDir, projectDir });
 
-    // ESM `import()` doesn't go through the Module hook, so chunk text is
-    // rewritten to canonical names for the ESM resolver. The CJS hook
-    // still handles any require() that ends up mangled.
+    // Chunks rewritten to absolute file paths with __NBC_BASE__ placeholder
+    // for both CJS require and ESM import — bun's compiled-binary resolver
+    // (both CJS and ESM) doesn't reliably walk node_modules from chunk
+    // locations on Linux, so absolute file paths skip resolution entirely.
     const chunk = readFileSync(join(root, chunkPath), "utf-8");
     expect(chunk).not.toContain("sharp-457ea9eae1af1a9c");
     expect(chunk).not.toContain("prettier-285d8f1d6bb5f650");
-    expect(chunk).toContain('a.x("sharp"');
-    expect(chunk).toContain('require("sharp")');
-    expect(chunk).toContain('a.y("prettier/plugins/html")');
+    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/sharp/index.js"');
+    expect(chunk).toContain('"__NBC_BASE__/.next/node_modules/prettier/plugins/html.js"');
 
     // Canonical packages embedded
     const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
     expect(assets).toContain("sharp/index.js");
     expect(assets).toContain("prettier/plugins/html.js");
 
-    // Server entry embeds the alias map and the resolver hook
+    // Server entry retains the alias map + resolver hook for internal
+    // package requires that fire from inside extracted packages.
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
     expect(entry).toContain("__nbcAliases");
     expect(entry).toContain('"sharp-457ea9eae1af1a9c":"sharp"');
     expect(entry).toContain('"prettier-285d8f1d6bb5f650":"prettier"');
     expect(entry).toContain("Module._resolveFilename");
+    // Runtime placeholder substitution must be in extractAssets
+    expect(entry).toContain("__NBC_BASE__");
   });
 
   test("discovers aliases from chunk literals even without build-time symlinks", () => {

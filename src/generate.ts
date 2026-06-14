@@ -237,29 +237,100 @@ function findTurbopackAliases(
 }
 
 /**
- * Rewrite every literal `"<alias>"` reference in the server chunks to the
- * canonical name. The runtime resolver hook (see server-entry) handles
- * the CJS path, but ESM `import()` doesn't go through Module hooks — bun's
- * own ESM resolver runs against whatever specifier the chunk passes, and
- * it has no knowledge of the alias→canonical mapping. Rewriting at build
- * time ensures `import("<mangled>/sub")` becomes `import("<target>/sub")`
- * so bun's standard ESM walk + exports-map handling can resolve it.
+ * For each alias spec (top-level or subpath), find the concrete file the
+ * canonical package would resolve to — by reading `package.json` and
+ * looking for the file with the right extension. Returns a map of
+ *   "<alias>"          → ".next/node_modules/<target>/<resolvedMain>"
+ *   "<alias>/<sub>"    → ".next/node_modules/<target>/<resolvedSub>"
+ */
+function buildCanonicalResolutions(
+  externalRoot: string,
+  aliases: Array<{ alias: string; target: string; subpaths: string[] }>
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const findFile = (dir: string, candidates: string[]): string | null => {
+    for (const c of candidates) {
+      if (!c) continue;
+      const p = join(dir, c);
+      if (existsSync(p) && statSync(p).isFile()) return c.replace(/\\/g, "/");
+    }
+    return null;
+  };
+  const resolveMain = (canonicalDir: string): string | null => {
+    const pkgPath = join(canonicalDir, "package.json");
+    let main = "index.js";
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+        if (typeof pkg.main === "string") main = pkg.main;
+      } catch {}
+    }
+    return findFile(canonicalDir, [
+      main, main + ".js", main + ".cjs", main + ".mjs",
+      join(main, "index.js"), join(main, "index.cjs"), join(main, "index.mjs"),
+      "index.js", "index.cjs", "index.mjs",
+    ]);
+  };
+  const resolveSub = (canonicalDir: string, sub: string): string | null => {
+    const stripped = sub.replace(/\.(?:js|cjs|mjs|json)$/, "");
+    // Try direct file forms first; for ESM contexts (.y/import calls) the
+    // `.mjs` variant of subpath exports is what's actually on disk for many
+    // packages (prettier/plugins/html.mjs vs html.js).
+    return findFile(canonicalDir, [
+      sub,
+      stripped + ".mjs",
+      stripped + ".js",
+      stripped + ".cjs",
+      stripped + ".json",
+      join(stripped, "index.mjs"),
+      join(stripped, "index.js"),
+      join(stripped, "index.cjs"),
+    ]);
+  };
+  for (const { alias, target, subpaths } of aliases) {
+    const canonicalDir = join(externalRoot, target);
+    if (!existsSync(canonicalDir)) continue;
+    const main = resolveMain(canonicalDir);
+    if (main) out.set(alias, `.next/node_modules/${target}/${main}`);
+    for (const sub of subpaths) {
+      const file = resolveSub(canonicalDir, sub);
+      if (file) out.set(`${alias}/${sub}`, `.next/node_modules/${target}/${file}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Replace every literal `"<alias>"` or `"<alias>/<sub>"` in the server
+ * chunks with the absolute file path of the canonical target, anchored on
+ * a `__NBC_BASE__` placeholder that's substituted with the real baseDir
+ * at runtime extraction time.
+ *
+ * Both CJS `require(...)` and ESM `await import(...)` go through this
+ * rewrite. The Module._resolveFilename hook installed in server-entry
+ * only catches CJS — ESM `import()` bypasses Module hooks entirely, and
+ * bun's ESM resolver in the compiled binary has the same node_modules-
+ * walk quirk as its CJS resolver in some Linux configurations. Embedding
+ * a literal absolute file path skips resolution entirely; bun stats and
+ * loads the file directly.
  */
 function rewriteTurbopackAliases(
   standaloneNextDir: string,
-  aliases: Array<{ alias: string; target: string }>
+  aliases: Array<{ alias: string }>,
+  resolutions: Map<string, string>
 ): void {
-  if (aliases.length === 0) return;
+  if (aliases.length === 0 || resolutions.size === 0) return;
   const serverDir = join(standaloneNextDir, "server");
   if (!existsSync(serverDir)) return;
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // Match the alias name followed immediately by `/`, `"`, or `'` — guards
-  // against any longer identifier that happens to start with the alias.
+  // Capture the whole quoted spec — alias or alias/sub/path — so we can
+  // look it up in the resolutions map and swap the literal in one shot.
   const pattern = new RegExp(
-    "([\"'])(" + aliases.map((a) => escape(a.alias)).join("|") + ")(?=[/\"'])",
+    "([\"'])((?:" +
+      aliases.map((a) => escape(a.alias)).join("|") +
+      ")(?:/[^\"']+)?)\\1",
     "g"
   );
-  const targetByAlias = new Map(aliases.map((a) => [a.alias, a.target]));
   let rewritten = 0;
   for (const f of walkDir(serverDir)) {
     if (!f.absolutePath.endsWith(".js")) continue;
@@ -269,7 +340,11 @@ function rewriteTurbopackAliases(
     } catch {
       continue;
     }
-    const next = content.replace(pattern, (_m, q, alias) => q + targetByAlias.get(alias)!);
+    const next = content.replace(pattern, (match, quote, spec) => {
+      const rel = resolutions.get(spec);
+      if (!rel) return match;
+      return `${quote}__NBC_BASE__/${rel}${quote}`;
+    });
     if (next !== content) {
       writeFileSync(f.absolutePath, next);
       rewritten++;
@@ -484,14 +559,13 @@ export function generateEntryPoint(options: GenerateOptions): string {
     urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
-  // Discover turbopack mangled aliases (e.g. `sharp-457ea9eae1af1a9c`).
-  // For ESM `import()` calls the chunks are rewritten in place — bun's ESM
-  // resolver doesn't go through our Module hook. For CJS `require()` calls
-  // the rewrite is belt-and-suspenders; the runtime hook in server-entry
-  // also redirects aliases by name as a fallback.
+  // Discover turbopack mangled aliases (e.g. `sharp-457ea9eae1af1a9c`). The
+  // actual rewrite happens further down, after collectExternalModules has
+  // populated the __external/ tree — we need to read each canonical's
+  // package.json + file layout to find the exact main/subpath file to
+  // point at.
   const standaloneNextDir = join(serverDir, ".next");
   const turbopackAliases = findTurbopackAliases(standaloneNextDir);
-  rewriteTurbopackAliases(standaloneNextDir, turbopackAliases);
   const aliasNames = new Set(turbopackAliases.map((a) => a.alias));
   const runtimeFiles = walkDir(standaloneNextDir)
     .filter((f) => {
@@ -528,6 +602,16 @@ export function generateEntryPoint(options: GenerateOptions): string {
       `next-bun-compile: Embedding ${externalModules.length} external modules for SSR`
     );
   }
+
+  // Resolve each alias spec to its actual canonical file path (main from
+  // package.json for top-level, the right extension for each subpath),
+  // then rewrite chunk references to absolute file paths via the
+  // __NBC_BASE__ placeholder. Substituted with baseDir at extract time.
+  const canonicalResolutions = buildCanonicalResolutions(
+    externalDir,
+    turbopackAliases
+  );
+  rewriteTurbopackAliases(standaloneNextDir, turbopackAliases, canonicalResolutions);
 
   // Check build context for assetPrefix — if set, static assets are served
   // from a CDN and don't need to be embedded in the binary.
@@ -740,7 +824,21 @@ async function extractAssets() {
     if (fs.existsSync(fullPath)) continue;
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
     const embedded = assetMap.get(urlPath);
-    if (embedded) { await Bun.write(fullPath, Bun.file(embedded)); n++; }
+    if (!embedded) continue;
+    // Server chunks may contain __NBC_BASE__ placeholders injected at
+    // build time by rewriteTurbopackAliases. Substitute the real baseDir
+    // before writing so bun resolves the absolute paths at chunk load
+    // (works for both CJS require and ESM import).
+    if (diskPath.startsWith(".next/server/")) {
+      const text = await Bun.file(embedded).text();
+      if (text.indexOf("__NBC_BASE__") !== -1) {
+        await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
+        n++;
+        continue;
+      }
+    }
+    await Bun.write(fullPath, Bun.file(embedded));
+    n++;
   }
   if (n > 0) console.log(\`Extracted \${n} assets\`);
 }
