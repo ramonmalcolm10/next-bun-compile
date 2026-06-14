@@ -1,5 +1,5 @@
 {
-  "name": "e2e-sharp-app",
+  "name": "example-sharp",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -13,7 +13,7 @@
     "sharp": "^0.34.5"
   },
   "devDependencies": {
-    "next-bun-compile": "file:../../..",
+    "next-bun-compile": "file:../..",
     "@types/node": "^22",
     "@types/react": "^19",
     "@types/react-dom": "^19",
