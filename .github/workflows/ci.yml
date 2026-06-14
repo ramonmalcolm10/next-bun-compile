@@ -41,21 +41,20 @@ jobs:
           bun install
           bun run build
 
-      - name: Install fixture deps
-        working-directory: test/e2e/sharp-app
+      - name: Install example deps
+        working-directory: examples/sharp
         run: bun install
 
-      - name: Compile fixture binary
-        working-directory: test/e2e/sharp-app
+      - name: Compile example binary
+        working-directory: examples/sharp
         run: bun --bun run build
 
       - name: Boot binary and verify sharp serves a PNG
-        working-directory: test/e2e/sharp-app
+        working-directory: examples/sharp
         run: |
           PORT=3001 ./server > /tmp/server.log 2>&1 &
           SERVER_PID=$!
 
-          # Wait up to 30s for readiness
           for i in $(seq 1 30); do
             if curl -fsS -o /dev/null http://localhost:3001/; then
               break
@@ -63,7 +62,6 @@ jobs:
             sleep 1
           done
 
-          # Hit the sharp-driven endpoint
           HTTP_STATUS=$(curl -sS -o /tmp/out.png -w "%{http_code}" http://localhost:3001/api/resize)
 
           kill $SERVER_PID 2>/dev/null || true
@@ -84,3 +82,61 @@ jobs:
           fi
 
           echo "✅ sharp resolved + loaded + produced a PNG end-to-end"
+
+  e2e-monorepo:
+    name: E2E (monorepo + sharp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build adapter
+        run: |
+          bun install
+          bun run build
+
+      - name: Install monorepo deps (workspaces)
+        working-directory: examples/monorepo
+        run: bun install
+
+      - name: Compile web app binary
+        working-directory: examples/monorepo/apps/web
+        run: bun --bun run build
+
+      - name: Boot binary and verify nested layout + workspace dep + sharp
+        working-directory: examples/monorepo/apps/web
+        run: |
+          PORT=3002 ./server > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:3002/; then
+              break
+            fi
+            sleep 1
+          done
+
+          HTTP_STATUS=$(curl -sS -o /tmp/mono.png -w "%{http_code}" http://localhost:3002/api/resize)
+
+          kill $SERVER_PID 2>/dev/null || true
+          sleep 1
+
+          echo "--- server log ---"
+          cat /tmp/server.log
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ /api/resize returned $HTTP_STATUS"
+            exit 1
+          fi
+
+          if ! file /tmp/mono.png | grep -q "PNG image"; then
+            echo "❌ /api/resize output is not a PNG:"
+            file /tmp/mono.png
+            exit 1
+          fi
+
+          echo "✅ monorepo + workspace dep + sharp all resolved end-to-end"
