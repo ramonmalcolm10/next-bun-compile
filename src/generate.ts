@@ -825,6 +825,20 @@ process.env.NODE_ENV = "production";
 const __nbcAliases = ${JSON.stringify(
     Object.fromEntries(turbopackAliases.map((a) => [a.alias, a.target]))
   )};
+// Debug mode: set NEXT_BUN_COMPILE_DEBUG=1 to log every resolver-hook
+// decision (alias redirects, fallback walks, fallback failures). Off by
+// default so production logs stay clean; turn it on when reproducing a
+// resolution bug — that one log line is usually enough to know which
+// package was missing and where the walk gave up.
+const __nbcDebug = process.env.NEXT_BUN_COMPILE_DEBUG === "1";
+function __nbcLog(msg) { console.log("next-bun-compile [debug]:", msg); }
+if (__nbcDebug) {
+  const n = Object.keys(__nbcAliases).length;
+  __nbcLog(\`resolver hook installed; \${n} alias mapping(s):\`);
+  for (const [k, v] of Object.entries(__nbcAliases)) {
+    __nbcLog(\`  \${k} → \${v}\`);
+  }
+}
 const __nbcOrigResolveFilename = Module._resolveFilename;
 function __nbcStatFile(p) {
   try { return fs.statSync(p).isFile() ? p : null; } catch { return null; }
@@ -910,6 +924,10 @@ function __nbcRedirectAlias(request) {
 }
 Module._resolveFilename = function(request, parent, isMain, options) {
   const redirected = __nbcRedirectAlias(request);
+  if (__nbcDebug && redirected !== request) {
+    const from = parent && parent.filename ? parent.filename : "<unknown>";
+    __nbcLog(\`redirected "\${request}" → "\${redirected}" (from \${from})\`);
+  }
   try {
     return __nbcOrigResolveFilename.call(this, redirected, parent, isMain, options);
   } catch (err) {
@@ -919,7 +937,15 @@ Module._resolveFilename = function(request, parent, isMain, options) {
     }
     const fromDir = parent && parent.filename ? path.dirname(parent.filename) : process.cwd();
     const resolved = __nbcResolvePackage(redirected, fromDir);
-    if (resolved) return resolved;
+    if (resolved) {
+      if (__nbcDebug) {
+        __nbcLog(\`fallback resolved "\${redirected}" → \${resolved} (from \${fromDir})\`);
+      }
+      return resolved;
+    }
+    if (__nbcDebug) {
+      __nbcLog(\`fallback FAILED for "\${redirected}" (from \${fromDir}); throwing original ResolveMessage\`);
+    }
     throw err;
   }
 };

@@ -426,6 +426,36 @@ describe("generateEntryPoint", () => {
     expect(joined).toContain("won't resolve at runtime");
   });
 
+  test("server-entry embeds the debug-mode resolver hook logging", () => {
+    // Debug mode is gated by NEXT_BUN_COMPILE_DEBUG at runtime — the
+    // emitted entry just needs to contain the conditional + log calls
+    // so users can flip the env var without rebuilding.
+    const root = join(tmpBase, "debug-mode-emitted");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "debug-build",
+      ".next/standalone/.next/server/chunks/ssr/page.js": `// chunk`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      "public/favicon.ico": "icon",
+    });
+
+    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+
+    expect(entry).toContain("NEXT_BUN_COMPILE_DEBUG");
+    expect(entry).toContain("__nbcDebug");
+    expect(entry).toContain("redirected");
+    expect(entry).toContain("fallback resolved");
+    expect(entry).toContain("fallback FAILED");
+  });
+
   test("validator stays quiet when every alias resolves", () => {
     const root = join(tmpBase, "alias-all-resolved");
     const distDir = join(root, ".next");
