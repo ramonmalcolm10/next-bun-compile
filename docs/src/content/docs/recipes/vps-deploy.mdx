@@ -1,0 +1,217 @@
+---
+title: Deploy to a VPS with zero runtime dependencies
+description: Build the binary in GitHub Actions, ship it to a VPS over SSH, run under systemd. The VPS needs nothing installed but ssh, systemd, and a working glibc.
+---
+
+import { Steps } from "@astrojs/starlight/components";
+
+The single-binary deploy story: a Linux executable built in CI, `scp`'d
+to your VPS, run under systemd. The VPS needs **nothing installed but
+ssh, systemd, and a working glibc** — no node, no bun, no
+node_modules. No Docker.
+
+Full working source in
+[`examples/vps-deploy/`](https://github.com/ramonmalcolm10/next-bun-compile/tree/main/examples/vps-deploy)
+— GitHub Actions workflow, systemd unit, README with one-time setup.
+
+## When this is the right answer
+
+- You want **predictable monthly costs**. A $4–6/mo VPS comfortably
+  runs a real Next.js app. No per-invocation fees, no platform
+  surprises.
+- You want **zero lock-in**. The deploy artifact is one file you
+  control end-to-end.
+- You want a **simple operational model**. systemd restarts on crash,
+  caddy in front handles TLS, that's the entire stack.
+- You don't want a Docker daemon on the VPS, or a build pipeline
+  that needs `docker login` / image registry credentials.
+
+If you want autoscaling, multi-region, or the Vercel feature set,
+this isn't the recipe — use Vercel or a container platform instead.
+
+## How it works
+
+<Steps>
+
+1. ### GitHub Actions builds the binary
+
+   `bun --bun run build:linux-x64` cross-compiles to a single Linux
+   binary regardless of the runner architecture. Produces a ~30MB
+   `./server` artifact.
+
+2. ### scp the binary to the VPS
+
+   The workflow uploads to a staging filename (`server.new`) instead
+   of overwriting `server` directly. `scp` writing to the live binary
+   would briefly leave it truncated if the transfer were interrupted.
+
+3. ### Atomic swap + restart
+
+   Over SSH:
+
+   ```bash
+   mv -f server.new server          # atomic on same filesystem
+   rm -rf .next public              # wipe stale extracted assets
+   sudo systemctl restart next-app  # the unit picks up the new binary
+   ```
+
+   `mv` within a filesystem is atomic at the inode level — readers
+   either see the old binary or the new one, never a half-written
+   file. The `rm -rf` of extracted assets is belt-and-suspenders:
+   `extractAssets` is idempotent and won't overwrite files that
+   already exist, so without the wipe stale chunks from the previous
+   deploy would linger.
+
+4. ### Smoke test
+
+   The workflow polls `/api/healthz` for up to 30s after restart. If
+   it doesn't come back 200, the workflow fails — you find out about
+   broken rollouts in CI, not from your users.
+
+</Steps>
+
+## VPS setup (one-time)
+
+Pick any VPS that runs systemd and ships glibc — Ubuntu, Debian,
+Rocky, anything modern.
+
+<Steps>
+
+1. ### Create a deploy user
+
+   ```bash
+   sudo useradd -r -m -s /bin/bash -d /srv/next-app deploy
+   sudo mkdir -p /srv/next-app
+   sudo chown -R deploy:deploy /srv/next-app
+   ```
+
+2. ### Generate a deploy SSH key
+
+   On your laptop (don't reuse a personal key):
+
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/next-app-deploy -N ""
+   cat ~/.ssh/next-app-deploy.pub
+   ```
+
+   On the VPS, add the public key to `deploy`'s authorized_keys.
+
+3. ### Allow `deploy` to restart the service
+
+   ```bash
+   sudo visudo -f /etc/sudoers.d/deploy-next-app
+   ```
+
+   ```
+   deploy ALL=(root) NOPASSWD: /bin/systemctl restart next-app
+   ```
+
+4. ### Install the systemd unit
+
+   The unit file is at `examples/vps-deploy/systemd/next-app.service`
+   in the repo. Copy it to the VPS, then:
+
+   ```bash
+   sudo cp next-app.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable next-app
+   ```
+
+   Don't start yet — there's no binary in `/srv/next-app/server` until
+   the first deploy.
+
+5. ### (Recommended) Put caddy in front for TLS
+
+   ```bash
+   sudo apt install caddy
+   ```
+
+   `/etc/caddy/Caddyfile`:
+
+   ```caddyfile
+   example.com {
+     reverse_proxy 127.0.0.1:3000
+   }
+   ```
+
+   Caddy handles HTTPS via Let's Encrypt automatically.
+
+</Steps>
+
+## Repo secrets + variables
+
+In repo Settings → Secrets and variables → Actions:
+
+**Secrets:**
+
+| Name              | Value                                                  |
+|-------------------|--------------------------------------------------------|
+| `VPS_HOST`        | `example.com` or VPS IP                                |
+| `VPS_USER`        | `deploy`                                               |
+| `VPS_SSH_KEY`     | contents of `~/.ssh/next-app-deploy` (the private key) |
+| `VPS_KNOWN_HOSTS` | `ssh-keyscan example.com` — pin the host key           |
+
+**Variables:**
+
+| Name           | Value           |
+|----------------|-----------------|
+| `APP_DIR`      | `/srv/next-app` |
+| `SERVICE_NAME` | `next-app`      |
+
+## Native dependencies (sharp, etc.)
+
+The binary loads native bindings just fine on any glibc-based VPS.
+For sharp's text rendering features specifically (watermarks),
+install fontconfig + a font face on the VPS:
+
+```bash
+sudo apt install fontconfig fonts-dejavu-core
+```
+
+No fancier setup required.
+
+## Why not Docker?
+
+Docker on a VPS is fine — it just adds layers (the daemon, an image
+registry, image pulls on every deploy). The single-binary approach
+is what makes "skip Docker" reasonable:
+
+| | Docker on VPS | next-bun-compile + scp |
+|---|---|---|
+| Per-deploy transfer | image pull (~50–200MB) | one binary (~30MB) |
+| Daemon process | yes, always | none |
+| Registry creds | yes | none |
+| Rollback | re-pull old tag | `mv` the previous binary back |
+
+If you already have a Docker pipeline you like, keep it. The
+[Distroless + sharp recipe](/next-bun-compile/recipes/distroless-sharp/)
+shows the container path.
+
+## Multi-app, multi-arch, no-reverse-proxy variants
+
+- **Multiple apps on one VPS:** each gets its own user, its own
+  `WorkingDirectory`, and its own systemd unit. Caddy in front
+  handles host-based routing.
+- **ARM VPS** (Hetzner, Oracle, AWS Graviton): swap
+  `build:linux-x64` for `build:linux-arm64` in the workflow.
+- **Skip the reverse proxy:** set `HOSTNAME=0.0.0.0` and
+  `PORT=80` in the unit, plus
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE` to bind a privileged
+  port as non-root. You're now responsible for TLS — most people
+  shouldn't.
+
+## Rollback
+
+The previous binary is gone (`mv` overwrote it). If you need
+rollback insurance, change the workflow to keep one backup:
+
+```bash
+mv -f server server.prev
+mv -f server.new server
+```
+
+Then `mv -f server.prev server && sudo systemctl restart next-app`
+rolls back instantly.
+
+For more sophisticated rollouts (canary, blue/green), you've outgrown
+"one VPS + systemd" — time to look at a container platform.
