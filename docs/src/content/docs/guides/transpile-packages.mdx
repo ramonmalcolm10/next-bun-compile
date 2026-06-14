@@ -1,0 +1,80 @@
+---
+title: transpilePackages
+description: When and why to use Next.js's transpilePackages with packages that have dynamic requires.
+---
+
+## The problem
+
+Some npm packages use dynamic `require()` calls internally —
+typically for worker threads, transports, plugins, or conditional
+loading. Examples: `pino`, `pino-pretty`, packages that load
+plugins by string name.
+
+Turbopack can't statically resolve these dynamic requires, so it
+**externalizes** the package. At runtime in a compiled binary,
+those dynamic calls hit names like `require("pino-142500b1eb3f4baf")`
+that don't exist in any node_modules, and you see:
+
+```
+Failed to load external module pino-142500b1eb3f4baf:
+ResolveMessage: Cannot find package ...
+```
+
+## The fix
+
+Add the package to `transpilePackages` in your `next.config.ts`:
+
+```ts
+const nextConfig: NextConfig = {
+  transpilePackages: ["pino", "pino-pretty"],
+  adapterPath: import.meta.resolve("next-bun-compile"),
+};
+```
+
+This forces Turbopack to fully compile the package source rather
+than deferring its dynamic requires to runtime. The package code
+ends up bundled into your chunks — no externalization, no resolver
+gymnastics needed.
+
+## When you need it
+
+You'll hit this for packages that:
+
+- Use `require()` with computed/variable specifiers (`require(pluginName)`)
+- Spawn worker threads via `new Worker(__filename)` or similar
+- Conditionally load implementations by inspecting env vars at runtime
+
+Pure ESM imports and statically-analyzable `require("string-literal")`
+calls don't need this — they work fine externalized.
+
+## When NOT to use it
+
+`transpilePackages` doesn't work for **native modules** (anything
+that ships `.node` files or relies on dlopen). Native deps must stay
+externalized; that's what the resolver hook is for. Examples:
+
+- `sharp` — externalize, don't transpile
+- `bcrypt` — externalize, don't transpile
+- `better-sqlite3` — externalize, don't transpile
+
+For native deps with dynamic resolution, the runtime resolver hook
+handles things automatically. See
+[How it works](/next-bun-compile/how-it-works/).
+
+## Diagnosing whether a package needs it
+
+Symptom: runtime error of the form `Failed to load external module
+<pkg>-<16-hex-chars>`.
+
+To verify it's a "dynamic require" issue and not a missing-canonical
+issue:
+
+1. Run with `NEXT_BUN_COMPILE_VERBOSE=1` at **build** time. The
+   adapter prints every alias it discovered and whether it resolved.
+2. If the failing alias resolves cleanly at build but fails at runtime,
+   the dynamic-require path inside the package is hitting an
+   un-statically-analyzable code path.
+3. Add the package to `transpilePackages` and rebuild.
+
+If verbose output shows the alias **didn't** resolve at build, see
+[Troubleshooting: alias didn't resolve](/next-bun-compile/troubleshooting/#cannot-find-package-x-hex-or-x-hexsub).

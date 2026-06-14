@@ -1,0 +1,71 @@
+---
+title: Cross-Compilation
+description: Build binaries for a different platform than your build machine.
+---
+
+import { Tabs, TabItem } from "@astrojs/starlight/components";
+
+Any flags passed to `next-bun-compile` are forwarded to
+`bun build --compile`. The most useful is `--target`:
+
+<Tabs>
+  <TabItem label="Linux x86_64">
+    ```bash
+    next-bun-compile --target=bun-linux-x64
+    ```
+  </TabItem>
+  <TabItem label="Linux ARM64">
+    ```bash
+    next-bun-compile --target=bun-linux-arm64
+    ```
+  </TabItem>
+  <TabItem label="macOS Apple Silicon">
+    ```bash
+    next-bun-compile --target=bun-darwin-arm64
+    ```
+  </TabItem>
+  <TabItem label="macOS Intel">
+    ```bash
+    next-bun-compile --target=bun-darwin-x64
+    ```
+  </TabItem>
+  <TabItem label="Windows">
+    ```bash
+    next-bun-compile --target=bun-windows-x64
+    ```
+  </TabItem>
+</Tabs>
+
+You can wire this into the build script:
+
+```json
+{
+  "scripts": {
+    "build:linux": "next build && next-bun-compile --target=bun-linux-x64",
+    "build:mac": "next build && next-bun-compile --target=bun-darwin-arm64"
+  }
+}
+```
+
+See the [Bun cross-compilation docs](https://bun.sh/docs/bundler/executables#cross-compile)
+for the complete target list and caveats.
+
+## Native dependencies + cross-compile
+
+If your app uses native deps like `sharp`, the binary embeds the
+native bindings that were installed for your **build platform**.
+Cross-compiling to a different OS/arch without re-installing the
+deps for that platform means those bindings won't load at runtime.
+
+**The reliable approach.** Build inside a container matching your
+deploy platform:
+
+```bash
+docker run --rm -v "$PWD":/app -w /app oven/bun:1.3.14 bash -c "
+  bun install &&
+  bun run build
+"
+```
+
+Or build in CI on a Linux runner if you're deploying to Linux —
+that's what most setups end up doing.

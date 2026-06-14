@@ -1,0 +1,88 @@
+---
+title: Monorepos
+description: bun workspaces, pnpm workspaces, and Turborepo all work — here's what to know.
+---
+
+next-bun-compile detects monorepo standalone layouts automatically.
+Next.js produces something like `apps/web/.next/standalone/apps/web/server.js`
+in a monorepo (the app path is preserved inside the standalone tree),
+and the adapter handles that without configuration.
+
+## Bun workspaces
+
+Standard bun workspaces setup, no special config:
+
+```json
+// package.json (monorepo root)
+{
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}
+```
+
+```json
+// apps/web/package.json
+{
+  "name": "web",
+  "scripts": {
+    "build": "next build && next-bun-compile"
+  },
+  "dependencies": {
+    "@example/shared": "*",
+    "next": "^16",
+    "next-bun-compile": "^0.6"
+  }
+}
+```
+
+```bash
+bun install                                  # at the monorepo root
+cd apps/web && bun --bun run build           # produces apps/web/server
+```
+
+A full working monorepo + sharp example is in
+[Recipes › Monorepo + sharp](/next-bun-compile/recipes/monorepo-sharp/).
+
+## pnpm workspaces
+
+Same idea — pnpm's `.pnpm/` hoisted store is handled the same way as
+bun's `.bun/` store. The adapter walks both.
+
+## Turborepo
+
+Works as-is. If you use `turbo prune --docker` in CI to slim the
+Docker context, the pruned tree still triggers the nested-layout
+codepath. The adapter doesn't care about the workspace tool — only
+about the standalone layout Next.js produces.
+
+## What the adapter does for monorepos
+
+1. **Detects nested `server.js`.** `findServerDir` walks the standalone
+   to find your app's directory (e.g. `standalone/apps/web/`).
+2. **Walks nested `node_modules/`.** Monorepo standalone outputs often
+   have both `standalone/node_modules/` AND
+   `standalone/apps/web/node_modules/`. The adapter scans both for
+   externalized packages and stub placement.
+3. **Workspace packages survive.** Anything Next.js's trace pulled in
+   (including workspace `*`-version deps) gets extracted from
+   wherever it landed in the standalone.
+
+## Common gotchas
+
+### "Server.js not found anywhere"
+
+The adapter looks for `server.js` in the standalone tree but skips
+`node_modules`. If your app's `server.js` ends up under a path the
+search doesn't recognize, file an issue with the layout — we'll
+extend the detection.
+
+### Path-relative `import.meta.resolve` in next.config.ts
+
+Works the same in monorepos. The resolution happens at config-load
+time so the workspace's `node_modules` is what's consulted.
+
+### Mixed package managers
+
+If your CI installs with `bun` but your repo also has a stale
+`package-lock.json`, Next.js's "multiple lockfiles" warning may
+confuse workspace detection. Remove the unused lockfile.
