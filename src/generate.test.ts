@@ -387,6 +387,79 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain('"sharp-457ea9eae1af1a9c":"sharp"');
   });
 
+  test("validator warns when an alias references a missing canonical package", () => {
+    // Chunk references `missing-pkg-deadbeefdeadbeef` but no `missing-pkg`
+    // is installed anywhere in the standalone. The build still has to run
+    // to completion (we don't fail the build — runtime might handle it
+    // via try/catch in an optional code path) but it must emit a warning
+    // so the user sees the issue at build time, not deploy time.
+    const root = join(tmpBase, "alias-unresolved-warn");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "warn-build",
+      ".next/standalone/.next/server/chunks/ssr/page.js":
+        `require("missing-pkg-deadbeefdeadbeef")`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      // no missing-pkg anywhere
+      "public/favicon.ico": "icon",
+    });
+
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => warns.push(args.join(" "));
+    try {
+      generateEntryPoint({ standaloneDir, distDir, projectDir });
+    } finally {
+      console.warn = origWarn;
+    }
+
+    const joined = warns.join("\n");
+    expect(joined).toContain("missing-pkg-deadbeefdeadbeef");
+    expect(joined).toContain("missing-pkg");
+    expect(joined).toContain("won't resolve at runtime");
+  });
+
+  test("validator stays quiet when every alias resolves", () => {
+    const root = join(tmpBase, "alias-all-resolved");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "ok-build",
+      ".next/standalone/.next/server/chunks/ssr/page.js":
+        `require("sharp-457ea9eae1af1a9c")`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/package.json":
+        JSON.stringify({ name: "sharp", main: "index.js" }),
+      ".next/standalone/node_modules/.bun/sharp@0.34.5/node_modules/sharp/index.js":
+        "module.exports = {};",
+      "public/favicon.ico": "icon",
+    });
+
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => warns.push(args.join(" "));
+    try {
+      generateEntryPoint({ standaloneDir, distDir, projectDir });
+    } finally {
+      console.warn = origWarn;
+    }
+
+    expect(warns.join("\n")).not.toContain("won't resolve");
+  });
+
   test("deeply nested monorepo layout (packages/apps/web)", () => {
     const root = join(tmpBase, "deep-mono");
     const distDir = join(root, ".next");
