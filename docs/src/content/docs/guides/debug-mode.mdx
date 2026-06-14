@@ -1,0 +1,68 @@
+---
+title: Debug Mode
+description: Surface every resolver-hook decision at runtime to diagnose why a require failed.
+---
+
+When a binary fails at runtime, the bug-report → diagnosis cycle is
+usually "share the error, then 20 questions about node_modules
+layout." Debug mode flips one env var and you get the full picture.
+
+## Enable
+
+```bash
+NEXT_BUN_COMPILE_DEBUG=1 ./server
+```
+
+## What you'll see
+
+```
+next-bun-compile [debug]: resolver hook installed; 1 alias mapping(s):
+next-bun-compile [debug]:   sharp-91413508168e89eb → sharp
+next-bun-compile [debug]: fallback resolved "detect-libc" → /app/.next/node_modules/detect-libc/lib/detect-libc.js (from /app/.next/node_modules/sharp/lib)
+next-bun-compile [debug]: fallback resolved "@img/sharp-linux-x64/sharp.node" → /app/.next/node_modules/@img/sharp-linux-x64/lib/sharp-linux-x64.node (from .../sharp/lib)
+next-bun-compile [debug]: fallback FAILED for "missing-pkg" (from /app/...); throwing original ResolveMessage
+```
+
+## What each line means
+
+| Line                      | What happened                                                                       |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| `resolver hook installed` | One-shot at boot. Shows the alias-redirect table the hook will consult.             |
+| `redirected "X" → "Y"`    | Alias map rewrote a mangled name to its canonical form before resolution ran.       |
+| `fallback resolved`       | Bun's compiled-binary resolver failed; our Node-compatible walk found the file.     |
+| `fallback FAILED`         | Both bun's resolver AND our fallback walk failed. The original `ResolveMessage` will throw next. |
+
+The parent file path on each line tells you **which extracted package** triggered the require — usually enough to skip straight to the fix.
+
+## Build-time verbose mode (related)
+
+For build-time issues (an alias the build couldn't resolve to a
+concrete file), use `NEXT_BUN_COMPILE_VERBOSE=1`:
+
+```bash
+NEXT_BUN_COMPILE_VERBOSE=1 bun run build
+```
+
+Output:
+
+```
+next-bun-compile: Validating 2 turbopack alias reference(s):
+  ✓ sharp-91413508168e89eb → sharp (sharp/lib/index.js)
+  ✓ prettier-285d8f1d6bb5f650/plugins/html → prettier/plugins/html (prettier/plugins/html.mjs)
+```
+
+A `✗` line means the canonical file isn't where the adapter looked.
+Cross-reference with the verbose log if the runtime debug mode shows
+a "FAILED" for the same alias.
+
+## When to leave debug mode on
+
+Off in production. The hook itself runs on every `require()` (CJS),
+and while it short-circuits to bun's resolver in the common case
+(O(1) alias-map check, single bun.resolver call), the logging adds
+console.log overhead per resolution. Fine for debugging, not for
+hot paths.
+
+If you want **always-on** observability for the hook firing rate,
+let us know — we can add a "summary at exit" counter without
+per-call logging.

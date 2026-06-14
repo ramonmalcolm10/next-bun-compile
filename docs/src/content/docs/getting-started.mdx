@@ -1,0 +1,131 @@
+---
+title: Getting Started
+description: Install next-bun-compile and ship your first Next.js binary in minutes.
+---
+
+import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
+
+## Requirements
+
+- [Bun](https://bun.sh) >= 1.3
+- [Next.js](https://nextjs.org) >= 16.0.0
+
+## Setup
+
+<Steps>
+
+1. ### Install
+
+   <Tabs>
+     <TabItem label="bun">
+       ```bash
+       bun add -D next-bun-compile
+       ```
+     </TabItem>
+     <TabItem label="npm">
+       ```bash
+       npm install -D next-bun-compile
+       ```
+     </TabItem>
+     <TabItem label="pnpm">
+       ```bash
+       pnpm add -D next-bun-compile
+       ```
+     </TabItem>
+     <TabItem label="yarn">
+       ```bash
+       yarn add -D next-bun-compile
+       ```
+     </TabItem>
+   </Tabs>
+
+2. ### Register the adapter
+
+   Add `adapterPath` to your `next.config.ts`:
+
+   ```ts
+   import type { NextConfig } from "next";
+
+   const nextConfig: NextConfig = {
+     adapterPath: import.meta.resolve("next-bun-compile"),
+   };
+
+   export default nextConfig;
+   ```
+
+   :::note[Using Next.js 16.1?]
+   Wrap it in `experimental`:
+
+   ```ts
+   const nextConfig: NextConfig = {
+     experimental: {
+       adapterPath: import.meta.resolve("next-bun-compile"),
+     },
+   };
+   ```
+   :::
+
+3. ### Update your build script
+
+   ```json
+   {
+     "scripts": {
+       "build": "next build && next-bun-compile"
+     }
+   }
+   ```
+
+   The adapter sets `output: "standalone"` automatically — you don't
+   need to add it yourself.
+
+4. ### Build the binary
+
+   ```bash
+   bun run build
+   ```
+
+   Produces a single `./server` executable next to your `package.json`.
+
+5. ### Run it
+
+   ```bash
+   ./server
+   ```
+
+   Listens on port 3000 by default. Configurable via the `PORT` env var.
+
+</Steps>
+
+## What's in the binary?
+
+- Your Next.js server runtime (chunks, manifests, build ID)
+- Static assets (`.next/static/*`)
+- Public files (`public/*`)
+- All externalized server packages (sharp, prisma, anything in
+  `serverExternalPackages`, etc.)
+- The bun runtime itself (you don't need bun on the deploy target)
+
+The binary extracts its embedded assets to disk on first run, then
+boots Next.js. Subsequent runs are instant — extraction is idempotent.
+
+## Verify it works
+
+```bash
+PORT=3000 ./server &
+curl http://localhost:3000/
+```
+
+You should see your homepage HTML. From here, the typical next step
+is putting it in a Docker image — see the
+[Distroless + sharp recipe](/next-bun-compile/recipes/distroless-sharp/)
+for a complete working Dockerfile.
+
+## Next steps
+
+- **Native deps** like `sharp` need a runner image with the right C
+  libraries. See [Native dependencies in Docker](/next-bun-compile/recipes/distroless-sharp/).
+- **Monorepos** are supported out of the box. See the
+  [Monorepo guide](/next-bun-compile/guides/monorepo/).
+- **Something went wrong?** Check [Troubleshooting](/next-bun-compile/troubleshooting/).
+- **Curious how the binary actually works?** See
+  [How it works](/next-bun-compile/how-it-works/).

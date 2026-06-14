@@ -1,0 +1,115 @@
+---
+title: Monorepo + sharp
+description: Complete Dockerfile recipe — bun workspaces monorepo (app + shared package) with sharp, on distroless.
+---
+
+A bun-workspaces monorepo with one Next.js app (`apps/web`) and one
+shared package (`packages/shared`). The web app uses sharp + the
+shared package and is compiled to a single binary on
+`gcr.io/distroless/cc-debian12`.
+
+This recipe doubles as the e2e regression test for two things at
+once:
+
+1. **Nested standalone layout** — Next.js produces
+   `apps/web/.next/standalone/apps/web/server.js`, not
+   `standalone/server.js`. The adapter handles the nesting
+   automatically.
+2. **Workspace package resolution** — `@example/shared` is a
+   workspace-versioned dep. It survives the standalone trace
+   round-trip into the binary.
+
+Full source in
+[`examples/monorepo/`](https://github.com/ramonmalcolm10/next-bun-compile/tree/main/examples/monorepo).
+
+## Project layout
+
+```
+monorepo/
+├── package.json              # workspaces: ["apps/*", "packages/*"]
+├── apps/
+│   └── web/
+│       ├── app/api/resize/route.ts  # uses sharp + @example/shared
+│       ├── next.config.ts
+│       └── package.json
+├── packages/
+│   └── shared/
+│       ├── index.ts          # exports pickColor(seed)
+│       └── package.json
+└── Dockerfile
+```
+
+## Dockerfile
+
+```dockerfile
+FROM oven/bun:1.3.14 AS builder
+
+WORKDIR /app
+
+# Workspace setup: root package.json + all workspace package.jsons
+# need to be present before `bun install` so the workspace graph
+# resolves. Copy them all first, then install once.
+COPY package.json bun.lock* ./
+COPY apps/web/package.json ./apps/web/
+COPY packages/shared/package.json ./packages/shared/
+RUN bun install --no-save
+
+# Now copy the source code
+COPY . .
+
+# Fontconfig + fonts for sharp/libvips text rendering. Skip if your
+# sharp usage is resize/format-only.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fontconfig fonts-dejavu-core \
+ && fc-cache -f \
+ && rm -rf /var/lib/apt/lists/*
+
+# Build the web app — produces apps/web/server (single binary)
+RUN cd apps/web && bun --bun run build
+
+# Runner: distroless with libstdc++ + fontconfig
+FROM gcr.io/distroless/cc-debian12:nonroot AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME="0.0.0.0"
+
+COPY --from=builder --chown=nonroot:nonroot /app/apps/web/server ./
+
+COPY --from=builder /etc/fonts /etc/fonts
+COPY --from=builder /usr/share/fontconfig /usr/share/fontconfig
+COPY --from=builder /usr/share/fonts /usr/share/fonts
+COPY --from=builder /var/cache/fontconfig /var/cache/fontconfig
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libfontconfig.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libfreetype.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libexpat.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libpng16.so* /usr/lib/x86_64-linux-gnu/
+
+EXPOSE 3000
+CMD ["./server"]
+```
+
+## Build it
+
+```bash
+docker build -t next-bun-compile-monorepo .
+docker run --rm -p 3000:3000 next-bun-compile-monorepo
+```
+
+## Adapting to your monorepo
+
+- **Turborepo / Nx.** Same recipe — the adapter cares about the
+  standalone layout, not the workspace tool. If you use
+  `turbo prune --docker` in CI to slim the Docker context, the
+  pruned tree still works.
+- **pnpm workspaces.** Works. The `.pnpm/` hoisted store is handled
+  by the same code as the `.bun/` store.
+- **Many apps in one repo.** The adapter scopes to whatever app's
+  `next build` you run; it doesn't try to detect siblings. Build
+  each app independently.
+- **Workspace dep changed but binary stale?** `next build` doesn't
+  rebuild on workspace-package changes by default. Add the workspace
+  package to `transpilePackages` (or rely on file watching during
+  development) if you hit this.
