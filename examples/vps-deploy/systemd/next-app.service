@@ -1,0 +1,62 @@
+# Systemd unit for a next-bun-compile binary.
+#
+# Install:
+#   sudo cp next-app.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable next-app
+#   sudo systemctl start next-app
+#
+# Status / logs:
+#   sudo systemctl status next-app
+#   journalctl -u next-app -f
+#
+# Substitute the values marked TODO before installing.
+
+[Unit]
+Description=Next.js app (next-bun-compile binary)
+After=network.target
+
+[Service]
+Type=simple
+
+# TODO: non-root user that owns APP_DIR. Create with:
+#   sudo useradd -r -s /bin/false -d /srv/next-app deploy
+User=deploy
+Group=deploy
+
+# TODO: the directory the GitHub Actions workflow uploads `server` into.
+# Must match the APP_DIR repo variable. The binary `cwd`s here at boot
+# (via `process.chdir(baseDir)`) and writes its extracted assets in
+# `.next/` and `public/` relative to this dir.
+WorkingDirectory=/srv/next-app
+ExecStart=/srv/next-app/server
+
+# Restart on crash; back off if it crashes repeatedly so we don't
+# pin a CPU on a doomed configuration.
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# Bind to a non-privileged port. Put caddy/nginx in front for TLS +
+# port 80/443 → this port. CAP_NET_BIND_SERVICE would let the binary
+# bind 80/443 directly without root, but reverse proxies are usually
+# simpler.
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+
+# Hardening — drop everything we don't need. Adjust if your app
+# legitimately needs more (e.g. WRITE_PATHS for an upload dir).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/next-app
+
+# Logging goes to journalctl.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

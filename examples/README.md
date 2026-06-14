@@ -8,6 +8,7 @@ real environments. Each example is also an e2e regression test —
 |---|---|
 | [`sharp/`](./sharp) | distroless + `sharp` on a single Next.js app. The most common starting point for an app with native image processing. Includes fontconfig setup for libvips text rendering. |
 | [`monorepo/`](./monorepo) | bun workspaces monorepo (one app, one shared package) with `sharp`. Demonstrates the nested-standalone layout (`standalone/apps/web/server.js`) and workspace dep resolution from the binary. |
+| [`vps-deploy/`](./vps-deploy) | Deploy to a VPS via GitHub Actions + SSH + systemd. The VPS needs nothing installed but ssh, systemd, and glibc — no node, no bun, no Docker. Includes the deploy workflow, the systemd unit, and full one-time-setup README. |
 
 ## How to use a recipe
 
