@@ -24,3 +24,63 @@ jobs:
 
       - name: Test
         run: bun test
+
+  e2e-sharp:
+    name: E2E (sharp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build adapter
+        run: |
+          bun install
+          bun run build
+
+      - name: Install fixture deps
+        working-directory: test/e2e/sharp-app
+        run: bun install
+
+      - name: Compile fixture binary
+        working-directory: test/e2e/sharp-app
+        run: bun --bun run build
+
+      - name: Boot binary and verify sharp serves a PNG
+        working-directory: test/e2e/sharp-app
+        run: |
+          PORT=3001 ./server > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+
+          # Wait up to 30s for readiness
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:3001/; then
+              break
+            fi
+            sleep 1
+          done
+
+          # Hit the sharp-driven endpoint
+          HTTP_STATUS=$(curl -sS -o /tmp/out.png -w "%{http_code}" http://localhost:3001/api/resize)
+
+          kill $SERVER_PID 2>/dev/null || true
+          sleep 1
+
+          echo "--- server log ---"
+          cat /tmp/server.log
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ /api/resize returned $HTTP_STATUS"
+            exit 1
+          fi
+
+          if ! file /tmp/out.png | grep -q "PNG image"; then
+            echo "❌ /api/resize output is not a PNG:"
+            file /tmp/out.png
+            exit 1
+          fi
+
+          echo "✅ sharp resolved + loaded + produced a PNG end-to-end"
