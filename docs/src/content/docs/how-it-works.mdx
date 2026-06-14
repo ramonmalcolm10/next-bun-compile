@@ -1,0 +1,128 @@
+---
+title: How It Works
+description: The architecture behind the binary — what the adapter does at build time, what the runtime does at boot.
+---
+
+## Pipeline
+
+1. **Adapter hook** — `modifyConfig()` flips `output: "standalone"`
+   automatically and writes a build-context file.
+2. **`next build`** runs your normal Next.js build, producing the
+   standalone tree under `.next/standalone/`.
+3. **`next-bun-compile` CLI** scans the standalone, discovers
+   externalized packages and turbopack-mangled aliases, generates
+   `server-entry.js` and `assets.generated.js`, then invokes
+   `bun build --compile`.
+4. **Bun compiles** everything (server code, embedded asset files,
+   bun runtime) into one binary with `--bytecode --minify`.
+
+## What gets embedded
+
+- All static files in `.next/static/` (skipped if `assetPrefix` set)
+- All public files
+- The `.next/server/` tree (chunks, manifests, build ID)
+- Every externalized server package — copied from your `node_modules/`
+  into the binary as file assets
+- A `server-entry.js` that extracts everything at first boot and
+  starts Next.js
+
+## Runtime: asset extraction
+
+On first run, the binary writes its embedded assets to disk relative
+to `process.execPath`. Subsequent runs see the files already there
+and skip re-extraction. Extraction is fast (~hundreds of ms for ~1500
+files) and idempotent.
+
+## Resolver hook for externalized packages
+
+This is where most of the interesting work happens. Next.js with
+Turbopack externalizes some packages (`sharp`, `bcrypt`, anything in
+`serverExternalPackages`, anything with native bindings) — they're
+loaded at runtime instead of bundled. Two things make that
+challenging in a compiled binary:
+
+1. **Mangled names.** Turbopack rewrites `require("sharp")` to
+   `require("sharp-457ea9eae1af1a9c")` in chunks, with a build-time
+   symlink at `.next/node_modules/sharp-457... → sharp`. The
+   compiled binary has no node_modules tree pre-baked.
+2. **Bun's compiled-binary resolver quirk.** From inside an extracted
+   `node_modules` entry (e.g. `sharp/lib/sharp.js`), bun's resolver
+   in compiled-binary mode doesn't reliably walk up to find sibling
+   packages. The same lookup works in `bun --bun next start` — it's
+   specific to compiled-binary mode.
+
+### Two mechanisms
+
+#### 1. Build-time chunk rewrite
+
+The adapter scans server chunks for `"<name>-<16 hex>"` string
+literals (the mangled-alias pattern) and replaces each with the
+absolute file path of the canonical target:
+
+```diff
+- require("sharp-457ea9eae1af1a9c")
++ require("__NBC_BASE__/.next/node_modules/sharp/lib/index.js")
+```
+
+`__NBC_BASE__` is a placeholder substituted with the real `baseDir`
+when `extractAssets` writes each chunk to disk. Resolution becomes a
+direct file load — no walks, no exports-map ambiguity, no resolver
+involvement. Works for both CJS `require()` and ESM `import()`.
+
+For subpath imports (`import("prettier-.../plugins/html")`), the
+adapter reads each canonical's `package.json` + `exports` map to
+pick the right `.mjs`/`.js`/`.cjs` variant, then rewrites to that
+absolute path.
+
+#### 2. Runtime `Module._resolveFilename` hook
+
+Once execution is inside an extracted package (sharp's own
+`require('detect-libc')`, the dynamic
+interpolated requires like `require('@img/sharp-PLATFORM/sharp.node')` (where `PLATFORM` is built from a runtime variable), the
+chunk rewrite no longer applies. A `Module._resolveFilename` hook
+catches CJS resolves that bun's compiled-binary resolver fails on
+and reimplements Node-compatible resolution from scratch:
+
+- Walk node_modules from the calling file
+- Read `package.json` + `main` for top-level
+- Honor `exports` maps (`require`/`node`/`default` conditions)
+- Handle directory subpaths with their own `package.json` +
+  `main` (e.g. `next/dist/compiled/source-map`)
+
+The hook also consults an alias map (`sharp-457... → sharp`) and
+redirects mangled names that slip past the build-time rewrite.
+
+Together: every externalized package's internal deps resolve through
+the same mechanism. No per-package patching needed for the common
+cases.
+
+## Module stubs (dev-only code paths)
+
+Some modules can't be resolved at compile time but are never reached
+in production — Next's dev server, the dev bundler, optional deps
+loaded in try/catch. The adapter creates no-op stubs for these
+**only if** the real module isn't installed. If you do install
+`@opentelemetry/api` or `critters`, the real package gets bundled
+instead.
+
+## Pre-flight validator (build time)
+
+For every alias + subpath the chunks reference, the adapter checks
+whether resolution found a file. If anything didn't resolve, it
+warns at build time:
+
+```
+next-bun-compile: ⚠ 1 of 4 turbopack alias reference(s) won't resolve at runtime:
+  ✗ some-pkg-deadbeef/foo → some-pkg/foo
+```
+
+Set `NEXT_BUN_COMPILE_VERBOSE=1` during build to see every
+resolution + the file it picked — useful for verifying exports-map
+handling chose the right variant.
+
+## Debug mode (runtime)
+
+Set `NEXT_BUN_COMPILE_DEBUG=1` when running the binary to log every
+resolver-hook decision: alias redirects, fallback walks, fallback
+failures, with parent-file context. See
+[Debug mode](/next-bun-compile/guides/debug-mode/).

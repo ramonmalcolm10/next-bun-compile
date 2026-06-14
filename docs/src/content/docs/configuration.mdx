@@ -1,0 +1,90 @@
+---
+title: Configuration
+description: Environment variables, CLI flags, and Next.js config options that affect next-bun-compile.
+---
+
+## Environment variables (runtime)
+
+| Variable                   | Default     | Description                                                       |
+| -------------------------- | ----------- | ----------------------------------------------------------------- |
+| `PORT`                     | `3000`      | Server port                                                       |
+| `HOSTNAME`                 | `0.0.0.0`   | Server hostname                                                   |
+| `KEEP_ALIVE_TIMEOUT`       | —           | HTTP keep-alive timeout (ms)                                      |
+| `NEXT_BUN_COMPILE_DEBUG`   | `0`         | Set to `1` to log every resolver-hook decision. See [Debug mode](/next-bun-compile/guides/debug-mode/). |
+| `NEXT_BUN_COMPILE_VERBOSE` | `0`         | Set to `1` to print the alias-resolution table at **build** time. |
+
+## CLI flags
+
+Any flags passed to `next-bun-compile` are forwarded to
+`bun build --compile`. The most useful is `--target` for
+cross-compilation:
+
+```bash
+next-bun-compile --target=bun-linux-x64
+next-bun-compile --target=bun-linux-arm64
+next-bun-compile --target=bun-windows-x64
+```
+
+See the [Cross-compilation guide](/next-bun-compile/guides/cross-compilation/)
+for the full target list.
+
+## `next.config.ts` options
+
+### `adapterPath` (required)
+
+```ts
+const nextConfig: NextConfig = {
+  adapterPath: import.meta.resolve("next-bun-compile"),
+};
+```
+
+Registers next-bun-compile as the build adapter. The adapter writes a
+build-context file that the `next-bun-compile` CLI consumes after
+`next build`.
+
+For Next.js 16.1, this lives under `experimental.adapterPath`. For
+16.2+, it's at the top level.
+
+### `assetPrefix` (optional, optimizes binary size)
+
+If you set `assetPrefix` for a CDN, the adapter detects it and
+**skips embedding static assets** in the binary — your CDN serves
+them instead. Only `public/` files and runtime chunks get embedded.
+
+```ts
+const nextConfig: NextConfig = {
+  assetPrefix: "https://cdn.example.com",
+  adapterPath: import.meta.resolve("next-bun-compile"),
+};
+```
+
+You'll need to upload `.next/static/` to your CDN separately.
+
+### `transpilePackages` (optional, for packages with dynamic requires)
+
+Some packages use dynamic `require()` calls internally that Turbopack
+can't resolve at build time. Force them through the bundler instead:
+
+```ts
+const nextConfig: NextConfig = {
+  transpilePackages: ["pino", "pino-pretty"],
+  adapterPath: import.meta.resolve("next-bun-compile"),
+};
+```
+
+See the [transpilePackages guide](/next-bun-compile/guides/transpile-packages/)
+for when you need this.
+
+## What the adapter sets automatically
+
+You **don't** need to set these — the adapter applies them in
+`modifyConfig`:
+
+- `output: "standalone"` — required for the build to produce the tree
+  next-bun-compile reads.
+
+## Where the binary appears
+
+`./server` next to the `package.json` of the project being built.
+In a monorepo, this is `apps/<your-app>/server`. The adapter detects
+monorepo layouts automatically.

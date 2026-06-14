@@ -1,0 +1,91 @@
+---
+title: next-bun-compile
+description: Compile Next.js apps into single-file Bun executables. One command. One binary. No runtime dependencies.
+template: splash
+hero:
+  tagline: A Next.js Build Adapter that compiles your app into a single-file Bun executable. One command, one binary, no runtime dependencies.
+  actions:
+    - text: Get Started
+      link: /next-bun-compile/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/ramonmalcolm10/next-bun-compile
+      icon: external
+      variant: minimal
+      attrs:
+        target: _blank
+        rel: noopener
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+## Why next-bun-compile?
+
+<CardGrid>
+  <Card title="One binary, ship anywhere" icon="rocket">
+    `next build` produces a single `./server` executable with every
+    static asset, public file, and runtime chunk embedded. Copy it to
+    a distroless image, scp it to a VM, attach it to a release —
+    that's the deploy.
+  </Card>
+  <Card title="Faster cold start" icon="random">
+    Bun's `--bytecode` flag pre-compiles JavaScript at build time so
+    parsing is skipped at boot. Real Next.js apps start ~2x faster
+    than `next start` on the same runtime.
+  </Card>
+  <Card title="Smaller image footprint" icon="seti:zip">
+    ~30MB binary on distroless beats ~150MB for `bun + standalone`
+    setups. For native deps like sharp, the runner adds the C runtime
+    libs and you're at ~80MB total.
+  </Card>
+  <Card title="Native deps just work" icon="puzzle">
+    sharp, bcrypt, better-sqlite3 — handled. A runtime resolver hook
+    + build-time chunk rewrite makes externalized packages resolve
+    cleanly from inside the compiled binary, with no per-package
+    configuration.
+  </Card>
+  <Card title="Monorepo aware" icon="seti:folder">
+    Bun workspaces, pnpm workspaces, Turborepo all work. The standalone
+    trace's nested layout (`standalone/apps/web/server.js`) is handled
+    correctly out of the box.
+  </Card>
+  <Card title="Works with what you already use" icon="approve-check">
+    Drops into your existing `next.config.ts` via `adapterPath`. No
+    changes to your app code, no opinions about your routing or data
+    layer.
+  </Card>
+</CardGrid>
+
+## Quick start
+
+```bash
+bun add -D next-bun-compile
+```
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  adapterPath: import.meta.resolve("next-bun-compile"),
+};
+
+export default nextConfig;
+```
+
+```json
+// package.json
+{
+  "scripts": {
+    "build": "next build && next-bun-compile"
+  }
+}
+```
+
+```bash
+bun run build    # → ./server
+./server         # serves on port 3000
+```
+
+Full walkthrough in [Getting Started](/next-bun-compile/getting-started/).
