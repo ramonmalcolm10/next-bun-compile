@@ -22,7 +22,7 @@ vps-deploy/
 │   ├── api/healthz/route.ts     # readiness endpoint for the smoke test
 │   ├── layout.tsx
 │   └── page.tsx
-├── next.config.ts               # adapterPath: next-bun-compile
+├── next.config.ts               # output: "standalone"
 ├── package.json                 # build:linux-x64 / build:linux-arm64 scripts
 ├── .github/workflows/
 │   └── deploy.yml               # the build + ship workflow

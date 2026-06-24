@@ -13,7 +13,7 @@ once:
 
 1. **Nested standalone layout** — Next.js produces
    `apps/web/.next/standalone/apps/web/server.js`, not
-   `standalone/server.js`. The adapter handles the nesting
+   `standalone/server.js`. next-bun-compile handles the nesting
    automatically.
 2. **Workspace package resolution** — `@example/shared` is a
    workspace-versioned dep. It survives the standalone trace
@@ -100,13 +100,13 @@ docker run --rm -p 3000:3000 next-bun-compile-monorepo
 
 ## Adapting to your monorepo
 
-- **Turborepo / Nx.** Same recipe — the adapter cares about the
+- **Turborepo / Nx.** Same recipe — next-bun-compile cares about the
   standalone layout, not the workspace tool. If you use
   `turbo prune --docker` in CI to slim the Docker context, the
   pruned tree still works.
 - **pnpm workspaces.** Works. The `.pnpm/` hoisted store is handled
   by the same code as the `.bun/` store.
-- **Many apps in one repo.** The adapter scopes to whatever app's
+- **Many apps in one repo.** next-bun-compile scopes to whatever app's
   `next build` you run; it doesn't try to detect siblings. Build
   each app independently.
 - **Workspace dep changed but binary stale?** `next build` doesn't

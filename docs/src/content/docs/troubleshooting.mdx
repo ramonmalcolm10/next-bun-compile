@@ -26,8 +26,8 @@ node_modules.
 
 ```ts
 const nextConfig: NextConfig = {
+  output: "standalone",
   transpilePackages: ["pino", "pino-pretty"],
-  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 

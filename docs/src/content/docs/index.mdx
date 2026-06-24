@@ -51,7 +51,7 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
     correctly out of the box.
   </Card>
   <Card title="Works with what you already use" icon="approve-check">
-    Drops into your existing `next.config.ts` via `adapterPath`. No
+    One line in your `next.config.ts` (`output: "standalone"`). No
     changes to your app code, no opinions about your routing or data
     layer.
   </Card>
@@ -68,7 +68,7 @@ bun add -D next-bun-compile
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  adapterPath: import.meta.resolve("next-bun-compile"),
+  output: "standalone",
 };
 
 export default nextConfig;

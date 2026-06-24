@@ -26,8 +26,8 @@ Add the package to `transpilePackages` in your `next.config.ts`:
 
 ```ts
 const nextConfig: NextConfig = {
+  output: "standalone",
   transpilePackages: ["pino", "pino-pretty"],
-  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 
@@ -69,8 +69,8 @@ Symptom: runtime error of the form `Failed to load external module
 To verify it's a "dynamic require" issue and not a missing-canonical
 issue:
 
-1. Run with `NEXT_BUN_COMPILE_VERBOSE=1` at **build** time. The
-   adapter prints every alias it discovered and whether it resolved.
+1. Run with `NEXT_BUN_COMPILE_VERBOSE=1` at **build** time.
+   next-bun-compile prints every alias it discovered and whether it resolved.
 2. If the failing alias resolves cleanly at build but fails at runtime,
    the dynamic-require path inside the package is hitting an
    un-statically-analyzable code path.

@@ -25,6 +25,86 @@ jobs:
       - name: Test
         run: bun test
 
+  e2e-next-versions:
+    name: E2E (Next.js ${{ matrix.label }})
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 8
+    # A canary break should warn, not fail the whole run.
+    continue-on-error: ${{ matrix.allow-failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "16.0.0 (floor)"
+            next: "16.0.0"
+            react: "19.2.0"
+            allow-failure: false
+          - label: "16.2.9 (verified)"
+            next: "16.2.9"
+            react: "19.2.0"
+            allow-failure: false
+          - label: "latest"
+            next: "latest"
+            react: "latest"
+            allow-failure: false
+          - label: "canary"
+            next: "canary"
+            react: "canary"
+            allow-failure: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build next-bun-compile
+        run: |
+          bun install
+          bun run build
+
+      - name: Pin Next.js ${{ matrix.next }} in example
+        working-directory: examples/vps-deploy
+        run: |
+          # Pin then CLEAN install. An incremental `bun add` over the
+          # self-referential `file:../..` devDep can hit a flaky ENOENT
+          # cache-copy error, so avoid it.
+          node -e "const p=require('./package.json');p.dependencies.next='${{ matrix.next }}';p.dependencies.react='${{ matrix.react }}';p.dependencies['react-dom']='${{ matrix.react }}';require('fs').writeFileSync('./package.json',JSON.stringify(p,null,2)+'\n')"
+          rm -rf node_modules bun.lock
+          bun install
+          echo "Using Next.js: $(node -p "require('next/package.json').version")"
+
+      - name: Compile binary
+        working-directory: examples/vps-deploy
+        run: bun --bun run build
+
+      - name: Boot binary and verify /api/healthz
+        working-directory: examples/vps-deploy
+        run: |
+          PORT=3003 ./server > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          trap "kill $SERVER_PID 2>/dev/null || true" EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:3003/api/healthz; then
+              break
+            fi
+            sleep 1
+          done
+
+          HTTP_STATUS=$(curl -sS -o /tmp/health.json -w "%{http_code}" http://localhost:3003/api/healthz)
+
+          echo "--- server log ---"
+          cat /tmp/server.log
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ /api/healthz returned $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "✅ vps-deploy compiles + boots on Next.js $(node -p "require('next/package.json').version")"
+
   e2e-sharp:
     name: E2E (sharp)
     runs-on: ubuntu-latest
@@ -36,7 +116,7 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Build adapter
+      - name: Build next-bun-compile
         run: |
           bun install
           bun run build
@@ -94,7 +174,7 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Build adapter
+      - name: Build next-bun-compile
         run: |
           bun install
           bun run build

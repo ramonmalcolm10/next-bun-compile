@@ -19,6 +19,27 @@ interface GenerateOptions {
 }
 
 /**
+ * Read assetPrefix from the build context. Prefers the adapter-written
+ * bun-compile-ctx.json (older flow) and falls back to required-server-files.json
+ * (always written by `next build`), so the CLI works whether or not the adapter
+ * is wired up.
+ */
+function readAssetPrefix(distDir: string): string {
+  const ctxPath = join(distDir, "bun-compile-ctx.json");
+  if (existsSync(ctxPath)) {
+    return JSON.parse(readFileSync(ctxPath, "utf-8")).assetPrefix ?? "";
+  }
+  const rsfPath = join(distDir, "required-server-files.json");
+  if (existsSync(rsfPath)) {
+    const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
+      config?: { assetPrefix?: string };
+    };
+    return rsf.config?.assetPrefix ?? "";
+  }
+  return "";
+}
+
+/**
  * statSync that returns null instead of throwing on EPERM/EACCES/ENOENT.
  * Bun's hoisted store (node_modules/.bun/<pkg>@<ver>/node_modules/<dep>) uses
  * symlinks pointing to other entries in the same store. On Windows those
@@ -731,12 +752,11 @@ export function generateEntryPoint(options: GenerateOptions): string {
   validateAliasResolutions(turbopackAliases, canonicalResolutions);
   rewriteTurbopackAliases(standaloneNextDir, turbopackAliases, canonicalResolutions);
 
-  // Check build context for assetPrefix — if set, static assets are served
-  // from a CDN and don't need to be embedded in the binary.
-  const ctx = JSON.parse(
-    readFileSync(join(distDir, "bun-compile-ctx.json"), "utf-8")
-  );
-  const { assetPrefix } = ctx;
+  // If assetPrefix is set in next.config, static assets are served from a CDN
+  // and don't need to be embedded in the binary. We read it from
+  // required-server-files.json (Next writes it under `config` in every build);
+  // the older adapter-written bun-compile-ctx.json is still honored when present.
+  const assetPrefix = readAssetPrefix(distDir);
 
   const assetsToEmbed = assetPrefix
     ? [...publicFiles, ...runtimeFiles]

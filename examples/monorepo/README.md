@@ -9,7 +9,7 @@ Doubles as the e2e regression test for two things at once:
 
 1. **Nested standalone layout** — Next.js produces
    `apps/web/.next/standalone/apps/web/server.js` (not
-   `standalone/server.js`). The adapter's `findServerDir` has to
+   `standalone/server.js`). next-bun-compile's `findServerDir` has to
    detect the nested location, and `findPackageDirs` /
    `collectExternalModules` have to walk nested `node_modules/`
    directories to find packages — not just the top-level one.
@@ -56,11 +56,11 @@ docker run --rm -p 3000:3000 next-bun-compile-monorepo
 
 ## Notes for adapting to your monorepo
 
-- **Turborepo / Nx**: works the same way — the adapter cares about
+- **Turborepo / Nx**: works the same way — next-bun-compile cares about
   the standalone layout, not the workspace tool. If you use
   `turbo prune --docker` in CI to slim the Docker context, the
   pruned tree still triggers the nested-layout codepath.
 - **pnpm workspaces**: works. The `.pnpm/` hoisted store is handled
   by the same code as the `.bun/` store.
-- **Many apps in one repo**: the adapter scopes to whatever app's
+- **Many apps in one repo**: next-bun-compile scopes to whatever app's
   `next build` you run; it doesn't try to detect siblings.

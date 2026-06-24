@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { generateEntryPoint } from "./generate.js";
 import { compile } from "./compile.js";
@@ -12,15 +12,9 @@ const standaloneDir = join(distDir, "standalone");
 
 if (!existsSync(standaloneDir)) {
   console.error(
-    'next-bun-compile: No standalone output found. Run "next build" first with output: "standalone" in next.config.ts.'
+    'next-bun-compile: No standalone output found. Add `output: "standalone"` to next.config.ts and re-run `next build`.'
   );
   process.exit(1);
-}
-
-// Check for adapter context (optional — works without the adapter too)
-const ctxPath = join(distDir, "bun-compile-ctx.json");
-if (existsSync(ctxPath)) {
-  console.log("next-bun-compile: Using build context from adapter");
 }
 
 const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });

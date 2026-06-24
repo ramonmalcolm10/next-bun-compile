@@ -1,7 +1,7 @@
 {
   "name": "next-bun-compile",
   "version": "0.0.1",
-  "description": "Next.js Build Adapter that compiles your app into a Bun single-file executable",
+  "description": "Compile your Next.js app into a Bun single-file executable",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
