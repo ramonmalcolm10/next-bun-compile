@@ -15,8 +15,8 @@ const tmpBase = join(import.meta.dir, "..", ".test-fixtures");
 /** Minimal server.js content that passes the nextConfig regex */
 const MOCK_SERVER_JS = `const nextConfig = {"env":{}}\nprocess.exit(0);\n`;
 
-/** Minimal bun-compile-ctx.json */
-const MOCK_CTX = JSON.stringify({ distDir: "", projectDir: "", assetPrefix: "" });
+/** Minimal required-server-files.json — generate.ts reads `config.assetPrefix` */
+const MOCK_RSF = JSON.stringify({ config: { assetPrefix: "" } });
 
 /** Minimal require-hook.js (won't be patched — target string absent) */
 const MOCK_REQUIRE_HOOK = `module.exports = {};`;
@@ -50,7 +50,7 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       // distDir files
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/test.js": "// static",
       // standalone files (server.js at root)
       ".next/standalone/server.js": MOCK_SERVER_JS,
@@ -85,7 +85,7 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       // distDir files
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/test.js": "// static",
       // standalone files — server.js nested under apps/web/
       ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
@@ -122,7 +122,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// app static",
       ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
       ".next/standalone/apps/web/.next/BUILD_ID": "mono-build-id",
@@ -151,7 +151,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       // Nested server with a chunk that requires an external module
       ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
@@ -187,7 +187,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       // standalone dir exists but has no server.js
       ".next/standalone/.next/BUILD_ID": "no-server",
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
@@ -208,7 +208,7 @@ describe("generateEntryPoint", () => {
       "node_modules/.pnpm/next@16.1.6_react@19.2.3/node_modules/next";
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/apps/admin/server.js": MOCK_SERVER_JS,
       ".next/standalone/apps/admin/.next/BUILD_ID": "pnpm-build",
@@ -248,7 +248,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "sym-build",
@@ -306,7 +306,7 @@ describe("generateEntryPoint", () => {
       `b.exports=a.x("sharp-457ea9eae1af1a9c",()=>require("sharp-457ea9eae1af1a9c"));\n` +
       `let p=await a.y("prettier-285d8f1d6bb5f650/plugins/html");`;
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "alias-map-build",
@@ -363,7 +363,7 @@ describe("generateEntryPoint", () => {
 
     const chunkPath = ".next/standalone/.next/server/chunks/ssr/page.js";
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "no-symlink-build",
@@ -399,7 +399,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "warn-build",
@@ -436,7 +436,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "debug-build",
@@ -463,7 +463,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "ok-build",
@@ -497,7 +497,7 @@ describe("generateEntryPoint", () => {
     const projectDir = root;
 
     scaffold(root, {
-      ".next/bun-compile-ctx.json": MOCK_CTX,
+      ".next/required-server-files.json": MOCK_RSF,
       ".next/static/app.js": "// static",
       ".next/standalone/packages/apps/web/server.js": MOCK_SERVER_JS,
       ".next/standalone/packages/apps/web/.next/BUILD_ID": "deep-build",
