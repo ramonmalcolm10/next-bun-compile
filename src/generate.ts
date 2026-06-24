@@ -19,24 +19,16 @@ interface GenerateOptions {
 }
 
 /**
- * Read assetPrefix from the build context. Prefers the adapter-written
- * bun-compile-ctx.json (older flow) and falls back to required-server-files.json
- * (always written by `next build`), so the CLI works whether or not the adapter
- * is wired up.
+ * Read assetPrefix from required-server-files.json, which Next writes on
+ * every `next build` and contains the full live nextConfig.
  */
 function readAssetPrefix(distDir: string): string {
-  const ctxPath = join(distDir, "bun-compile-ctx.json");
-  if (existsSync(ctxPath)) {
-    return JSON.parse(readFileSync(ctxPath, "utf-8")).assetPrefix ?? "";
-  }
   const rsfPath = join(distDir, "required-server-files.json");
-  if (existsSync(rsfPath)) {
-    const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
-      config?: { assetPrefix?: string };
-    };
-    return rsf.config?.assetPrefix ?? "";
-  }
-  return "";
+  if (!existsSync(rsfPath)) return "";
+  const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
+    config?: { assetPrefix?: string };
+  };
+  return rsf.config?.assetPrefix ?? "";
 }
 
 /**
