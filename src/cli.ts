@@ -1,27 +1,47 @@
-#!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
+#!/usr/bin/env bun
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { generateEntryPoint } from "./generate.js";
 import { compile } from "./compile.js";
+import { traceForCompilation } from "./trace.js";
+import { buildVirtualLayout } from "./layout.js";
+import { materializeVirtualStandalone } from "./materialize.js";
 
 const extraArgs = process.argv.slice(2);
 
 const projectDir = resolve(".");
 const distDir = join(projectDir, ".next");
-const standaloneDir = join(distDir, "standalone");
 
-if (!existsSync(standaloneDir)) {
-  console.error(
-    'next-bun-compile: No standalone output found. Run "next build" first with output: "standalone" in next.config.ts.'
-  );
-  process.exit(1);
+if (!existsSync(join(distDir, "required-server-files.json"))) {
+	console.error(
+		'next-bun-compile: No Next.js build found. Run "next build" first.',
+	);
+	process.exit(1);
 }
 
-// Check for adapter context (optional — works without the adapter too)
 const ctxPath = join(distDir, "bun-compile-ctx.json");
 if (existsSync(ctxPath)) {
-  console.log("next-bun-compile: Using build context from adapter");
+	console.log("next-bun-compile: Using build context from adapter");
 }
 
-const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
-compile({ serverDir, outfile: join(projectDir, "server"), extraArgs });
+// Trace runtime deps ourselves — bypasses Next's `output: "standalone"` step,
+// which is broken under Turbopack in 16.3-canary and not strictly needed.
+console.log("next-bun-compile: Tracing runtime dependencies...");
+const trace = await traceForCompilation({ projectDir, distDir });
+const layout = buildVirtualLayout(trace);
+console.log(`next-bun-compile: Traced ${layout.entries.length} files`);
+
+const virtualStandalone = join(distDir, "__nbc-virtual-standalone");
+materializeVirtualStandalone({
+	layout,
+	outDir: virtualStandalone,
+	projectDir,
+	distDir: ".next",
+});
+
+const serverDir = generateEntryPoint({
+	standaloneDir: virtualStandalone,
+	distDir,
+	projectDir,
+});
+await compile({ serverDir, outfile: join(projectDir, "server"), extraArgs });

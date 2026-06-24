@@ -19,6 +19,9 @@
     "build": "bun build src/index.ts src/cli.ts --outdir dist --target node --splitting",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@vercel/nft": "^0.29.4"
+  },
   "peerDependencies": {
     "next": ">=16.0.0"
   },

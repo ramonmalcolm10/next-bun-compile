@@ -23,12 +23,9 @@ const adapter: NextAdapter = {
       );
     }
 
-    if (config.output !== "standalone") {
-      console.warn(
-        'next-bun-compile: Setting output to "standalone" (required for compilation)'
-      );
-      config.output = "standalone";
-    }
+    // We trace runtime dependencies ourselves via @vercel/nft; standalone is
+    // no longer required. Skipping it also avoids the canary Turbopack
+    // regression that crashes Next's standalone copy step.
 
     const existing = config.transpilePackages ?? [];
     const toAdd = knownTranspilePackages.filter((p) => !existing.includes(p));
