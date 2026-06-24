@@ -6,7 +6,7 @@ description: bun workspaces, pnpm workspaces, and Turborepo all work — here's 
 next-bun-compile detects monorepo standalone layouts automatically.
 Next.js produces something like `apps/web/.next/standalone/apps/web/server.js`
 in a monorepo (the app path is preserved inside the standalone tree),
-and the adapter handles that without configuration.
+and next-bun-compile handles that without configuration.
 
 ## Bun workspaces
 
@@ -46,22 +46,22 @@ A full working monorepo + sharp example is in
 ## pnpm workspaces
 
 Same idea — pnpm's `.pnpm/` hoisted store is handled the same way as
-bun's `.bun/` store. The adapter walks both.
+bun's `.bun/` store. next-bun-compile walks both.
 
 ## Turborepo
 
 Works as-is. If you use `turbo prune --docker` in CI to slim the
 Docker context, the pruned tree still triggers the nested-layout
-codepath. The adapter doesn't care about the workspace tool — only
+codepath. next-bun-compile doesn't care about the workspace tool — only
 about the standalone layout Next.js produces.
 
-## What the adapter does for monorepos
+## What next-bun-compile does for monorepos
 
 1. **Detects nested `server.js`.** `findServerDir` walks the standalone
    to find your app's directory (e.g. `standalone/apps/web/`).
 2. **Walks nested `node_modules/`.** Monorepo standalone outputs often
    have both `standalone/node_modules/` AND
-   `standalone/apps/web/node_modules/`. The adapter scans both for
+   `standalone/apps/web/node_modules/`. next-bun-compile scans both for
    externalized packages and stub placement.
 3. **Workspace packages survive.** Anything Next.js's trace pulled in
    (including workspace `*`-version deps) gets extracted from
@@ -71,7 +71,7 @@ about the standalone layout Next.js produces.
 
 ### "Server.js not found anywhere"
 
-The adapter looks for `server.js` in the standalone tree but skips
+next-bun-compile looks for `server.js` in the standalone tree but skips
 `node_modules`. If your app's `server.js` ends up under a path the
 search doesn't recognize, file an issue with the layout — we'll
 extend the detection.

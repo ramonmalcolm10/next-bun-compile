@@ -30,31 +30,28 @@ for the full target list.
 
 ## `next.config.ts` options
 
-### `adapterPath` (required)
+### `output: "standalone"` (required)
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: import.meta.resolve("next-bun-compile"),
+  output: "standalone",
 };
 ```
 
-Registers next-bun-compile as the build adapter. The adapter writes a
-build-context file that the `next-bun-compile` CLI consumes after
-`next build`.
-
-For Next.js 16.1, this lives under `experimental.adapterPath`. For
-16.2+, it's at the top level.
+`next-bun-compile` reads the standalone tree Next.js produces here.
+Without this set, `next build` won't emit `.next/standalone/` and the
+CLI will refuse to run.
 
 ### `assetPrefix` (optional, optimizes binary size)
 
-If you set `assetPrefix` for a CDN, the adapter detects it and
-**skips embedding static assets** in the binary — your CDN serves
+If you set `assetPrefix` for a CDN, `next-bun-compile` detects it
+and **skips embedding static assets** in the binary — your CDN serves
 them instead. Only `public/` files and runtime chunks get embedded.
 
 ```ts
 const nextConfig: NextConfig = {
+  output: "standalone",
   assetPrefix: "https://cdn.example.com",
-  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 
@@ -67,24 +64,16 @@ can't resolve at build time. Force them through the bundler instead:
 
 ```ts
 const nextConfig: NextConfig = {
+  output: "standalone",
   transpilePackages: ["pino", "pino-pretty"],
-  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 
 See the [transpilePackages guide](/next-bun-compile/guides/transpile-packages/)
 for when you need this.
 
-## What the adapter sets automatically
-
-You **don't** need to set these — the adapter applies them in
-`modifyConfig`:
-
-- `output: "standalone"` — required for the build to produce the tree
-  next-bun-compile reads.
-
 ## Where the binary appears
 
 `./server` next to the `package.json` of the project being built.
-In a monorepo, this is `apps/<your-app>/server`. The adapter detects
-monorepo layouts automatically.
+In a monorepo, this is `apps/<your-app>/server`. Monorepo layouts
+are detected automatically.

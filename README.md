@@ -1,6 +1,6 @@
 # next-bun-compile
 
-A Next.js Build Adapter that compiles your app into a single-file [Bun](https://bun.sh) executable.
+Compile your Next.js app into a single-file [Bun](https://bun.sh) executable.
 
 One command. One binary. No runtime dependencies.
 
@@ -23,29 +23,17 @@ bun add -D next-bun-compile
 
 ## Setup
 
-Add the adapter to your `next.config.ts`:
+Enable Next.js standalone output in your `next.config.ts`:
 
 ```ts
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  adapterPath: import.meta.resolve("next-bun-compile"),
+  output: "standalone",
 };
 
 export default nextConfig;
 ```
-
-<details>
-<summary>Using Next.js 16.1? Use the experimental config instead</summary>
-
-```ts
-const nextConfig: NextConfig = {
-  experimental: {
-    adapterPath: import.meta.resolve("next-bun-compile"),
-  },
-};
-```
-</details>
 
 Update your build script in `package.json`:
 
@@ -88,12 +76,12 @@ See the [Bun cross-compilation docs](https://bun.sh/docs/bundler/executables#cro
 
 ### CDN / `assetPrefix`
 
-If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/static/`) are served from your CDN instead of the origin server. The adapter detects this automatically and skips embedding static assets in the binary — only public files are embedded. This results in a smaller binary.
+If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/static/`) are served from your CDN instead of the origin server. `next-bun-compile` detects this from the build output and skips embedding static assets in the binary — only public files are embedded. This results in a smaller binary.
 
 ```ts
 const nextConfig: NextConfig = {
+  output: "standalone",
   assetPrefix: "https://cdn.example.com",
-  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 
@@ -115,18 +103,17 @@ Startup improvements scale with codebase size — larger applications benefit mo
 
 ## How It Works
 
-1. **Adapter hook** — `modifyConfig()` sets `output: "standalone"` automatically so you don't need to configure it
-2. **Asset discovery** — Scans `.next/static/` and `public/` for all static files
-3. **Code generation** — Creates a `server-entry.js` that:
+1. **Asset discovery** — Scans `.next/static/` and `public/` for all static files
+2. **Code generation** — Creates a `server-entry.js` that:
    - Embeds all assets into the binary via Bun's `import ... with { type: "file" }`
    - Extracts them to disk on first run
    - Fixes `__dirname` for compiled binary context
    - Starts the Next.js server
-4. **Compilation** — Runs `bun build --compile` with `--define` flags to eliminate dead code branches (dev-only modules, non-turbo runtimes)
+3. **Compilation** — Runs `bun build --compile` with `--define` flags to eliminate dead code branches (dev-only modules, non-turbo runtimes)
 
 ### Module Stubs
 
-Some modules can't be resolved at compile time but are never reached in production (dev servers, optional dependencies). The adapter creates no-op stubs for these **only if** the real module isn't installed. If you actually use `@opentelemetry/api` or `critters`, the real package gets bundled instead.
+Some modules can't be resolved at compile time but are never reached in production (dev servers, optional dependencies). `next-bun-compile` creates no-op stubs for these **only if** the real module isn't installed. If you actually use `@opentelemetry/api` or `critters`, the real package gets bundled instead.
 
 ## Troubleshooting
 
@@ -152,8 +139,8 @@ Failed to load external module pino-142500b1eb3f4baf: Cannot find package ...
 
 ```ts
 const nextConfig: NextConfig = {
+  output: "standalone",
   transpilePackages: ["pino", "pino-pretty"],
-  adapterPath: import.meta.resolve("next-bun-compile"),
 };
 ```
 

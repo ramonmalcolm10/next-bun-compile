@@ -39,31 +39,19 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
      </TabItem>
    </Tabs>
 
-2. ### Register the adapter
+2. ### Enable standalone output
 
-   Add `adapterPath` to your `next.config.ts`:
+   Add `output: "standalone"` to your `next.config.ts`:
 
    ```ts
    import type { NextConfig } from "next";
 
    const nextConfig: NextConfig = {
-     adapterPath: import.meta.resolve("next-bun-compile"),
+     output: "standalone",
    };
 
    export default nextConfig;
    ```
-
-   :::note[Using Next.js 16.1?]
-   Wrap it in `experimental`:
-
-   ```ts
-   const nextConfig: NextConfig = {
-     experimental: {
-       adapterPath: import.meta.resolve("next-bun-compile"),
-     },
-   };
-   ```
-   :::
 
 3. ### Update your build script
 
@@ -74,9 +62,6 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
      }
    }
    ```
-
-   The adapter sets `output: "standalone"` automatically — you don't
-   need to add it yourself.
 
 4. ### Build the binary
 

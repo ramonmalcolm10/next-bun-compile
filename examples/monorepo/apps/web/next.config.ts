@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  adapterPath: import.meta.resolve("next-bun-compile"),
+  output: "standalone",
 };
 
 export default nextConfig;

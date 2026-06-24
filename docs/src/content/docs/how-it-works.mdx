@@ -1,19 +1,18 @@
 ---
 title: How It Works
-description: The architecture behind the binary — what the adapter does at build time, what the runtime does at boot.
+description: The architecture behind the binary — what next-bun-compile does at build time, what the runtime does at boot.
 ---
 
 ## Pipeline
 
-1. **Adapter hook** — `modifyConfig()` flips `output: "standalone"`
-   automatically and writes a build-context file.
-2. **`next build`** runs your normal Next.js build, producing the
-   standalone tree under `.next/standalone/`.
-3. **`next-bun-compile` CLI** scans the standalone, discovers
+1. **`next build`** runs your normal Next.js build with
+   `output: "standalone"`, producing the standalone tree under
+   `.next/standalone/`.
+2. **`next-bun-compile` CLI** scans the standalone, discovers
    externalized packages and turbopack-mangled aliases, generates
    `server-entry.js` and `assets.generated.js`, then invokes
    `bun build --compile`.
-4. **Bun compiles** everything (server code, embedded asset files,
+3. **Bun compiles** everything (server code, embedded asset files,
    bun runtime) into one binary with `--bytecode --minify`.
 
 ## What gets embedded
@@ -55,7 +54,7 @@ challenging in a compiled binary:
 
 #### 1. Build-time chunk rewrite
 
-The adapter scans server chunks for `"<name>-<16 hex>"` string
+next-bun-compile scans server chunks for `"<name>-<16 hex>"` string
 literals (the mangled-alias pattern) and replaces each with the
 absolute file path of the canonical target:
 
@@ -70,7 +69,7 @@ direct file load — no walks, no exports-map ambiguity, no resolver
 involvement. Works for both CJS `require()` and ESM `import()`.
 
 For subpath imports (`import("prettier-.../plugins/html")`), the
-adapter reads each canonical's `package.json` + `exports` map to
+next-bun-compile reads each canonical's `package.json` + `exports` map to
 pick the right `.mjs`/`.js`/`.cjs` variant, then rewrites to that
 absolute path.
 
@@ -100,14 +99,14 @@ cases.
 
 Some modules can't be resolved at compile time but are never reached
 in production — Next's dev server, the dev bundler, optional deps
-loaded in try/catch. The adapter creates no-op stubs for these
+loaded in try/catch. next-bun-compile creates no-op stubs for these
 **only if** the real module isn't installed. If you do install
 `@opentelemetry/api` or `critters`, the real package gets bundled
 instead.
 
 ## Pre-flight validator (build time)
 
-For every alias + subpath the chunks reference, the adapter checks
+For every alias + subpath the chunks reference, next-bun-compile checks
 whether resolution found a file. If anything didn't resolve, it
 warns at build time:
 

@@ -14,7 +14,7 @@ sharp/
 │   ├── api/resize/route.ts   # generates a 32x32 PNG via sharp
 │   ├── layout.tsx
 │   └── page.tsx
-├── next.config.ts            # adapterPath: next-bun-compile
+├── next.config.ts            # output: "standalone"
 ├── package.json              # next, react, sharp, next-bun-compile
 ├── tsconfig.json
 ├── Dockerfile                # the recipe
