@@ -11,13 +11,17 @@ export function compile(options: CompileOptions): void {
   const { serverDir, outfile, extraArgs = [] } = options;
   const entryPoint = join(serverDir, "server-entry.js");
 
+  // No --bytecode: it only covers the statically bundled entry graph, while
+  // nearly all request-path code (SSR chunks, pages, externalized packages)
+  // is extracted raw JS loaded at runtime. Measured on a demo app it added
+  // +30% binary size for zero warm-boot gain. Users can re-add it via CLI
+  // extra args, which append after these defaults.
   const args = [
     "build",
     entryPoint,
     "--production",
     "--compile",
     "--minify",
-    "--bytecode",
     "--sourcemap",
     "--define",
     "process.env.TURBOPACK=1",

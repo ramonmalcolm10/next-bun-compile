@@ -30,9 +30,9 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
     that's the deploy.
   </Card>
   <Card title="Faster cold start" icon="random">
-    Bun's `--bytecode` flag pre-compiles JavaScript at build time so
-    parsing is skipped at boot. Real Next.js apps start ~2x faster
-    than `next start` on the same runtime.
+    The server core is pre-bundled and minified into the binary — no
+    module resolution or node_modules walks at boot. Real Next.js
+    apps start ~2x faster than `next start` on the same runtime.
   </Card>
   <Card title="Smaller image footprint" icon="seti:zip">
     ~30MB binary on distroless beats ~150MB for `bun + standalone`

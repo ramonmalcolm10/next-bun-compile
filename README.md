@@ -89,7 +89,7 @@ You'll need to upload `.next/static/` to your CDN separately.
 
 ## Performance
 
-The compiled binary uses Bun's `--bytecode` flag to pre-compile JavaScript to bytecode at build time, skipping the parsing step at startup. Code is also minified and dead code paths (dev-only modules, non-turbo runtimes) are eliminated via `--define` flags.
+The compiled binary is minified, and dead code paths (dev-only modules, non-turbo runtimes) are eliminated via `--define` flags. Startup skips module resolution for the bundled server core entirely — the code is already in the binary.
 
 Benchmarks on a real Next.js app (both running on Bun's runtime):
 
