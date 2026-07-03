@@ -91,7 +91,8 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
 - The bun runtime itself (you don't need bun on the deploy target)
 
 The binary extracts its embedded assets to disk on first run, then
-boots Next.js. Subsequent runs are instant — extraction is idempotent.
+boots Next.js. It records a manifest of what it extracted, so
+subsequent runs of the same build skip extraction entirely.
 
 ## Verify it works
 

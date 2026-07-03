@@ -350,6 +350,10 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain("Module._resolveFilename");
     // Runtime placeholder substitution must be in extractAssets
     expect(entry).toContain("__NBC_BASE__");
+    // Rewritten chunks are listed so extraction only text-substitutes those
+    expect(entry).toContain(
+      '".next/server/chunks/ssr/[root-of-the-server].js"'
+    );
   });
 
   test("discovers aliases from chunk literals even without build-time symlinks", () => {
@@ -488,6 +492,64 @@ describe("generateEntryPoint", () => {
     }
 
     expect(warns.join("\n")).not.toContain("won't resolve");
+  });
+
+  test("server-entry embeds the extraction manifest fast-path", () => {
+    const root = join(tmpBase, "manifest-fast-path");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "manifest-build",
+      ".next/standalone/.next/server/chunks/ssr.js": `// chunk`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      "public/favicon.ico": "icon",
+    });
+
+    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+
+    // Manifest skip: matching stamp on disk means extraction is bypassed
+    expect(entry).toContain(".nbc-extracted");
+    expect(entry).toContain("buildStamp");
+    // Stamp is a 64-hex sha256 over the embedded assets, tied to baseDir
+    expect(entry).toMatch(/const buildStamp = "[0-9a-f]{64}" \+ "\\n" \+ baseDir;/);
+  });
+
+  test("build stamp changes when embedded asset content changes", () => {
+    const files = {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/static/app.js": "// static v1",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "stamp-build",
+      ".next/standalone/.next/server/chunks/ssr.js": `// chunk`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      "public/favicon.ico": "icon",
+    };
+    const stampOf = (root: string, overrides: Record<string, string>) => {
+      const distDir = join(root, ".next");
+      const standaloneDir = join(distDir, "standalone");
+      scaffold(root, { ...files, ...overrides });
+      generateEntryPoint({ standaloneDir, distDir, projectDir: root });
+      const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+      return entry.match(/const buildStamp = "([0-9a-f]{64})"/)?.[1];
+    };
+
+    const a = stampOf(join(tmpBase, "stamp-a"), {});
+    const b = stampOf(join(tmpBase, "stamp-b"), {});
+    const c = stampOf(join(tmpBase, "stamp-c"), {
+      ".next/static/app.js": "// static v2",
+    });
+
+    expect(a).toBeDefined();
+    expect(a).toBe(b!); // identical inputs → identical stamp
+    expect(a).not.toBe(c!); // changed asset content → different stamp
   });
 
   test("deeply nested monorepo layout (packages/apps/web)", () => {

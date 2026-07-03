@@ -58,9 +58,10 @@ this isn't the recipe — use Vercel or a container platform instead.
    `mv` within a filesystem is atomic at the inode level — readers
    either see the old binary or the new one, never a half-written
    file. The `rm -rf` of extracted assets is belt-and-suspenders:
-   `extractAssets` is idempotent and won't overwrite files that
-   already exist, so without the wipe stale chunks from the previous
-   deploy would linger.
+   a new binary detects the manifest mismatch and re-extracts
+   everything with overwrite, but files the new build no longer
+   ships (deleted pages, renamed chunks) would linger without the
+   wipe.
 
 4. ### Smoke test
 
