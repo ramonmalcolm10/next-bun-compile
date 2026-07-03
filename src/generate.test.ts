@@ -552,6 +552,39 @@ describe("generateEntryPoint", () => {
     expect(a).not.toBe(c!); // changed asset content → different stamp
   });
 
+  test("asset var names never collide, even with identical sanitized prefixes", () => {
+    // toVarName truncates the sanitized path to 40 chars; deep node_modules
+    // trees (e.g. puppeteer) produce thousands of assets sharing that
+    // prefix. A truncated hash suffix collided in the wild — names must be
+    // unique by construction.
+    const root = join(tmpBase, "varname-collision");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    const files: Record<string, string> = {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "collision-build",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+    };
+    // 200 files whose urlPaths all sanitize to the same 40-char prefix
+    for (let i = 0; i < 200; i++) {
+      files[
+        `.next/standalone/node_modules/puppeteer-core/lib/cjs/deep/nested/path/file-${i}.js`
+      ] = `// file ${i}`;
+    }
+    scaffold(root, files);
+
+    generateEntryPoint({ standaloneDir, distDir, projectDir });
+
+    const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+    const names = [...assets.matchAll(/^import (asset_\S+) from /gm)].map((m) => m[1]);
+    expect(names.length).toBeGreaterThan(200);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
   test("deeply nested monorepo layout (packages/apps/web)", () => {
     const root = join(tmpBase, "deep-mono");
     const distDir = join(root, ".next");
