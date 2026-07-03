@@ -71,11 +71,15 @@ function walkDir(
   return results;
 }
 
-/** Generate a safe JS variable name from a file path */
-function toVarName(filePath: string): string {
-  const hash = createHash("sha256").update(filePath).digest("hex").slice(0, 6);
+/**
+ * Generate a safe JS variable name from a file path. The index makes names
+ * unique by construction — a truncated hash suffix collides in practice
+ * once enough assets share the same sanitized 40-char prefix (deep
+ * node_modules trees like puppeteer's).
+ */
+function toVarName(filePath: string, index: number): string {
   const safe = filePath.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
-  return `asset_${safe}_${hash}`;
+  return `asset_${index}_${safe}`;
 }
 
 /**
@@ -789,8 +793,8 @@ export function generateEntryPoint(options: GenerateOptions): string {
   const imports: string[] = [];
   const mapEntries: string[] = [];
 
-  for (const asset of assetsToEmbed) {
-    const varName = toVarName(asset.urlPath);
+  for (const [i, asset] of assetsToEmbed.entries()) {
+    const varName = toVarName(asset.urlPath, i);
     const importPath = relative(serverDir, asset.absolutePath).replace(
       /\\/g,
       "/"
