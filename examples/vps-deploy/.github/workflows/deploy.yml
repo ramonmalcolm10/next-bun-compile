@@ -81,10 +81,9 @@ jobs:
           chmod +x server.new
           mv -f server.new server
 
-          # Wipe extracted assets so the new binary re-extracts its own.
-          # next-bun-compile's extractAssets is idempotent and skips
-          # files that already exist on disk, so without this the
-          # binary would reuse stale chunks from the previous deploy.
+          # Wipe extracted assets. The new binary re-extracts its own
+          # (it detects the manifest mismatch and overwrites), but files
+          # the new build no longer ships would linger without this.
           rm -rf .next public
 
           sudo systemctl restart "$SERVICE_NAME"

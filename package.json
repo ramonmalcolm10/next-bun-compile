@@ -24,10 +24,11 @@
   },
   "devDependencies": {
     "next": "16.1.6",
+    "@types/bun": "^1",
     "@types/node": "^20",
     "typescript": "^5"
   },
-  "keywords": ["nextjs", "bun", "compile", "standalone", "executable", "adapter"],
+  "keywords": ["nextjs", "bun", "compile", "standalone", "executable"],
   "license": "MIT",
   "homepage": "https://github.com/ramonmalcolm10/next-bun-compile#readme",
   "bugs": {

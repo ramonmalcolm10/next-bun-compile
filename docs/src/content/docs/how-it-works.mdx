@@ -28,9 +28,14 @@ description: The architecture behind the binary — what next-bun-compile does a
 ## Runtime: asset extraction
 
 On first run, the binary writes its embedded assets to disk relative
-to `process.execPath`. Subsequent runs see the files already there
-and skip re-extraction. Extraction is fast (~hundreds of ms for ~1500
-files) and idempotent.
+to `process.execPath`, then stamps `.next/.nbc-extracted` with a
+content hash of the build plus the directory it extracted into.
+Later boots compare that stamp: a match skips extraction entirely
+(one file read), while a mismatch — new binary, moved directory, or
+a half-finished previous extraction — re-extracts everything with
+overwrite so nothing stale can shadow the embedded assets. Extraction
+is fast (~hundreds of ms for ~1500 files) and bounded to 64
+concurrent writes so it can't exhaust file-descriptor limits.
 
 ## Resolver hook for externalized packages
 

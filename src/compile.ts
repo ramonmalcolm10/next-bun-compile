@@ -31,6 +31,16 @@ export function compile(options: CompileOptions): void {
   ];
 
   console.log(`next-bun-compile: Compiling to ${outfile}...`);
-  execFileSync("bun", args, { stdio: "inherit" });
+  try {
+    execFileSync("bun", args, { stdio: "inherit" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(
+        "next-bun-compile: `bun` was not found on PATH. Install it from https://bun.sh and re-run."
+      );
+      process.exit(1);
+    }
+    throw err;
+  }
   console.log(`next-bun-compile: Done → ${outfile}`);
 }

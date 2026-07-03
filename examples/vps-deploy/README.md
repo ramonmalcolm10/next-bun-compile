@@ -138,10 +138,10 @@ Push to `main`. The workflow:
 
 ### Why the `rm -rf .next public`?
 
-`extractAssets` is idempotent and skips files that already exist on
-disk. Without the wipe, files from the previous deploy that don't
-exist in the new binary would linger. Cheap insurance for a clean
-filesystem state.
+A new binary detects that the on-disk extraction manifest doesn't
+match and re-extracts everything with overwrite — but files from the
+previous deploy that don't exist in the new binary would linger.
+Cheap insurance for a clean filesystem state.
 
 ### Why a separate `server.new` then `mv`?
 

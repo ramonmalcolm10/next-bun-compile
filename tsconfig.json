@@ -5,11 +5,11 @@
     "moduleResolution": "bundler",
     "declaration": true,
     "outDir": "dist",
-    "rootDir": "next-bun-compile/src",
+    "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node", "bun"]
   },
-  "include": ["next-bun-compile/src"]
+  "include": ["src"]
 }

@@ -7,6 +7,7 @@ import {
   lstatSync,
   realpathSync,
   mkdirSync,
+  copyFileSync,
   type Stats,
 } from "node:fs";
 import { join, relative, basename } from "node:path";
@@ -72,17 +73,11 @@ function walkDir(
 
 /** Generate a safe JS variable name from a file path */
 function toVarName(filePath: string): string {
-  const hash = createHash("md5").update(filePath).digest("hex").slice(0, 6);
+  const hash = createHash("sha256").update(filePath).digest("hex").slice(0, 6);
   const safe = filePath.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 40);
   return `asset_${safe}_${hash}`;
 }
 
-/**
- * Create stub files for modules that bun can't resolve but are never
- * actually reached in production. Stubs are only created if the real
- * module doesn't already exist — so if a user actually installs the
- * dependency (e.g. @opentelemetry/api), the real one gets bundled.
- */
 /**
  * Find all real locations of a package inside node_modules/, including
  * hoisted layouts used by bun (.bun/) and pnpm (.pnpm/).
@@ -151,6 +146,12 @@ function findPackageDirs(standaloneDir: string, pkg: string): string[] {
   return dirs;
 }
 
+/**
+ * Create stub files for modules that bun can't resolve but are never
+ * actually reached in production. Stubs are only created if the real
+ * module doesn't already exist — so if a user actually installs the
+ * dependency (e.g. @opentelemetry/api), the real one gets bundled.
+ */
 function generateStubs(standaloneDir: string): void {
   const stubs: Array<{ pkg: string; subpath: string; content: string }> = [
     // Dev-only — guarded by runtime `options.dev` / `opts.dev`, not env vars
@@ -430,10 +431,11 @@ function rewriteTurbopackAliases(
   standaloneNextDir: string,
   aliases: Array<{ alias: string }>,
   resolutions: Map<string, string>
-): void {
-  if (aliases.length === 0 || resolutions.size === 0) return;
+): string[] {
+  const rewrittenPaths: string[] = [];
+  if (aliases.length === 0 || resolutions.size === 0) return rewrittenPaths;
   const serverDir = join(standaloneNextDir, "server");
-  if (!existsSync(serverDir)) return;
+  if (!existsSync(serverDir)) return rewrittenPaths;
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   // Capture the whole quoted spec — alias or alias/sub/path — so we can
   // look it up in the resolutions map and swap the literal in one shot.
@@ -443,7 +445,6 @@ function rewriteTurbopackAliases(
       ")(?:/[^\"']+)?)\\1",
     "g"
   );
-  let rewritten = 0;
   for (const f of walkDir(serverDir)) {
     if (!f.absolutePath.endsWith(".js")) continue;
     let content: string;
@@ -459,14 +460,15 @@ function rewriteTurbopackAliases(
     });
     if (next !== content) {
       writeFileSync(f.absolutePath, next);
-      rewritten++;
+      rewrittenPaths.push(`.next/server/${f.relativePath.replace(/\\/g, "/")}`);
     }
   }
-  if (rewritten > 0) {
+  if (rewrittenPaths.length > 0) {
     console.log(
-      `next-bun-compile: Rewrote turbopack-mangled aliases in ${rewritten} server chunks`
+      `next-bun-compile: Rewrote turbopack-mangled aliases in ${rewrittenPaths.length} server chunks`
     );
   }
+  return rewrittenPaths;
 }
 
 /**
@@ -544,9 +546,9 @@ function patchRequireHook(standaloneDir: string): void {
 /**
  * Collect all files under node_modules/ in the standalone output.
  * Next.js standalone already tree-shakes to only what's needed at runtime.
- * Skips .bun/.pnpm store dirs and next-bun-compile itself.
- */
-/**
+ * Skips hidden entries (.bun/.pnpm stores are handled explicitly) and
+ * next-bun-compile itself.
+ *
  * Returns array of {mod, src} where mod is the canonical module path
  * (e.g. "next/dist/server/next.js") and src is the absolute path on disk.
  */
@@ -642,7 +644,12 @@ function fixModuleResolution(standaloneDir: string): void {
       const pkgJsonPath = join(dir, "package.json");
       const indexPath = join(dir, "index.js");
       if (!existsSync(pkgJsonPath) || existsSync(indexPath)) continue;
-      const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
+      let pkg: { main?: string };
+      try {
+        pkg = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
+      } catch {
+        continue;
+      }
       if (pkg.main && pkg.main !== "index.js") {
         writeFileSync(indexPath, `module.exports = require("./${pkg.main}");`);
       }
@@ -718,7 +725,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
     if (!existsSync(src)) continue;
     const dest = join(externalDir, mod);
     mkdirSync(join(dest, ".."), { recursive: true });
-    writeFileSync(dest, readFileSync(src));
+    copyFileSync(src, dest);
     runtimeFiles.push({
       absolutePath: dest,
       relativePath: `__external/${mod}`,
@@ -742,12 +749,14 @@ export function generateEntryPoint(options: GenerateOptions): string {
     turbopackAliases
   );
   validateAliasResolutions(turbopackAliases, canonicalResolutions);
-  rewriteTurbopackAliases(standaloneNextDir, turbopackAliases, canonicalResolutions);
+  const rewrittenChunks = rewriteTurbopackAliases(
+    standaloneNextDir,
+    turbopackAliases,
+    canonicalResolutions
+  );
 
   // If assetPrefix is set in next.config, static assets are served from a CDN
-  // and don't need to be embedded in the binary. We read it from
-  // required-server-files.json (Next writes it under `config` in every build);
-  // the older adapter-written bun-compile-ctx.json is still honored when present.
+  // and don't need to be embedded in the binary.
   const assetPrefix = readAssetPrefix(distDir);
 
   const assetsToEmbed = assetPrefix
@@ -763,6 +772,18 @@ export function generateEntryPoint(options: GenerateOptions): string {
   console.log(
     `next-bun-compile: Embedding ${assetsToEmbed.length} assets (${staticFiles.length} static + ${publicFiles.length} public + ${runtimeFiles.length} runtime)`
   );
+
+  // Content hash of everything embedded (post chunk-rewrite). The runtime
+  // stamps this (plus the resolved baseDir) into a manifest file after a
+  // complete extraction; a boot that finds a matching manifest skips
+  // extraction with a single file read.
+  const hasher = createHash("sha256");
+  for (const asset of assetsToEmbed) {
+    hasher.update(asset.urlPath);
+    hasher.update("\0");
+    hasher.update(readFileSync(asset.absolutePath));
+  }
+  const buildHash = hasher.digest("hex");
 
   // Generate assets.generated.js
   const imports: string[] = [];
@@ -990,45 +1011,59 @@ process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(nextConfig);
 const currentPort = parseInt(process.env.PORT, 10) || 3000;
 const hostname = process.env.HOSTNAME || "0.0.0.0";
 let keepAliveTimeout = parseInt(process.env.KEEP_ALIVE_TIMEOUT, 10);
-if (Number.isNaN(keepAliveTimeout) || !Number.isFinite(keepAliveTimeout) || keepAliveTimeout < 0) {
+if (!Number.isFinite(keepAliveTimeout) || keepAliveTimeout < 0) {
   keepAliveTimeout = undefined;
 }
 
 const extractions = ${JSON.stringify(assetExtractions)};
+// Chunks that got __NBC_BASE__ placeholders injected at build time by
+// rewriteTurbopackAliases — only these need text substitution on extract;
+// everything else streams straight from the binary.
+const rewrittenChunks = new Set(${JSON.stringify(rewrittenChunks)});
+// Written to the manifest after a complete extraction. Includes baseDir:
+// if the deploy directory moves, the substituted absolute paths in the
+// rewritten chunks are wrong and everything must be re-extracted.
+const buildStamp = ${JSON.stringify(buildHash)} + "\\n" + baseDir;
+const manifestPath = path.join(baseDir, ".next", ".nbc-extracted");
 async function extractAssets() {
-  // Collect everything that isn't already on disk, dedupe parent dirs
-  // for a single mkdir pass, then issue all writes concurrently.
-  // ~45% faster than serial extraction on a typical Next.js app with
-  // sharp; trivially correct because each write is to a distinct path.
-  const todo = [];
-  for (const [urlPath, diskPath] of extractions) {
-    const fullPath = path.join(baseDir, diskPath);
-    if (fs.existsSync(fullPath)) continue;
-    const embedded = assetMap.get(urlPath);
-    if (!embedded) continue;
-    todo.push({ diskPath, fullPath, embedded });
-  }
-  if (todo.length === 0) return;
+  // Fast path: a previous boot of this exact build in this exact directory
+  // finished extracting — one file read, no per-asset stats.
+  try {
+    if (fs.readFileSync(manifestPath, "utf-8") === buildStamp) return;
+  } catch {}
 
+  // Full extraction, overwriting whatever is on disk. Skipping existing
+  // files would let stale ones (crashed half-extraction, previous build,
+  // pre-placed tampering) shadow the embedded assets forever.
   const dirs = new Set();
-  for (const t of todo) dirs.add(path.dirname(t.fullPath));
+  for (const [, diskPath] of extractions) {
+    dirs.add(path.dirname(path.join(baseDir, diskPath)));
+  }
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 
-  await Promise.all(todo.map(async ({ diskPath, fullPath, embedded }) => {
-    // Server chunks may contain __NBC_BASE__ placeholders injected at
-    // build time by rewriteTurbopackAliases. Substitute the real baseDir
-    // before writing so bun resolves the absolute paths at chunk load
-    // (works for both CJS require and ESM import).
-    if (diskPath.startsWith(".next/server/")) {
-      const text = await Bun.file(embedded).text();
-      if (text.indexOf("__NBC_BASE__") !== -1) {
+  // Concurrent writes, bounded so thousands of in-flight fds can't trip
+  // EMFILE under conservative ulimits.
+  let idx = 0;
+  async function worker() {
+    while (idx < extractions.length) {
+      const [urlPath, diskPath] = extractions[idx++];
+      const embedded = assetMap.get(urlPath);
+      if (!embedded) continue;
+      const fullPath = path.join(baseDir, diskPath);
+      if (rewrittenChunks.has(diskPath)) {
+        const text = await Bun.file(embedded).text();
         await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
-        return;
+      } else {
+        await Bun.write(fullPath, Bun.file(embedded));
       }
     }
-    await Bun.write(fullPath, Bun.file(embedded));
-  }));
-  console.log(\`Extracted \${todo.length} assets\`);
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(64, extractions.length) }, worker)
+  );
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, buildStamp);
+  console.log(\`Extracted \${extractions.length} assets\`);
 }
 
 extractAssets().then(() => {
