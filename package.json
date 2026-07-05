@@ -5,22 +5,26 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "next-bun-compile": "./dist/cli.js"
-  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./adapter": {
+      "default": "./dist/adapter.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "bun build src/index.ts src/cli.ts --outdir dist --target node --splitting",
-    "typecheck": "tsc --noEmit"
+    "build": "bun build src/index.ts src/adapter.ts --outdir dist --target node --splitting && mkdir -p dist/runtime && cp src/runtime/serve.js dist/runtime/serve.js",
+    "typecheck": "tsc --noEmit",
+    "test:regression": "bash test/regression/run.sh",
+    "postinstall": "bun -e \"try{require('fs').symlinkSync('..','node_modules/next-bun-compile')}catch{}\""
   },
   "peerDependencies": {
-    "next": ">=16.0.0"
+    "next": ">=16.2.0"
   },
   "devDependencies": {
     "next": "16.1.6",
@@ -28,7 +32,13 @@
     "@types/node": "^20",
     "typescript": "^5"
   },
-  "keywords": ["nextjs", "bun", "compile", "standalone", "executable"],
+  "keywords": [
+    "nextjs",
+    "bun",
+    "compile",
+    "standalone",
+    "executable"
+  ],
   "license": "MIT",
   "homepage": "https://github.com/ramonmalcolm10/next-bun-compile#readme",
   "bugs": {
@@ -37,5 +47,11 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ramonmalcolm10/next-bun-compile.git"
-  }
+  },
+  "workspaces": [
+    "examples/vps-deploy",
+    "examples/sharp",
+    "examples/monorepo/apps/*",
+    "examples/monorepo/packages/*"
+  ]
 }

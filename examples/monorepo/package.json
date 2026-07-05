@@ -1,6 +1,5 @@
 {
   "name": "example-monorepo",
   "version": "0.0.0",
-  "private": true,
-  "workspaces": ["apps/*", "packages/*"]
+  "private": true
 }

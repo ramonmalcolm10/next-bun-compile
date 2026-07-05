@@ -15,6 +15,21 @@ const tmpBase = join(import.meta.dir, "..", ".test-fixtures");
 /** Minimal server.js content that passes the nextConfig regex */
 const MOCK_SERVER_JS = `const nextConfig = {"env":{}}\nprocess.exit(0);\n`;
 
+/** Minimal adapter outputs snapshot — generate.ts requires it */
+function mockSnapshot() {
+  return JSON.stringify({
+    version: 1,
+    buildId: "test-build-id",
+    nextVersion: "16.0.0",
+    basePath: "",
+    i18n: false,
+    hasCustomCacheHandler: false,
+    middlewareMatchers: [],
+    routingRules: [],
+    prerenders: [],
+  });
+}
+
 /** Minimal required-server-files.json — generate.ts reads `config.assetPrefix` */
 const MOCK_RSF = JSON.stringify({ config: { assetPrefix: "" } });
 
@@ -51,6 +66,8 @@ describe("generateEntryPoint", () => {
     scaffold(root, {
       // distDir files
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/test.js": "// static",
       // standalone files (server.js at root)
       ".next/standalone/server.js": MOCK_SERVER_JS,
@@ -62,9 +79,8 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const serverDir = generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
 
-    // For standard layout, serverDir should equal standaloneDir
     expect(serverDir).toBe(standaloneDir);
 
     // Generated files should be in standaloneDir
@@ -74,7 +90,7 @@ describe("generateEntryPoint", () => {
     // server-entry.js should contain valid content
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
     expect(entry).toContain("assetMap");
-    expect(entry).toContain('const nextConfig = {"env":{}}');
+    expect(entry).toContain('const nextConfig = {"assetPrefix":""}');
   });
 
   test("monorepo layout: returns nested serverDir", () => {
@@ -86,6 +102,8 @@ describe("generateEntryPoint", () => {
     scaffold(root, {
       // distDir files
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/test.js": "// static",
       // standalone files — server.js nested under apps/web/
       ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
@@ -98,7 +116,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const serverDir = generateEntryPoint({ standaloneDir, serverDir: join(standaloneDir, "apps/web"), distDir, projectDir });
 
     // For monorepo, serverDir should be the nested directory
     const expectedServerDir = join(standaloneDir, "apps/web");
@@ -112,7 +130,7 @@ describe("generateEntryPoint", () => {
     // server-entry.js should still have valid content
     const entry = readFileSync(join(expectedServerDir, "server-entry.js"), "utf-8");
     expect(entry).toContain("assetMap");
-    expect(entry).toContain('const nextConfig = {"env":{}}');
+    expect(entry).toContain('const nextConfig = {"assetPrefix":""}');
   });
 
   test("monorepo layout: runtime files come from nested .next/", () => {
@@ -123,6 +141,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// app static",
       ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
       ".next/standalone/apps/web/.next/BUILD_ID": "mono-build-id",
@@ -133,7 +153,7 @@ describe("generateEntryPoint", () => {
       "public/robots.txt": "User-agent: *",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const serverDir = generateEntryPoint({ standaloneDir, serverDir: join(standaloneDir, "apps/web"), distDir, projectDir });
     expect(serverDir).toBe(join(standaloneDir, "apps/web"));
 
     // assets.generated.js should reference files relative to serverDir
@@ -152,6 +172,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       // Nested server with a chunk that requires an external module
       ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
@@ -166,7 +188,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const serverDir = generateEntryPoint({ standaloneDir, serverDir: join(standaloneDir, "apps/web"), distDir, projectDir });
     expect(serverDir).toBe(join(standaloneDir, "apps/web"));
 
     // External modules should be copied into serverDir/.next/__external/
@@ -180,7 +202,7 @@ describe("generateEntryPoint", () => {
     ).toBe(false);
   });
 
-  test("throws when server.js not found anywhere", () => {
+  test("throws when adapter outputs are missing (adapter is the only build path)", () => {
     const root = join(tmpBase, "missing");
     const distDir = join(root, ".next");
     const standaloneDir = join(distDir, "standalone");
@@ -188,14 +210,34 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
-      // standalone dir exists but has no server.js
-      ".next/standalone/.next/BUILD_ID": "no-server",
+      ".next/BUILD_ID": "test-build-id",
+      // no nbc-adapter-outputs.json
+      ".next/standalone/.next/BUILD_ID": "test-build-id",
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
     });
 
     expect(() =>
-      generateEntryPoint({ standaloneDir, distDir, projectDir })
-    ).toThrow("Could not find server.js");
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir })
+    ).toThrow("adapter outputs not found");
+  });
+
+  test("throws when adapter outputs are from a previous build", () => {
+    const root = join(tmpBase, "stale");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "a-newer-build",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(), // buildId: test-build-id
+      ".next/standalone/.next/BUILD_ID": "a-newer-build",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+    });
+
+    expect(() =>
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir })
+    ).toThrow("adapter outputs not found");
   });
 
   test("pnpm monorepo layout: stubs placed in .pnpm/ store", () => {
@@ -209,6 +251,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/apps/admin/server.js": MOCK_SERVER_JS,
       ".next/standalone/apps/admin/.next/BUILD_ID": "pnpm-build",
@@ -221,7 +265,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const serverDir = generateEntryPoint({ standaloneDir, serverDir: join(standaloneDir, "apps/admin"), distDir, projectDir });
     expect(serverDir).toBe(join(standaloneDir, "apps/admin"));
 
     // Stubs should be created in the .pnpm/ hoisted path
@@ -249,6 +293,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "sym-build",
@@ -280,7 +326,7 @@ describe("generateEntryPoint", () => {
     );
 
     expect(() =>
-      generateEntryPoint({ standaloneDir, distDir, projectDir })
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir })
     ).not.toThrow();
 
     // The real react (reachable via its canonical .bun path) still embeds
@@ -307,6 +353,8 @@ describe("generateEntryPoint", () => {
       `let p=await a.y("prettier-285d8f1d6bb5f650/plugins/html");`;
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "alias-map-build",
@@ -324,7 +372,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
 
     // Chunks rewritten to absolute file paths with __NBC_BASE__ placeholder
     // for both CJS require and ESM import — bun's compiled-binary resolver
@@ -368,6 +416,8 @@ describe("generateEntryPoint", () => {
     const chunkPath = ".next/standalone/.next/server/chunks/ssr/page.js";
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "no-symlink-build",
@@ -385,7 +435,7 @@ describe("generateEntryPoint", () => {
     // No `.next/node_modules/sharp-457...` symlink — discovery must come
     // from the chunk literal scan alone.
 
-    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
 
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
     expect(entry).toContain('"sharp-457ea9eae1af1a9c":"sharp"');
@@ -404,6 +454,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "warn-build",
@@ -419,7 +471,7 @@ describe("generateEntryPoint", () => {
     const origWarn = console.warn;
     console.warn = (...args: unknown[]) => warns.push(args.join(" "));
     try {
-      generateEntryPoint({ standaloneDir, distDir, projectDir });
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
     } finally {
       console.warn = origWarn;
     }
@@ -441,6 +493,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "debug-build",
@@ -450,7 +504,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
 
     expect(entry).toContain("NEXT_BUN_COMPILE_DEBUG");
@@ -468,6 +522,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "ok-build",
@@ -486,7 +542,7 @@ describe("generateEntryPoint", () => {
     const origWarn = console.warn;
     console.warn = (...args: unknown[]) => warns.push(args.join(" "));
     try {
-      generateEntryPoint({ standaloneDir, distDir, projectDir });
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
     } finally {
       console.warn = origWarn;
     }
@@ -502,6 +558,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "manifest-build",
@@ -511,7 +569,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
     const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
 
     // Manifest skip: matching stamp on disk means extraction is bypassed
@@ -524,6 +582,8 @@ describe("generateEntryPoint", () => {
   test("build stamp changes when embedded asset content changes", () => {
     const files = {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static v1",
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "stamp-build",
@@ -536,7 +596,7 @@ describe("generateEntryPoint", () => {
       const distDir = join(root, ".next");
       const standaloneDir = join(distDir, "standalone");
       scaffold(root, { ...files, ...overrides });
-      generateEntryPoint({ standaloneDir, distDir, projectDir: root });
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
       const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
       return entry.match(/const buildStamp = "([0-9a-f]{64})"/)?.[1];
     };
@@ -564,6 +624,8 @@ describe("generateEntryPoint", () => {
 
     const files: Record<string, string> = {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/standalone/server.js": MOCK_SERVER_JS,
       ".next/standalone/.next/BUILD_ID": "collision-build",
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
@@ -577,7 +639,7 @@ describe("generateEntryPoint", () => {
     }
     scaffold(root, files);
 
-    generateEntryPoint({ standaloneDir, distDir, projectDir });
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
 
     const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
     const names = [...assets.matchAll(/^import (asset_\S+) from /gm)].map((m) => m[1]);
@@ -593,6 +655,8 @@ describe("generateEntryPoint", () => {
 
     scaffold(root, {
       ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
       ".next/static/app.js": "// static",
       ".next/standalone/packages/apps/web/server.js": MOCK_SERVER_JS,
       ".next/standalone/packages/apps/web/.next/BUILD_ID": "deep-build",
@@ -602,7 +666,7 @@ describe("generateEntryPoint", () => {
       "public/favicon.ico": "icon",
     });
 
-    const serverDir = generateEntryPoint({ standaloneDir, distDir, projectDir });
+    const serverDir = generateEntryPoint({ standaloneDir, serverDir: join(standaloneDir, "packages/apps/web"), distDir, projectDir });
     expect(serverDir).toBe(join(standaloneDir, "packages/apps/web"));
     expect(existsSync(join(serverDir, "server-entry.js"))).toBe(true);
   });

@@ -8,7 +8,7 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.3
-- [Next.js](https://nextjs.org) >= 16.0.0
+- [Next.js](https://nextjs.org) >= 16.2.0
 
 ## Setup
 
@@ -39,39 +39,39 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
      </TabItem>
    </Tabs>
 
-2. ### Enable standalone output
+2. ### Point Next.js at the build adapter
 
-   Add `output: "standalone"` to your `next.config.ts`:
+   next-bun-compile is a [Next.js Build Adapter](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath).
+   Add `adapterPath` to your `next.config.ts`:
 
    ```ts
    import type { NextConfig } from "next";
 
    const nextConfig: NextConfig = {
-     output: "standalone",
+     adapterPath: "next-bun-compile/adapter",
    };
 
    export default nextConfig;
    ```
 
-3. ### Update your build script
-
-   ```json
-   {
-     "scripts": {
-       "build": "next build && next-bun-compile"
-     }
-   }
-   ```
-
-4. ### Build the binary
+   No `output: "standalone"` needed — the adapter assembles its own
+   traced output tree. You can also enable it without touching the
+   config at all:
 
    ```bash
-   bun run build
+   NEXT_ADAPTER_PATH=next-bun-compile/adapter next build
    ```
 
-   Produces a single `./server` executable next to your `package.json`.
+3. ### Build the binary
 
-5. ### Run it
+   ```bash
+   next build
+   ```
+
+   One command. Produces a single `./server` executable next to your
+   `package.json`.
+
+4. ### Run it
 
    ```bash
    ./server
@@ -81,18 +81,32 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
 
 </Steps>
 
+## Migrating from the CLI (v0.x)
+
+Three changes:
+
+1. Remove `output: "standalone"` from `next.config.ts` and add
+   `adapterPath: "next-bun-compile/adapter"`.
+2. Change your build script from `next build && next-bun-compile`
+   to just `next build`.
+3. Cross-compiling? `--target=bun-linux-x64` becomes
+   `NBC_TARGET=bun-linux-x64 next build`.
+
 ## What's in the binary?
 
 - Your Next.js server runtime (chunks, manifests, build ID)
-- Static assets (`.next/static/*`)
-- Public files (`public/*`)
+- Static assets (`.next/static/*`) and public files (`public/*`)
+- Prerendered pages and their RSC payloads
 - All externalized server packages (sharp, prisma, anything in
   `serverExternalPackages`, etc.)
 - The bun runtime itself (you don't need bun on the deploy target)
 
-The binary extracts its embedded assets to disk on first run, then
-boots Next.js. It records a manifest of what it extracted, so
-subsequent runs of the same build skip extraction entirely.
+At runtime, static assets and fully-static prerendered pages are
+served **directly from memory**; ISR and cache-component responses get
+an in-memory cache that Next's own revalidation invalidates. The
+binary extracts its server runtime files to disk on first run (or to
+`NBC_RUNTIME_DIR` — point it at tmpfs for read-only filesystems), and
+skips extraction on subsequent runs of the same build.
 
 ## Verify it works
 

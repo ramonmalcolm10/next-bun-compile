@@ -15,22 +15,13 @@ import { createHash } from "node:crypto";
 
 interface GenerateOptions {
   standaloneDir: string;
+  /** Directory the entrypoint is generated into (the app dir inside the
+   *  assembled tree — nested for monorepo layouts). */
+  serverDir: string;
   distDir: string;
   projectDir: string;
 }
 
-/**
- * Read assetPrefix from required-server-files.json, which Next writes on
- * every `next build` and contains the full live nextConfig.
- */
-function readAssetPrefix(distDir: string): string {
-  const rsfPath = join(distDir, "required-server-files.json");
-  if (!existsSync(rsfPath)) return "";
-  const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
-    config?: { assetPrefix?: string };
-  };
-  return rsf.config?.assetPrefix ?? "";
-}
 
 /**
  * statSync that returns null instead of throwing on EPERM/EACCES/ENOENT.
@@ -475,45 +466,6 @@ function rewriteTurbopackAliases(
   return rewrittenPaths;
 }
 
-/**
- * Locate the directory containing server.js inside the standalone output.
- * For regular projects this is standaloneDir itself. For Turborepo monorepos,
- * Next.js nests the app (e.g. standalone/apps/web/server.js).
- */
-function findServerDir(standaloneDir: string): string {
-  // Fast path: regular (non-monorepo) layout
-  if (existsSync(join(standaloneDir, "server.js"))) {
-    return standaloneDir;
-  }
-
-  // Monorepo layout: search subdirectories (skip node_modules)
-  function search(dir: string): string | null {
-    if (!existsSync(dir)) return null;
-    for (const entry of readdirSync(dir)) {
-      if (entry === "node_modules") continue;
-      const full = join(dir, entry);
-      const stat = tryStat(full);
-      if (!stat || !stat.isDirectory()) continue;
-      if (existsSync(join(full, "server.js"))) return full;
-      const found = search(full);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  const found = search(standaloneDir);
-  if (!found) {
-    throw new Error(
-      "next-bun-compile: Could not find server.js in standalone output"
-    );
-  }
-
-  const rel = relative(standaloneDir, found);
-  console.log(
-    `next-bun-compile: Monorepo layout detected — server.js found at ${rel}/`
-  );
-  return found;
-}
 
 /**
  * Patch require-hook.js so require.resolve calls don't crash in compiled binaries.
@@ -565,10 +517,20 @@ function collectExternalModules(
   // `standalone/<app>/node_modules/`; only collecting the top-level one
   // misses packages that are nested-only, like next.js's own runtime files
   // when `file:` deps push the dep tree into a nested copy).
-  const pkgRoots = new Map<string, string>(); // pkg name -> absolute path
+  // pkg name -> every location found. Monorepo/adapter layouts can hold a
+  // partial copy of a package (per-route traced files) in one node_modules
+  // and the complete server-runtime copy in another — first-wins per
+  // package would embed only the partial one, so merge all locations and
+  // dedupe per file instead.
+  const pkgRoots = new Map<string, Set<string>>();
 
   function addPkg(name: string, path: string) {
-    if (!pkgRoots.has(name)) pkgRoots.set(name, path);
+    let set = pkgRoots.get(name);
+    if (!set) {
+      set = new Set();
+      pkgRoots.set(name, set);
+    }
+    set.add(path);
   }
 
   function scanDir(dir: string) {
@@ -619,12 +581,15 @@ function collectExternalModules(
   if (pkgRoots.size === 0) return [];
 
   const results: Array<{ mod: string; src: string }> = [];
-  for (const [name, pkgPath] of pkgRoots) {
-    for (const f of walkDir(pkgPath)) {
-      results.push({
-        mod: `${name}/${f.relativePath.replace(/\\/g, "/")}`,
-        src: f.absolutePath,
-      });
+  const seenMods = new Set<string>();
+  for (const [name, paths] of pkgRoots) {
+    for (const pkgPath of paths) {
+      for (const f of walkDir(pkgPath)) {
+        const mod = `${name}/${f.relativePath.replace(/\\/g, "/")}`;
+        if (seenMods.has(mod)) continue;
+        seenMods.add(mod);
+        results.push({ mod, src: f.absolutePath });
+      }
     }
   }
   return results;
@@ -677,9 +642,191 @@ function fixModuleResolution(standaloneDir: string): void {
   }
 }
 
+// --- Static-tier computation (Bun.serve routes served from memory) ---
+
+export type Tier1Entry = {
+  urlPath: string;
+  key: string;
+  kind: "static" | "public";
+};
+
+export type StaticPageSpec = {
+  path: string;
+  htmlKey: string;
+  rscKey: string | null;
+  headers: Record<string, string>;
+  status: number;
+  /** Cache tags recorded at build (incl. _N_T_ path tags) — used to drop
+   *  this page from the memory tier when Next revalidates it. */
+  tags: string[];
+};
+
+
+type TierResult = {
+  tier1: Tier1Entry[];
+  staticPages: StaticPageSpec[];
+  disabled: string | null;
+  customCacheHandler: boolean;
+};
+
+/**
+ * Typed build outputs persisted by the build adapter (see src/adapter.ts).
+ * When present and matching the current BUILD_ID, this replaces every
+ * manifest read below — same decisions, authoritative data source.
+ */
+type AdapterSnapshot = {
+  version: number;
+  buildId: string;
+  basePath: string;
+  i18n: boolean;
+  hasCustomCacheHandler: boolean;
+  middlewareMatchers: string[];
+  routingRules: string[];
+  prerenders: Array<{
+    pathname: string;
+    file: string | null;
+    status: number;
+    revalidate: number | false;
+    postponed: boolean;
+    headers: Record<string, string>;
+  }>;
+};
+
+function readAdapterSnapshot(distDir: string): AdapterSnapshot | null {
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(distDir, "nbc-adapter-outputs.json"), "utf-8")
+    ) as AdapterSnapshot;
+    if (raw?.version !== 1 || !Array.isArray(raw.prerenders)) return null;
+    // A snapshot from a previous build must not drive this one.
+    const buildId = readFileSync(join(distDir, "BUILD_ID"), "utf-8").trim();
+    if (raw.buildId !== buildId) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+function computeStaticTiersFromSnapshot(
+  snapshot: AdapterSnapshot,
+  args: {
+    staticFiles: Array<{ urlPath: string }>;
+    publicFiles: Array<{ urlPath: string }>;
+    assetPrefix: string;
+  }
+): TierResult {
+  const none = (why: string): TierResult => ({
+    tier1: [],
+    staticPages: [],
+    disabled: why,
+    customCacheHandler: snapshot.hasCustomCacheHandler,
+  });
+  if (snapshot.basePath) return none("basePath is set");
+  if (snapshot.i18n) return none("i18n is configured");
+
+  const matchers: RegExp[] = [];
+  for (const source of [
+    ...snapshot.middlewareMatchers,
+    ...snapshot.routingRules,
+  ]) {
+    try {
+      matchers.push(new RegExp(source));
+    } catch {
+      matchers.push(/.*/); // unparseable rule: fail closed
+    }
+  }
+  const covered = (p: string) => matchers.some((re) => re.test(p));
+
+  const tier1: Tier1Entry[] = [];
+  if (!args.assetPrefix) {
+    for (const f of args.staticFiles) {
+      if (!covered(f.urlPath)) {
+        tier1.push({ urlPath: f.urlPath, key: f.urlPath, kind: "static" });
+      }
+    }
+  }
+  for (const f of args.publicFiles) {
+    if (!covered(f.urlPath)) {
+      tier1.push({ urlPath: f.urlPath, key: f.urlPath, kind: "public" });
+    }
+  }
+
+  const byPathname = new Map(snapshot.prerenders.map((p) => [p.pathname, p]));
+  const staticPages: StaticPageSpec[] = [];
+  for (const p of snapshot.prerenders) {
+    if (!p.file || !p.file.endsWith(".html")) continue; // html variant only
+    if (p.pathname.startsWith("/_")) continue; // _not-found, _global-error
+    if (p.revalidate !== false || p.postponed) continue;
+    if (covered(p.pathname)) continue;
+
+    const rscPathname =
+      p.pathname === "/" ? "/index.rsc" : `${p.pathname}.rsc`;
+    const rscFile = byPathname.get(rscPathname)?.file ?? null;
+
+    // Runtime owns vary/content-type; cache tags drive invalidation and
+    // must not leak into responses.
+    const headers: Record<string, string> = {};
+    let tags: string[] = [];
+    for (const [k, v] of Object.entries(p.headers)) {
+      const lc = k.toLowerCase();
+      if (lc === "x-next-cache-tags") {
+        tags = v.split(",").map((t) => t.trim()).filter(Boolean);
+      } else if (lc !== "vary" && lc !== "content-type") {
+        headers[k] = v;
+      }
+    }
+
+    staticPages.push({
+      path: p.pathname,
+      htmlKey: `__runtime/.next/${p.file.replace(/\\/g, "/")}`,
+      rscKey: rscFile ? `__runtime/.next/${rscFile.replace(/\\/g, "/")}` : null,
+      headers,
+      status: p.status,
+      tags,
+    });
+  }
+
+  return {
+    tier1,
+    staticPages,
+    disabled: null,
+    customCacheHandler: snapshot.hasCustomCacheHandler,
+  };
+}
+
+/**
+ * Decide which prerendered pages can be served frozen from memory.
+ * Eligible: revalidate === false (never time-revalidates), no PPR
+ * postponed state (nothing to resume), not covered by a middleware
+ * matcher or a response-altering routing rule. Everything else stays
+ * with Next. On-demand revalidation of eligible pages is still honored —
+ * the runtime drops a page from the route table when Next invalidates it.
+ *
+ * Data source: the build adapter's typed snapshot (src/adapter.ts) —
+ * the only supported build path.
+ */
+function computeStaticTiers(args: {
+  distDir: string;
+  staticFiles: Array<{ urlPath: string }>;
+  publicFiles: Array<{ urlPath: string }>;
+  assetPrefix: string;
+}): TierResult {
+  const { distDir, staticFiles, publicFiles, assetPrefix } = args;
+  const snapshot = readAdapterSnapshot(distDir);
+  if (!snapshot) {
+    throw new Error(
+      "next-bun-compile: adapter outputs not found for this build. Build through the adapter: set `adapterPath: \"next-bun-compile/adapter\"` in next.config (or NEXT_ADAPTER_PATH=next-bun-compile/adapter) and run `next build`."
+    );
+  }
+  return computeStaticTiersFromSnapshot(snapshot, {
+    staticFiles,
+    publicFiles,
+    assetPrefix,
+  });
+}
+
 export function generateEntryPoint(options: GenerateOptions): string {
-  const { standaloneDir, distDir, projectDir } = options;
-  const serverDir = findServerDir(standaloneDir);
+  const { standaloneDir, serverDir, distDir, projectDir } = options;
 
   generateStubs(standaloneDir);
   patchRequireHook(standaloneDir);
@@ -698,12 +845,59 @@ export function generateEntryPoint(options: GenerateOptions): string {
     urlPath: `/${f.relativePath.replace(/\\/g, "/")}`,
   }));
 
+  // The live standalone-shaped config Next wrote for this build — embedded
+  // into the entrypoint and the source of assetPrefix (a set assetPrefix
+  // means static assets are served from a CDN and aren't embedded).
+  const rsfConfig = (
+    JSON.parse(
+      readFileSync(join(distDir, "required-server-files.json"), "utf-8")
+    ) as { config?: Record<string, unknown> }
+  ).config ?? {};
+  const assetPrefix = (rsfConfig as { assetPrefix?: string }).assetPrefix ?? "";
+
+  // Static tiers: which URLs the Bun.serve runtime may answer from memory
+  // without consulting Next. Computed from the build manifests. (When the
+  // Build Adapters API stabilizes, AdapterOutputs can replace the manifest
+  // reads — only this function's data source changes, not its output.)
+  const {
+    tier1,
+    staticPages,
+    disabled: tiersDisabled,
+    customCacheHandler,
+  } = computeStaticTiers({
+    distDir,
+    staticFiles,
+    publicFiles,
+    assetPrefix,
+  });
+  if (tiersDisabled) {
+    console.log(
+      `next-bun-compile: memory tiers disabled (${tiersDisabled}) — all requests go through Next`
+    );
+  } else {
+    console.log(
+      `next-bun-compile: Serving ${tier1.length} assets + ${staticPages.length} prerendered pages from memory`
+    );
+  }
+
   // Discover turbopack mangled aliases (e.g. `sharp-457ea9eae1af1a9c`). The
   // actual rewrite happens further down, after collectExternalModules has
   // populated the __external/ tree — we need to read each canonical's
   // package.json + file layout to find the exact main/subpath file to
   // point at.
   const standaloneNextDir = join(serverDir, ".next");
+
+  // The runtime observes revalidations by patching the default filesystem
+  // cache handler in-process. With a custom cacheHandler configured those
+  // events never reach it, so frozen pages could go stale — keep them
+  // with Next instead.
+  const hasCustomCacheHandler = customCacheHandler;
+  if (staticPages.length > 0 && hasCustomCacheHandler) {
+    console.log(
+      "next-bun-compile: custom cacheHandler detected — prerendered pages stay with Next (Tier 2 off)"
+    );
+    staticPages.length = 0;
+  }
   const turbopackAliases = findTurbopackAliases(standaloneNextDir);
   const aliasNames = new Set(turbopackAliases.map((a) => a.alias));
   const runtimeFiles = walkDir(standaloneNextDir)
@@ -759,10 +953,6 @@ export function generateEntryPoint(options: GenerateOptions): string {
     canonicalResolutions
   );
 
-  // If assetPrefix is set in next.config, static assets are served from a CDN
-  // and don't need to be embedded in the binary.
-  const assetPrefix = readAssetPrefix(distDir);
-
   const assetsToEmbed = assetPrefix
     ? [...publicFiles, ...runtimeFiles]
     : [...staticFiles, ...publicFiles, ...runtimeFiles];
@@ -810,19 +1000,15 @@ export function generateEntryPoint(options: GenerateOptions): string {
     `${imports.join("\n")}\nexport const assetMap = new Map([\n${mapEntries.join("\n")}\n]);\n`
   );
 
-  // Extract nextConfig from standalone server.js
-  const standaloneServerSrc = readFileSync(
-    join(serverDir, "server.js"),
-    "utf-8"
+  // Copy the Bun.serve runtime next to the entry so the bundler picks it up.
+  const serveRuntimeSrc = join(import.meta.dirname, "runtime/serve.js");
+  copyFileSync(
+    existsSync(serveRuntimeSrc)
+      ? serveRuntimeSrc
+      : join(import.meta.dirname, "../src/runtime/serve.js"),
+    join(serverDir, "nbc-serve.js")
   );
-  const configMatch = standaloneServerSrc.match(
-    /const nextConfig = ({[\s\S]*?})\n/
-  );
-  if (!configMatch) {
-    throw new Error(
-      "next-bun-compile: Could not extract nextConfig from standalone server.js"
-    );
-  }
+
 
   // Build extraction map for embedded assets
   const assetExtractions = assetsToEmbed.map((a) => {
@@ -843,7 +1029,13 @@ const path = require("path");
 const fs = require("fs");
 const Module = require("module");
 
-const baseDir = path.dirname(process.execPath);
+// NBC_RUNTIME_DIR relocates extraction + Next's working dir — point it at
+// tmpfs (e.g. /tmp/app) for RAM-backed runtime files and compatibility
+// with read-only root filesystems. Default: next to the binary.
+const baseDir = process.env.NBC_RUNTIME_DIR
+  ? path.resolve(process.env.NBC_RUNTIME_DIR)
+  : path.dirname(process.execPath);
+fs.mkdirSync(baseDir, { recursive: true });
 process.chdir(baseDir);
 process.env.NODE_ENV = "production";
 
@@ -1009,7 +1201,7 @@ Module._resolveFilename = function(request, parent, isMain, options) {
   }
 };
 
-const nextConfig = ${configMatch[1]};
+const nextConfig = ${JSON.stringify(rsfConfig)};
 process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(nextConfig);
 
 const currentPort = parseInt(process.env.PORT, 10) || 3000;
@@ -1070,12 +1262,24 @@ async function extractAssets() {
   console.log(\`Extracted \${extractions.length} assets\`);
 }
 
+const __NBC_TIER1 = ${JSON.stringify(tier1)};
+const __NBC_STATIC_PAGES = ${JSON.stringify(staticPages)};
+
 extractAssets().then(() => {
-  require("next");
-  const { startServer } = require("next/dist/server/lib/start-server");
-  return startServer({
-    dir: baseDir, isDev: false, config: nextConfig,
-    hostname, port: currentPort, allowRetry: false, keepAliveTimeout,
+  const { start } = require("./nbc-serve.js");
+  return start({
+    assetMap,
+    nextConfig,
+    port: currentPort,
+    hostname,
+    keepAliveTimeout,
+    tier1: __NBC_TIER1,
+    staticPages: __NBC_STATIC_PAGES,
+    baseDir,
+    // Revalidation events are observed on the default filesystem cache
+    // handler; with a custom handler they never fire, so response
+    // caching would serve stale pages.
+    enableL1: ${JSON.stringify(!hasCustomCacheHandler)},
   });
 }).catch((err) => { console.error(err); process.exit(1); });
 `;

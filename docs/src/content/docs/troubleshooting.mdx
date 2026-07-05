@@ -3,17 +3,27 @@ title: Troubleshooting
 description: Common errors and their fixes when building or running a next-bun-compile binary.
 ---
 
-## Stale standalone output after upgrading Next.js
+## `Cannot find module 'next-bun-compile/adapter'`
 
-Next.js doesn't clean its standalone output between builds. If you
-upgrade Next.js, stale files from the old version can cause runtime
-errors like `Cannot find module 'next/dist/compiled/source-map'`.
+Next resolves `adapterPath` from its own package location. In
+monorepos or linked workspaces, resolve from the app dir instead:
 
-**Fix.** Clean before rebuilding:
+```ts
+import { createRequire } from "node:module";
+const req = createRequire(process.cwd() + "/");
 
-```bash
-rm -rf .next/standalone && bun run build
+const nextConfig: NextConfig = {
+  adapterPath: req.resolve("next-bun-compile/adapter"),
+};
 ```
+
+## `adapter outputs not found for this build`
+
+The compile pipeline ran without the adapter (e.g. against a stale
+`.next`). Build through the adapter — `adapterPath` in `next.config`
+or `NEXT_ADAPTER_PATH=next-bun-compile/adapter next build` — and make
+sure nothing removed `.next/nbc-adapter-outputs.json` between the
+build and the compile.
 
 ## `Failed to load external module pino-...: Cannot find package`
 
@@ -26,7 +36,7 @@ node_modules.
 
 ```ts
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
   transpilePackages: ["pino", "pino-pretty"],
 };
 ```
@@ -79,11 +89,21 @@ next-bun-compile: ⚠ N of M turbopack alias reference(s) won't resolve at runti
   ✗ X-abc123def456... → X
 ```
 
-**Fix.** The canonical package isn't in the standalone tree. Either:
+**Fix.** The canonical package isn't in the assembled output tree. Either:
 
 - Add it as a dependency
 - Or add it to `transpilePackages` so it's bundled into the chunks
   instead of externalized
+
+## Binary can't write next to itself (read-only filesystem)
+
+The binary extracts runtime files beside itself by default. On
+read-only root filesystems (Kubernetes `readOnlyRootFilesystem`,
+read-only containers), point extraction at writable tmpfs:
+
+```bash
+NBC_RUNTIME_DIR=/tmp/app ./server
+```
 
 ## Want to see what's happening at runtime?
 

@@ -1,46 +1,51 @@
 ---
 title: Configuration
-description: Environment variables, CLI flags, and Next.js config options that affect next-bun-compile.
+description: Environment variables and Next.js config options that affect next-bun-compile.
 ---
 
 ## Environment variables (runtime)
 
-| Variable                   | Default     | Description                                                       |
-| -------------------------- | ----------- | ----------------------------------------------------------------- |
-| `PORT`                     | `3000`      | Server port                                                       |
-| `HOSTNAME`                 | `0.0.0.0`   | Server hostname                                                   |
-| `KEEP_ALIVE_TIMEOUT`       | —           | HTTP keep-alive timeout (ms)                                      |
-| `NEXT_BUN_COMPILE_DEBUG`   | `0`         | Set to `1` to log every resolver-hook decision. See [Debug mode](/next-bun-compile/guides/debug-mode/). |
-| `NEXT_BUN_COMPILE_VERBOSE` | `0`         | Set to `1` to print the alias-resolution table at **build** time. |
+| Variable                   | Default              | Description                                                       |
+| -------------------------- | -------------------- | ----------------------------------------------------------------- |
+| `PORT`                     | `3000`               | Server port                                                       |
+| `HOSTNAME`                 | `0.0.0.0`            | Server hostname                                                   |
+| `KEEP_ALIVE_TIMEOUT`       | —                    | HTTP keep-alive timeout (ms)                                      |
+| `NBC_RUNTIME_DIR`          | binary's directory   | Where runtime files extract and `.next/cache` lives. Point at tmpfs (e.g. `/tmp/app`) for RAM-backed runtime files and read-only root filesystems. |
+| `NEXT_BUN_COMPILE_DEBUG`   | `0`                  | Set to `1` to log every resolver-hook decision. See [Debug mode](/next-bun-compile/guides/debug-mode/). |
 
-## CLI flags
+## Environment variables (build time)
 
-Any flags passed to `next-bun-compile` are forwarded to
-`bun build --compile`. The most useful is `--target` for
-cross-compilation:
-
-```bash
-next-bun-compile --target=bun-linux-x64
-next-bun-compile --target=bun-linux-arm64
-next-bun-compile --target=bun-windows-x64
-```
-
-See the [Cross-compilation guide](/next-bun-compile/guides/cross-compilation/)
-for the full target list.
+| Variable                   | Default        | Description                                                       |
+| -------------------------- | -------------- | ----------------------------------------------------------------- |
+| `NEXT_ADAPTER_PATH`        | —              | Enable the adapter without touching `next.config`: `NEXT_ADAPTER_PATH=next-bun-compile/adapter next build` |
+| `NBC_TARGET`               | host platform  | Cross-compile target, e.g. `bun-linux-x64`. See [Cross-compilation](/next-bun-compile/guides/cross-compilation/). |
+| `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
 
 ## `next.config.ts` options
 
-### `output: "standalone"` (required)
+### `adapterPath` (required)
 
 ```ts
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
 };
 ```
 
-`next-bun-compile` reads the standalone tree Next.js produces here.
-Without this set, `next build` won't emit `.next/standalone/` and the
-CLI will refuse to run.
+This makes `next build` produce the binary directly. `output:
+"standalone"` is **not** required (and not used) — the adapter
+assembles its own traced output tree from the build.
+
+In monorepos or linked workspaces, Next resolves `adapterPath` from
+its own package location — resolve from the app dir instead:
+
+```ts
+import { createRequire } from "node:module";
+const req = createRequire(process.cwd() + "/");
+
+const nextConfig: NextConfig = {
+  adapterPath: req.resolve("next-bun-compile/adapter"),
+};
+```
 
 ### `assetPrefix` (optional, optimizes binary size)
 
@@ -50,7 +55,7 @@ them instead. Only `public/` files and runtime chunks get embedded.
 
 ```ts
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
   assetPrefix: "https://cdn.example.com",
 };
 ```
@@ -64,13 +69,21 @@ can't resolve at build time. Force them through the bundler instead:
 
 ```ts
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
   transpilePackages: ["pino", "pino-pretty"],
 };
 ```
 
 See the [transpilePackages guide](/next-bun-compile/guides/transpile-packages/)
 for when you need this.
+
+## Custom cache handlers
+
+If you configure a custom `cacheHandler`, the in-memory page tiers
+turn themselves off automatically (revalidation events flow through
+your handler, which the memory tiers can't observe) — every page
+request goes through Next exactly as it would under `next start`.
+Static assets are still served from memory.
 
 ## Where the binary appears
 

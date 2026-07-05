@@ -23,45 +23,56 @@ bun add -D next-bun-compile
 
 ## Setup
 
-Enable Next.js standalone output in your `next.config.ts`:
+next-bun-compile is a [Next.js Build Adapter](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath). Point `adapterPath` at it in `next.config.ts`:
 
 ```ts
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
 };
 
 export default nextConfig;
 ```
 
-Update your build script in `package.json`:
+Or enable it without touching the config at all:
 
-```json
-{
-  "scripts": {
-    "build": "next build && next-bun-compile"
-  }
-}
+```bash
+NEXT_ADAPTER_PATH=next-bun-compile/adapter next build
 ```
+
+No `output: "standalone"` needed — the adapter assembles its own traced
+output tree.
+
+> **Monorepos:** Next resolves `adapterPath` from its own package location.
+> If `next-bun-compile` is a nested workspace dependency, resolve it from
+> the app dir instead:
+>
+> ```ts
+> import { createRequire } from "node:module";
+> const req = createRequire(process.cwd() + "/");
+> const nextConfig: NextConfig = {
+>   adapterPath: req.resolve("next-bun-compile/adapter"),
+> };
+> ```
 
 ## Usage
 
 ```bash
-bun run build    # Builds Next.js + compiles to ./server
-./server         # Starts on port 3000
+next build    # Builds Next.js + compiles to ./server, one command
+./server      # Starts on port 3000
 ```
 
-The binary is fully self-contained — static assets, public files, and the Next.js server are all embedded. Just copy it anywhere and run.
+The binary is fully self-contained — static assets, public files, prerendered pages, and the Next.js server are all embedded. Just copy it anywhere and run. Static assets and fully-static prerendered pages are served straight from memory; ISR and cache-component responses get an in-memory cache that Next's own revalidation invalidates.
 
 ### Cross-Compilation
 
-Any flags passed to `next-bun-compile` are forwarded to `bun build --compile`. Use `--target` to cross-compile for a different platform:
+Set `NBC_TARGET` to cross-compile for a different platform:
 
 ```bash
-next-bun-compile --target=bun-linux-x64
-next-bun-compile --target=bun-linux-arm64
-next-bun-compile --target=bun-windows-x64
+NBC_TARGET=bun-linux-x64 next build
+NBC_TARGET=bun-linux-arm64 next build
+NBC_TARGET=bun-windows-x64 next build
 ```
 
 See the [Bun cross-compilation docs](https://bun.sh/docs/bundler/executables#cross-compile) for all available targets.
@@ -73,6 +84,8 @@ See the [Bun cross-compilation docs](https://bun.sh/docs/bundler/executables#cro
 | `PORT` | `3000` | Server port |
 | `HOSTNAME` | `0.0.0.0` | Server hostname |
 | `KEEP_ALIVE_TIMEOUT` | — | HTTP keep-alive timeout (ms) |
+| `NBC_RUNTIME_DIR` | binary's directory | Where runtime files extract and `.next/cache` lives. Point at tmpfs (e.g. `/tmp/app`) for RAM-backed runtime files and read-only root filesystems |
+| `NBC_TARGET` | host platform | Cross-compile target (build time) |
 
 ### CDN / `assetPrefix`
 
@@ -80,7 +93,7 @@ If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/
 
 ```ts
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
   assetPrefix: "https://cdn.example.com",
 };
 ```
@@ -117,16 +130,6 @@ Some modules can't be resolved at compile time but are never reached in producti
 
 ## Troubleshooting
 
-### Stale standalone output after upgrading Next.js
-
-Next.js doesn't clean the standalone output directory between builds. If you upgrade Next.js versions, stale files from the old version can cause runtime errors like `Cannot find module 'next/dist/compiled/source-map'`.
-
-**Fix:** Clean the standalone output before rebuilding:
-
-```bash
-rm -rf .next/standalone && bun next build && next-bun-compile
-```
-
 ### Packages with dynamic `require()` calls (e.g. pino)
 
 Some packages like `pino` use dynamic `require()` calls internally (for worker threads, transports, etc.). Turbopack can't resolve these at build time, so they fail at runtime inside the compiled binary with errors like:
@@ -139,7 +142,7 @@ Failed to load external module pino-142500b1eb3f4baf: Cannot find package ...
 
 ```ts
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
   transpilePackages: ["pino", "pino-pretty"],
 };
 ```

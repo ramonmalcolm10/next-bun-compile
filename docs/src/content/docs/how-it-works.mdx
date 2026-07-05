@@ -1,48 +1,85 @@
 ---
 title: How It Works
-description: The architecture behind the binary — what next-bun-compile does at build time, what the runtime does at boot.
+description: The architecture behind the binary — what the build adapter does at build time, what the runtime does at boot and per request.
 ---
 
 ## Pipeline
 
-1. **`next build`** runs your normal Next.js build with
-   `output: "standalone"`, producing the standalone tree under
-   `.next/standalone/`.
-2. **`next-bun-compile` CLI** scans the standalone, discovers
-   externalized packages and turbopack-mangled aliases, generates
-   `server-entry.js` and `assets.generated.js`, then invokes
-   `bun build --compile`.
-3. **Bun compiles** everything (server code, embedded asset files,
-   bun runtime) into one minified binary.
+1. **`next build`** runs your normal Next.js build. Because
+   `adapterPath` points at next-bun-compile, Next invokes the adapter's
+   `onBuildComplete` with its typed build outputs: every route's traced
+   assets, prerender metadata (revalidate times, PPR state, headers),
+   middleware matchers, and routing rules.
+2. **The adapter assembles** a standalone-equivalent tree from those
+   traced outputs — per-route assets, the server runtime's NFT trace,
+   prerender seed files. `output: "standalone"` is never used.
+3. **Code generation** scans the assembled tree, discovers
+   externalized packages and turbopack-mangled aliases, computes which
+   pages can be served frozen from memory, and generates
+   `server-entry.js` + `assets.generated.js`.
+4. **Bun compiles** the entry, the serve runtime, and every embedded
+   asset file into one minified binary. Next.js itself is *not*
+   bundled — it loads at runtime from the extracted tree, so nothing
+   is carried twice.
+
+## The three-tier runtime
+
+A single `Bun.serve` owns the port. Requests route through the
+fastest tier that can answer them correctly:
+
+- **Tier 1 — static assets.** `/_next/static/*` and `public/*` served
+  from memory with precompressed gzip, ETags, and immutable cache
+  headers.
+- **Tier 2 — frozen prerendered pages.** Pages with
+  `revalidate: false`, no PPR postponed state, and no covering
+  middleware or routing rule are served from memory with full RSC
+  content negotiation. Non-GET methods (server actions!) always fall
+  through to Next.
+- **Tier 3 — everything else.** PPR resume, ISR, API routes, server
+  actions, and dynamic rendering go to Next's own `router-server`
+  request handler **in-process**, through a fetch→node bridge — the
+  exact stack `next start` runs, minus its HTTP listener. ISR and
+  cache-component responses additionally get an in-memory L1 cache.
+
+**Revalidation stays Next's job.** The runtime patches the default
+filesystem cache handler so every `revalidateTag`/`revalidatePath`
+and background regeneration drops the affected page from the memory
+tiers — semantics are identical to `next start`, just faster between
+changes. With a custom `cacheHandler` configured, the page tiers turn
+themselves off entirely.
+
+Next boots **lazily** on the first dynamic request; the static tiers
+answer from the first millisecond the port is open.
 
 ## What gets embedded
 
 - All static files in `.next/static/` (skipped if `assetPrefix` set)
 - All public files
+- Prerendered pages: HTML, RSC payloads, and their metadata
 - The `.next/server/` tree (chunks, manifests, build ID)
-- Every externalized server package — copied from your `node_modules/`
-  into the binary as file assets
-- A `server-entry.js` that extracts everything at first boot and
-  starts Next.js
+- Every externalized server package — traced from your
+  `node_modules/` into the binary as file assets
+- The server orchestration graph (router-server chain), traced with
+  the same pruning `output: "standalone"` applied
 
 ## Runtime: asset extraction
 
 On first run, the binary writes its embedded assets to disk relative
-to `process.execPath`, then stamps `.next/.nbc-extracted` with a
-content hash of the build plus the directory it extracted into.
-Later boots compare that stamp: a match skips extraction entirely
-(one file read), while a mismatch — new binary, moved directory, or
-a half-finished previous extraction — re-extracts everything with
-overwrite so nothing stale can shadow the embedded assets. Extraction
-is fast (~hundreds of ms for ~1500 files) and bounded to 64
+to `process.execPath` — or to `NBC_RUNTIME_DIR` if set (point it at
+tmpfs for RAM-backed runtime files and read-only root filesystems).
+It then stamps `.next/.nbc-extracted` with a content hash of the
+build plus the directory it extracted into. Later boots compare that
+stamp: a match skips extraction entirely (one file read), while a
+mismatch — new binary, moved directory, or a half-finished previous
+extraction — re-extracts everything with overwrite so nothing stale
+can shadow the embedded assets. Extraction is bounded to 64
 concurrent writes so it can't exhaust file-descriptor limits.
 
 ## Resolver hook for externalized packages
 
-This is where most of the interesting work happens. Next.js with
-Turbopack externalizes some packages (`sharp`, `bcrypt`, anything in
-`serverExternalPackages`, anything with native bindings) — they're
-loaded at runtime instead of bundled. Two things make that
+Next.js with Turbopack externalizes some packages (`sharp`, `bcrypt`,
+anything in `serverExternalPackages`, anything with native bindings) —
+they're loaded at runtime instead of bundled. Two things make that
 challenging in a compiled binary:
 
 1. **Mangled names.** Turbopack rewrites `require("sharp")` to
@@ -52,8 +89,7 @@ challenging in a compiled binary:
 2. **Bun's compiled-binary resolver quirk.** From inside an extracted
    `node_modules` entry (e.g. `sharp/lib/sharp.js`), bun's resolver
    in compiled-binary mode doesn't reliably walk up to find sibling
-   packages. The same lookup works in `bun --bun next start` — it's
-   specific to compiled-binary mode.
+   packages.
 
 ### Two mechanisms
 
@@ -73,19 +109,19 @@ when `extractAssets` writes each chunk to disk. Resolution becomes a
 direct file load — no walks, no exports-map ambiguity, no resolver
 involvement. Works for both CJS `require()` and ESM `import()`.
 
-For subpath imports (`import("prettier-.../plugins/html")`), the
-next-bun-compile reads each canonical's `package.json` + `exports` map to
-pick the right `.mjs`/`.js`/`.cjs` variant, then rewrites to that
+For subpath imports (`import("prettier-.../plugins/html")`),
+next-bun-compile reads each canonical's `package.json` + `exports` map
+to pick the right `.mjs`/`.js`/`.cjs` variant, then rewrites to that
 absolute path.
 
 #### 2. Runtime `Module._resolveFilename` hook
 
 Once execution is inside an extracted package (sharp's own
-`require('detect-libc')`, the dynamic
-interpolated requires like `require('@img/sharp-PLATFORM/sharp.node')` (where `PLATFORM` is built from a runtime variable), the
-chunk rewrite no longer applies. A `Module._resolveFilename` hook
-catches CJS resolves that bun's compiled-binary resolver fails on
-and reimplements Node-compatible resolution from scratch:
+`require('detect-libc')`, dynamic interpolated requires like
+`require('@img/sharp-PLATFORM/sharp.node')`), the chunk rewrite no
+longer applies. A `Module._resolveFilename` hook catches CJS resolves
+that bun's compiled-binary resolver fails on and reimplements
+Node-compatible resolution from scratch:
 
 - Walk node_modules from the calling file
 - Read `package.json` + `main` for top-level
@@ -95,10 +131,6 @@ and reimplements Node-compatible resolution from scratch:
 
 The hook also consults an alias map (`sharp-457... → sharp`) and
 redirects mangled names that slip past the build-time rewrite.
-
-Together: every externalized package's internal deps resolve through
-the same mechanism. No per-package patching needed for the common
-cases.
 
 ## Module stubs (dev-only code paths)
 
@@ -121,8 +153,7 @@ next-bun-compile: ⚠ 1 of 4 turbopack alias reference(s) won't resolve at runti
 ```
 
 Set `NEXT_BUN_COMPILE_VERBOSE=1` during build to see every
-resolution + the file it picked — useful for verifying exports-map
-handling chose the right variant.
+resolution + the file it picked.
 
 ## Debug mode (runtime)
 

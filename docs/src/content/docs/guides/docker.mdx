@@ -15,7 +15,7 @@ WORKDIR /app
 COPY package.json bun.lock* ./
 RUN bun install --no-save
 COPY . .
-RUN bun --bun run build
+RUN bun run build
 
 FROM gcr.io/distroless/base-debian12:nonroot AS runner
 WORKDIR /app
@@ -47,16 +47,33 @@ rendering with sharp), see
 | `gcr.io/distroless/base-debian12:nonroot`          | ~25MB     | glibc, openssl | Pure-JS app, no native modules                          |
 | `gcr.io/distroless/cc-debian12:nonroot`            | ~30MB     | `cc` deps + libstdc++, libgcc | Any native dep (sharp, bcrypt, native query engines) |
 | `debian:12-slim`                                   | ~75MB     | full slim debian | Need apt-get for extra libs at runtime                |
-| `oven/bun:1.3.14-slim`                             | ~150MB    | bun runtime  | Skip the binary entirely; run with `bun --bun ./standalone/server.js` |
+| `oven/bun:1.3.14-slim`                             | ~150MB    | bun runtime  | Skip the binary entirely; run standalone output with bun directly |
+
+## Read-only root filesystems
+
+The binary extracts runtime files next to itself by default. For
+`readOnlyRootFilesystem: true` (Kubernetes) or read-only containers,
+point extraction at a writable tmpfs:
+
+```dockerfile
+ENV NBC_RUNTIME_DIR=/tmp/app
+```
+
+```yaml
+# k8s: mount tmpfs at /tmp
+volumes:
+  - name: runtime
+    emptyDir: { medium: Memory }
+```
 
 ## Multi-arch builds in CI
 
 GitHub Actions example for building both amd64 and arm64:
 
 ```yaml
-- run: bun --bun run build --target=bun-linux-x64
+- run: NBC_TARGET=bun-linux-x64 bun run build
 - run: mv server server-amd64
-- run: bun --bun run build --target=bun-linux-arm64
+- run: NBC_TARGET=bun-linux-arm64 bun run build
 - run: mv server server-arm64
 - uses: docker/buildx-action@v3
 - run: |
@@ -78,7 +95,7 @@ compiled-binary resolver quirks.
 Use the binary when:
 
 - Image size matters (~30MB vs ~150MB)
-- Cold start matters (pre-bundled boot is ~2x faster than `next start`)
+- Cold start matters (static tiers answer in ~60ms while Next boots lazily)
 - You want a single self-contained artifact
 
 Use bun + standalone when:

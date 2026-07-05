@@ -3,10 +3,28 @@ title: Monorepos
 description: bun workspaces, pnpm workspaces, and Turborepo all work — here's what to know.
 ---
 
-next-bun-compile detects monorepo standalone layouts automatically.
-Next.js produces something like `apps/web/.next/standalone/apps/web/server.js`
-in a monorepo (the app path is preserved inside the standalone tree),
-and next-bun-compile handles that without configuration.
+next-bun-compile handles monorepo layouts automatically. The adapter
+assembles its traced output tree with the app path preserved
+(e.g. `apps/web/...` relative to the repo root), and the compiled
+binary lands at `apps/web/server`.
+
+One monorepo-specific requirement: Next.js resolves `adapterPath`
+from **its own package location**, so a nested workspace dependency
+needs resolving from the app dir:
+
+```ts
+// apps/web/next.config.ts
+import { createRequire } from "node:module";
+import type { NextConfig } from "next";
+
+const req = createRequire(process.cwd() + "/");
+
+const nextConfig: NextConfig = {
+  adapterPath: req.resolve("next-bun-compile/adapter"),
+};
+
+export default nextConfig;
+```
 
 ## Bun workspaces
 
@@ -25,19 +43,19 @@ Standard bun workspaces setup, no special config:
 {
   "name": "web",
   "scripts": {
-    "build": "next build && next-bun-compile"
+    "build": "next build"
   },
   "dependencies": {
     "@example/shared": "*",
-    "next": "^16",
-    "next-bun-compile": "^0.6"
+    "next": "^16.2",
+    "next-bun-compile": "^1"
   }
 }
 ```
 
 ```bash
-bun install                                  # at the monorepo root
-cd apps/web && bun --bun run build           # produces apps/web/server
+bun install                        # at the monorepo root
+cd apps/web && bun run build       # produces apps/web/server
 ```
 
 A full working monorepo + sharp example is in
@@ -57,29 +75,24 @@ about the standalone layout Next.js produces.
 
 ## What next-bun-compile does for monorepos
 
-1. **Detects nested `server.js`.** `findServerDir` walks the standalone
-   to find your app's directory (e.g. `standalone/apps/web/`).
-2. **Walks nested `node_modules/`.** Monorepo standalone outputs often
-   have both `standalone/node_modules/` AND
-   `standalone/apps/web/node_modules/`. next-bun-compile scans both for
-   externalized packages and stub placement.
+1. **Preserves the nested layout.** The adapter's assembled tree keys
+   files relative to the repo root, so `apps/web` nesting survives
+   into the binary's extraction layout.
+2. **Merges split `node_modules/`.** Traced outputs can place partial
+   package copies at multiple levels; next-bun-compile merges every
+   location per file so nothing is lost to hoisting.
 3. **Workspace packages survive.** Anything Next.js's trace pulled in
-   (including workspace `*`-version deps) gets extracted from
-   wherever it landed in the standalone.
+   (including workspace `*`-version deps) gets embedded from wherever
+   it landed.
 
 ## Common gotchas
 
-### "Server.js not found anywhere"
+### "Cannot find module 'next-bun-compile/adapter'"
 
-next-bun-compile looks for `server.js` in the standalone tree but skips
-`node_modules`. If your app's `server.js` ends up under a path the
-search doesn't recognize, file an issue with the layout — we'll
-extend the detection.
-
-### Path-relative `import.meta.resolve` in next.config.ts
-
-Works the same in monorepos. The resolution happens at config-load
-time so the workspace's `node_modules` is what's consulted.
+Next resolves the bare `adapterPath` string from its own package
+location, which in a monorepo may not see your app's nested
+dependency. Use the `createRequire(process.cwd() + "/")` pattern
+shown above.
 
 ### Mixed package managers
 

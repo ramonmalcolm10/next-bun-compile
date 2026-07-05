@@ -35,7 +35,7 @@ this isn't the recipe — use Vercel or a container platform instead.
 
 1. ### GitHub Actions builds the binary
 
-   `bun --bun run build:linux-x64` cross-compiles to a single Linux
+   `bun run build:linux-x64` (`NBC_TARGET=bun-linux-x64 next build`) cross-compiles to a single Linux
    binary regardless of the runner architecture. Produces a ~30MB
    `./server` artifact.
 

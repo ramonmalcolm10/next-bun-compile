@@ -5,33 +5,33 @@ description: Build binaries for a different platform than your build machine.
 
 import { Tabs, TabItem } from "@astrojs/starlight/components";
 
-Any flags passed to `next-bun-compile` are forwarded to
-`bun build --compile`. The most useful is `--target`:
+Set `NBC_TARGET` when building to cross-compile for a different
+platform:
 
 <Tabs>
   <TabItem label="Linux x86_64">
     ```bash
-    next-bun-compile --target=bun-linux-x64
+    NBC_TARGET=bun-linux-x64 next build
     ```
   </TabItem>
   <TabItem label="Linux ARM64">
     ```bash
-    next-bun-compile --target=bun-linux-arm64
+    NBC_TARGET=bun-linux-arm64 next build
     ```
   </TabItem>
   <TabItem label="macOS Apple Silicon">
     ```bash
-    next-bun-compile --target=bun-darwin-arm64
+    NBC_TARGET=bun-darwin-arm64 next build
     ```
   </TabItem>
   <TabItem label="macOS Intel">
     ```bash
-    next-bun-compile --target=bun-darwin-x64
+    NBC_TARGET=bun-darwin-x64 next build
     ```
   </TabItem>
   <TabItem label="Windows">
     ```bash
-    next-bun-compile --target=bun-windows-x64
+    NBC_TARGET=bun-windows-x64 next build
     ```
   </TabItem>
 </Tabs>
@@ -41,8 +41,8 @@ You can wire this into the build script:
 ```json
 {
   "scripts": {
-    "build:linux": "next build && next-bun-compile --target=bun-linux-x64",
-    "build:mac": "next build && next-bun-compile --target=bun-darwin-arm64"
+    "build:linux": "next build && NBC_TARGET=bun-linux-x64 next build",
+    "build:mac": "next build && NBC_TARGET=bun-darwin-arm64 next build"
   }
 }
 ```
