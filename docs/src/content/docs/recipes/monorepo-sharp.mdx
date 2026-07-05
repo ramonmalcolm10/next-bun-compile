@@ -11,12 +11,12 @@ shared package and is compiled to a single binary on
 This recipe doubles as the e2e regression test for two things at
 once:
 
-1. **Nested standalone layout** — Next.js produces
-   `apps/web/.next/standalone/apps/web/server.js`, not
-   `standalone/server.js`. next-bun-compile handles the nesting
+1. **Nested monorepo layout** — the adapter's assembled output tree
+   preserves the app path (`apps/web/...` relative to the repo
+   root). next-bun-compile handles the nesting
    automatically.
 2. **Workspace package resolution** — `@example/shared` is a
-   workspace-versioned dep. It survives the standalone trace
+   workspace-versioned dep. It survives the build trace
    round-trip into the binary.
 
 Full source in
@@ -65,7 +65,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Build the web app — produces apps/web/server (single binary)
-RUN cd apps/web && bun --bun run build
+RUN cd apps/web && bun run build
 
 # Runner: distroless with libstdc++ + fontconfig
 FROM gcr.io/distroless/cc-debian12:nonroot AS runner
@@ -101,7 +101,7 @@ docker run --rm -p 3000:3000 next-bun-compile-monorepo
 ## Adapting to your monorepo
 
 - **Turborepo / Nx.** Same recipe — next-bun-compile cares about the
-  standalone layout, not the workspace tool. If you use
+  traced output layout, not the workspace tool. If you use
   `turbo prune --docker` in CI to slim the Docker context, the
   pruned tree still works.
 - **pnpm workspaces.** Works. The `.pnpm/` hoisted store is handled

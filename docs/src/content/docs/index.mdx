@@ -29,10 +29,11 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
     a distroless image, scp it to a VM, attach it to a release —
     that's the deploy.
   </Card>
-  <Card title="Faster cold start" icon="random">
-    The server core is pre-bundled and minified into the binary — no
-    module resolution or node_modules walks at boot. Real Next.js
-    apps start ~2x faster than `next start` on the same runtime.
+  <Card title="Memory-served hot paths" icon="random">
+    Static assets and fully-static prerendered pages are served
+    straight from memory; ISR pages get an invalidation-aware
+    in-memory cache. First byte in ~60ms — Next.js boots lazily on
+    the first dynamic request.
   </Card>
   <Card title="Smaller image footprint" icon="seti:zip">
     ~30MB binary on distroless beats ~150MB for `bun + standalone`
@@ -51,9 +52,9 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
     correctly out of the box.
   </Card>
   <Card title="Works with what you already use" icon="approve-check">
-    One line in your `next.config.ts` (`output: "standalone"`). No
-    changes to your app code, no opinions about your routing or data
-    layer.
+    One line in your `next.config.ts`
+    (`adapterPath: "next-bun-compile/adapter"`). No changes to your
+    app code, no opinions about your routing or data layer.
   </Card>
 </CardGrid>
 
@@ -68,24 +69,15 @@ bun add -D next-bun-compile
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  adapterPath: "next-bun-compile/adapter",
 };
 
 export default nextConfig;
 ```
 
-```json
-// package.json
-{
-  "scripts": {
-    "build": "next build && next-bun-compile"
-  }
-}
-```
-
 ```bash
-bun run build    # → ./server
-./server         # serves on port 3000
+next build    # → ./server, one command
+./server      # serves on port 3000
 ```
 
 Full walkthrough in [Getting Started](/next-bun-compile/getting-started/).

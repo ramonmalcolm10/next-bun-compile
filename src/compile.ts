@@ -23,6 +23,19 @@ export function compile(options: CompileOptions): void {
     "--compile",
     "--minify",
     "--sourcemap",
+    // Dev-only lazy requires inside Next's graph (webpack machinery is
+    // never loaded with output builds in production). Externalizing keeps
+    // the bundler from failing on modules that never execute.
+    "--external",
+    "webpack",
+    "--external",
+    "webpack/*",
+    "--external",
+    "next/dist/build/webpack/*",
+    "--external",
+    "sass",
+    "--external",
+    "critters",
     "--define",
     "process.env.TURBOPACK=1",
     "--define",
@@ -31,6 +44,9 @@ export function compile(options: CompileOptions): void {
     'process.env.NEXT_RUNTIME="nodejs"',
     "--outfile",
     outfile,
+    // Cross-compile target for flows with no CLI to pass --target
+    // (the build adapter): NBC_TARGET=bun-linux-x64 next build
+    ...(process.env.NBC_TARGET ? [`--target=${process.env.NBC_TARGET}`] : []),
     ...extraArgs,
   ];
 
