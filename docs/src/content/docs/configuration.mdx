@@ -17,7 +17,7 @@ description: Environment variables and Next.js config options that affect next-b
 
 | Variable                   | Default        | Description                                                       |
 | -------------------------- | -------------- | ----------------------------------------------------------------- |
-| `NEXT_ADAPTER_PATH`        | —              | Enable the adapter without touching `next.config`: `NEXT_ADAPTER_PATH=next-bun-compile/adapter next build` |
+| `NEXT_ADAPTER_PATH`        | —              | Enable the adapter without touching `next.config`: `NEXT_ADAPTER_PATH=next-bun-compile next build` |
 | `NBC_TARGET`               | host platform  | Cross-compile target, e.g. `bun-linux-x64`. See [Cross-compilation](/next-bun-compile/guides/cross-compilation/). |
 | `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
 
@@ -27,7 +27,7 @@ description: Environment variables and Next.js config options that affect next-b
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
 };
 ```
 
@@ -43,7 +43,7 @@ import { createRequire } from "node:module";
 const req = createRequire(process.cwd() + "/");
 
 const nextConfig: NextConfig = {
-  adapterPath: req.resolve("next-bun-compile/adapter"),
+  adapterPath: req.resolve("next-bun-compile"),
 };
 ```
 
@@ -55,7 +55,7 @@ them instead. Only `public/` files and runtime chunks get embedded.
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
   assetPrefix: "https://cdn.example.com",
 };
 ```
@@ -69,7 +69,7 @@ can't resolve at build time. Force them through the bundler instead:
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
   transpilePackages: ["pino", "pino-pretty"],
 };
 ```

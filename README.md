@@ -29,7 +29,7 @@ next-bun-compile is a [Next.js Build Adapter](https://nextjs.org/docs/app/api-re
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
 };
 
 export default nextConfig;
@@ -38,7 +38,7 @@ export default nextConfig;
 Or enable it without touching the config at all:
 
 ```bash
-NEXT_ADAPTER_PATH=next-bun-compile/adapter next build
+NEXT_ADAPTER_PATH=next-bun-compile next build
 ```
 
 No `output: "standalone"` needed — the adapter assembles its own traced
@@ -52,7 +52,7 @@ output tree.
 > import { createRequire } from "node:module";
 > const req = createRequire(process.cwd() + "/");
 > const nextConfig: NextConfig = {
->   adapterPath: req.resolve("next-bun-compile/adapter"),
+>   adapterPath: req.resolve("next-bun-compile"),
 > };
 > ```
 
@@ -93,7 +93,7 @@ If you configure `assetPrefix` in your `next.config.ts`, static assets (`/_next/
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
   assetPrefix: "https://cdn.example.com",
 };
 ```
@@ -142,7 +142,7 @@ Failed to load external module pino-142500b1eb3f4baf: Cannot find package ...
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
   transpilePackages: ["pino", "pino-pretty"],
 };
 ```

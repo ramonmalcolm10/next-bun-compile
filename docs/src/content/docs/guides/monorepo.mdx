@@ -20,7 +20,7 @@ import type { NextConfig } from "next";
 const req = createRequire(process.cwd() + "/");
 
 const nextConfig: NextConfig = {
-  adapterPath: req.resolve("next-bun-compile/adapter"),
+  adapterPath: req.resolve("next-bun-compile"),
 };
 
 export default nextConfig;
@@ -87,7 +87,7 @@ about the standalone layout Next.js produces.
 
 ## Common gotchas
 
-### "Cannot find module 'next-bun-compile/adapter'"
+### "Cannot find module 'next-bun-compile'"
 
 Next resolves the bare `adapterPath` string from its own package
 location, which in a monorepo may not see your app's nested

@@ -6,7 +6,7 @@ import type { NextConfig } from "next";
 const req = createRequire(process.cwd() + "/");
 
 const nextConfig: NextConfig = {
-  adapterPath: req.resolve("next-bun-compile/adapter"),
+  adapterPath: req.resolve("next-bun-compile"),
 };
 
 export default nextConfig;
