@@ -9,16 +9,13 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    },
-    "./adapter": {
-      "default": "./dist/adapter.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "bun build src/index.ts src/adapter.ts --outdir dist --target node --splitting && mkdir -p dist/runtime && cp src/runtime/serve.js dist/runtime/serve.js",
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node && mkdir -p dist/runtime && cp src/runtime/serve.js dist/runtime/serve.js",
     "typecheck": "tsc --noEmit",
     "test:regression": "bash test/regression/run.sh",
     "postinstall": "bun -e \"try{require('fs').symlinkSync('..','node_modules/next-bun-compile')}catch{}\""

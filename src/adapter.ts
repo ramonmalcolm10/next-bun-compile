@@ -14,7 +14,7 @@ import { runBuild } from "./build.js";
  * Next.js Build Adapter entry point (`adapterPath` in next.config, or the
  * `NEXT_ADAPTER_PATH` env var — no config change needed):
  *
- *   NEXT_ADAPTER_PATH=next-bun-compile/adapter next build
+ *   NEXT_ADAPTER_PATH=next-bun-compile next build
  *
  * `onBuildComplete` does everything in one `next build`:
  *  1. persists the typed build outputs Next hands us (prerender
