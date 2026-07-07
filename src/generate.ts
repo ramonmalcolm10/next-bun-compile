@@ -659,6 +659,9 @@ export type StaticPageSpec = {
   /** Cache tags recorded at build (incl. _N_T_ path tags) — used to drop
    *  this page from the memory tier when Next revalidates it. */
   tags: string[];
+  /** Overrides the text/html default for non-page bodies (static metadata
+   *  routes: image/svg+xml, image/x-icon, …), from the seed's .meta. */
+  contentType?: string;
 };
 
 
@@ -690,6 +693,9 @@ type AdapterSnapshot = {
     postponed: boolean;
     headers: Record<string, string>;
   }>;
+  /** Static route bodies (app-router static metadata, auto-static pages
+   *  HTML) — optional: snapshots from older adapter versions lack it. */
+  staticFiles?: Array<{ pathname: string; file: string }>;
 };
 
 function readAdapterSnapshot(distDir: string): AdapterSnapshot | null {
@@ -710,6 +716,7 @@ function readAdapterSnapshot(distDir: string): AdapterSnapshot | null {
 function computeStaticTiersFromSnapshot(
   snapshot: AdapterSnapshot,
   args: {
+    distDir: string;
     staticFiles: Array<{ urlPath: string }>;
     publicFiles: Array<{ urlPath: string }>;
     assetPrefix: string;
@@ -786,6 +793,64 @@ function computeStaticTiersFromSnapshot(
     });
   }
 
+  // Static-file route bodies (app-router static metadata, auto-static
+  // pages HTML). Frozen output with no revalidation — same tier as
+  // prerendered pages, with status/headers read from the seed's .meta.
+  const claimed = new Set(staticPages.map((s) => s.path));
+  for (const f of snapshot.staticFiles ?? []) {
+    if (f.pathname.startsWith("/_")) continue;
+    // Error documents are served by Next with their own status semantics —
+    // their seeds ship in the tree, but the paths stay with Next.
+    if (f.pathname === "/404" || f.pathname === "/500") continue;
+    if (claimed.has(f.pathname) || covered(f.pathname)) continue;
+
+    const file = f.file.replace(/\\/g, "/");
+    let meta: {
+      status?: number;
+      headers?: Record<string, string>;
+    } = {};
+    const suffix = [".html", ".body"].find((s) => file.endsWith(s));
+    if (suffix) {
+      try {
+        meta = JSON.parse(
+          readFileSync(
+            join(args.distDir, file.slice(0, -suffix.length) + ".meta"),
+            "utf-8"
+          )
+        );
+      } catch {
+        // .html seeds may have no .meta (auto-static pages) — defaults ok
+      }
+    }
+    const isHtml = file.endsWith(".html");
+    const contentType = meta.headers?.["content-type"];
+    // A non-HTML body with no recorded content-type can't be served
+    // faithfully from memory — leave it with Next.
+    if (!isHtml && !contentType) continue;
+
+    const headers: Record<string, string> = {};
+    let tags: string[] = [];
+    for (const [k, v] of Object.entries(meta.headers ?? {})) {
+      const lc = k.toLowerCase();
+      if (lc === "x-next-cache-tags") {
+        tags = v.split(",").map((t) => t.trim()).filter(Boolean);
+      } else if (lc !== "vary" && lc !== "content-type") {
+        headers[k] = v;
+      }
+    }
+
+    claimed.add(f.pathname);
+    staticPages.push({
+      path: f.pathname,
+      htmlKey: `__runtime/.next/${file}`,
+      rscKey: null,
+      headers,
+      status: meta.status ?? 200,
+      tags,
+      ...(isHtml ? {} : { contentType }),
+    });
+  }
+
   return {
     tier1,
     staticPages,
@@ -819,6 +884,7 @@ function computeStaticTiers(args: {
     );
   }
   return computeStaticTiersFromSnapshot(snapshot, {
+    distDir,
     staticFiles,
     publicFiles,
     assetPrefix,

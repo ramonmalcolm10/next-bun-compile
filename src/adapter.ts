@@ -39,6 +39,12 @@ type AdapterRoute = {
   destination?: string;
   status?: number;
   priority?: boolean;
+  has?: unknown[];
+};
+
+type AdapterStaticFile = {
+  pathname?: string;
+  filePath?: string;
 };
 
 type AdapterPrerender = {
@@ -73,6 +79,15 @@ export type AdapterSnapshot = {
     revalidate: number | false;
     postponed: boolean;
     headers: Record<string, string>;
+  }>;
+  /** Fully static route bodies Next reports as STATIC_FILE outputs rather
+   *  than prerenders — app-router static metadata (favicon.ico, icon.svg,
+   *  opengraph-image.png) and auto-static pages-router HTML. `/_next/static`
+   *  entries are excluded (the generator embeds those from disk directly). */
+  staticFiles: Array<{
+    pathname: string;
+    /** file path relative to distDir */
+    file: string;
   }>;
 };
 
@@ -138,6 +153,7 @@ async function assembleStandalone(ctx: {
     appRoutes?: TracedOutput[];
     middleware?: TracedOutput;
     prerenders?: Array<{ fallback?: { filePath?: string } }>;
+    staticFiles?: AdapterStaticFile[];
   };
   const routeOutputs: TracedOutput[] = [
     ...(outputs.pages ?? []),
@@ -175,13 +191,45 @@ async function assembleStandalone(ctx: {
   // them as well roughly doubled both extraction size and runtime memory
   // (every orchestration module loaded twice).
 
-  for (const p of outputs.prerenders ?? []) {
-    const file = p.fallback?.filePath;
-    if (!file) continue;
+  const copySeed = (file: string) => {
     copyTo(relative(ctx.repoRoot, file), file);
-    if (file.endsWith(".html")) {
-      const meta = file.slice(0, -".html".length) + ".meta";
+    // Seed bodies carry response metadata (status/headers/cache tags) in a
+    // sibling .meta — Next's FS cache needs both to serve without a render.
+    const suffix = [".html", ".body"].find((s) => file.endsWith(s));
+    if (suffix) {
+      const meta = file.slice(0, -suffix.length) + ".meta";
       copyTo(relative(ctx.repoRoot, meta), meta);
+    }
+  };
+
+  for (const p of outputs.prerenders ?? []) {
+    if (p.fallback?.filePath) copySeed(p.fallback.filePath);
+  }
+
+  // Static-file outputs (app-router static metadata like favicon.ico /
+  // icon.svg, auto-static pages HTML) are neither prerenders nor traced
+  // route outputs — without their seeds AND route modules the fallback
+  // render throws MODULE_NOT_FOUND. `/_next/static` entries are skipped:
+  // the generator embeds those from distDir directly.
+  for (const f of outputs.staticFiles ?? []) {
+    if (!f.filePath || f.pathname?.startsWith("/_next/")) continue;
+    copySeed(f.filePath);
+    if (f.filePath.endsWith(".body")) {
+      const routeJs = join(f.filePath.slice(0, -".body".length), "route.js");
+      if (existsSync(routeJs)) {
+        copyTo(relative(ctx.repoRoot, routeJs), routeJs);
+        try {
+          const { files } = JSON.parse(
+            readFileSync(routeJs + ".nft.json", "utf-8")
+          ) as { files: string[] };
+          for (const dep of files) {
+            const src = resolve(dirname(routeJs), dep);
+            copyTo(relative(ctx.repoRoot, src), src);
+          }
+        } catch {
+          // no trace — the module's deps are covered by the server trace
+        }
+      }
     }
   }
 
@@ -221,6 +269,7 @@ const adapter = {
         config?: { matchers?: Array<{ sourceRegex?: string }> };
       };
       prerenders?: AdapterPrerender[];
+      staticFiles?: AdapterStaticFile[];
     };
   }) {
     const routingRules: string[] = [];
@@ -236,14 +285,20 @@ const adapter = {
       for (const route of list as AdapterRoute[]) {
         // Only user-authored rules that change responses force a path back
         // to Next. Internal built-ins are either flagged `priority` (the
-        // trailing-slash redirect) or synthesized without a `source` (the
-        // /_next/static cache-control rule) — behaviors the memory tiers
-        // already replicate.
+        // trailing-slash redirect), synthesized without a `source` (the
+        // /_next/static cache-control rule), or the deploymentId skew
+        // headers (a catch-all `/:path*` that would otherwise disable the
+        // tiers entirely) — behaviors the memory tiers already replicate.
+        const headerKeys = Object.keys(route.headers ?? {});
+        const isDeploymentIdRule =
+          headerKeys.length === 1 &&
+          headerKeys[0] === "x-nextjs-deployment-id";
         if (
           route.sourceRegex &&
           typeof route.source === "string" &&
           !route.priority &&
-          (route.headers || route.destination || route.status)
+          !isDeploymentIdRule &&
+          (headerKeys.length > 0 || route.destination || route.status)
         ) {
           routingRules.push(route.sourceRegex);
         }
@@ -266,6 +321,17 @@ const adapter = {
       ];
     });
 
+    const staticFiles = (ctx.outputs?.staticFiles ?? []).flatMap((f) => {
+      if (!f.pathname || !f.filePath) return [];
+      if (f.pathname.startsWith("/_next/")) return [];
+      return [
+        {
+          pathname: f.pathname,
+          file: relative(ctx.distDir, f.filePath),
+        },
+      ];
+    });
+
     const snapshot: AdapterSnapshot = {
       version: 1,
       buildId: ctx.buildId,
@@ -278,6 +344,7 @@ const adapter = {
         .filter((r): r is string => !!r),
       routingRules,
       prerenders,
+      staticFiles,
     };
 
     writeFileSync(

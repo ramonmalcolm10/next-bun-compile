@@ -355,7 +355,8 @@ async function buildTier1Routes(tier1, assetMap, bridge) {
 
 /** Tier 2: prerendered page with RSC negotiation + ETag/304. */
 function makePageHandler(page, bridge) {
-  const { html, rsc, headers: metaHeaders, status } = page;
+  const { html, rsc, headers: metaHeaders, status, contentType, deploymentId } =
+    page;
   const htmlEtag = `"${Bun.hash(html).toString(36)}"`;
   const rscEtag = rsc ? `"${Bun.hash(rsc).toString(36)}"` : null;
   const htmlGz = html.byteLength >= GZIP_MIN_BYTES ? Bun.gzipSync(html) : null;
@@ -363,9 +364,16 @@ function makePageHandler(page, bridge) {
     rsc && rsc.byteLength >= GZIP_MIN_BYTES ? Bun.gzipSync(rsc) : null;
 
   const base = {};
-  for (const [k, v] of Object.entries(metaHeaders || {})) base[k] = v;
+  let hasCacheControl = false;
+  for (const [k, v] of Object.entries(metaHeaders || {})) {
+    base[k] = v;
+    if (k.toLowerCase() === "cache-control") hasCacheControl = true;
+  }
   base["Vary"] = PAGE_VARY;
-  base["Cache-Control"] = "s-maxage=31536000";
+  // Seeds that recorded an explicit cache-control (static metadata routes:
+  // public, max-age=0, must-revalidate) keep it — pages get the frozen-
+  // prerender policy.
+  if (!hasCacheControl) base["Cache-Control"] = "s-maxage=31536000";
   base["x-nextjs-cache"] = "HIT";
 
   return (req, server) => {
@@ -391,12 +399,16 @@ function makePageHandler(page, bridge) {
       ...base,
       "Content-Type": wantsRsc
         ? "text/x-component"
-        : "text/html; charset=utf-8",
+        : contentType || "text/html; charset=utf-8",
       ...(useGzip && { "Content-Encoding": "gzip" }),
       "Content-Length": String(payload.byteLength),
       ETag: etag,
       // Baseline sends X-Powered-By on documents but not RSC payloads.
       ...(!wantsRsc && { "X-Powered-By": "Next.js" }),
+      // With a deploymentId configured, Next stamps RSC responses so the
+      // client router can detect deployment skew — replicate it.
+      ...(wantsRsc &&
+        deploymentId && { "x-nextjs-deployment-id": deploymentId }),
     };
     if (req.headers.get("if-none-match") === etag) {
       return new Response(null, { status: 304, headers });
@@ -408,7 +420,7 @@ function makePageHandler(page, bridge) {
   };
 }
 
-async function buildTier2Routes(staticPages, assetMap, bridge) {
+async function buildTier2Routes(staticPages, assetMap, bridge, deploymentId) {
   const routes = {};
   await Promise.all(
     staticPages.map(async (spec) => {
@@ -416,7 +428,14 @@ async function buildTier2Routes(staticPages, assetMap, bridge) {
       if (html == null) return;
       const rsc = spec.rscKey ? await loadBytes(assetMap, spec.rscKey) : null;
       const handler = makePageHandler(
-        { html, rsc, headers: spec.headers, status: spec.status },
+        {
+          html,
+          rsc,
+          headers: spec.headers,
+          status: spec.status,
+          contentType: spec.contentType,
+          deploymentId,
+        },
         bridge
       );
       // Plain function route: GET/HEAD from memory, everything else
@@ -577,7 +596,12 @@ async function start(opts) {
 
   const [tier1Routes, tier2Routes] = await Promise.all([
     buildTier1Routes(tier1, assetMap, bridgeLazy),
-    buildTier2Routes(staticPages, assetMap, bridgeLazy),
+    buildTier2Routes(
+      staticPages,
+      assetMap,
+      bridgeLazy,
+      nextConfig?.deploymentId
+    ),
   ]);
 
   const routes = { ...tier1Routes, ...tier2Routes };
