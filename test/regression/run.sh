@@ -80,9 +80,11 @@ EOF
 bun install >/dev/null 2>&1
 
 echo "== build (adapter, single command) =="
+# NEXT_DEPLOYMENT_ID exercises the internal skew-header routing rules —
+# a catch-all that once disabled the tiers entirely (0 assets + 0 pages).
 BUILD_LOG="$WORK/build.log"
-bunx next build >"$BUILD_LOG" 2>&1 || { tail -10 "$BUILD_LOG"; exit 1; }
-expect "tier eligibility: 10 assets + 2 pages frozen" grep -q "Serving 10 assets + 2 prerendered pages" "$BUILD_LOG"
+NEXT_DEPLOYMENT_ID=testdpl bunx next build >"$BUILD_LOG" 2>&1 || { tail -10 "$BUILD_LOG"; exit 1; }
+expect "tier eligibility: 11 assets + 3 pages frozen (deploymentId set)" grep -q "Serving 11 assets + 3 prerendered pages" "$BUILD_LOG"
 expect "binary produced by next build alone" test -f server
 
 echo "== behavior =="
@@ -91,10 +93,15 @@ for r in / /ssr /cached /ppr /api/healthz; do
   expect "GET $r → 200" test "$(code_of http://127.0.0.1:$PORT$r)" = "200"
 done
 expect "unknown route → 404" test "$(code_of http://127.0.0.1:$PORT/definitely-missing)" = "404"
+expect "error document path stays with Next (status intact)" test "$(code_of http://127.0.0.1:$PORT/404)" = "404"
 expect "plain POST to static page → 405" test "$(code_of -X POST http://127.0.0.1:$PORT/action)" = "405"
 
-CT=$(curl -s -D- -o /dev/null -H "RSC: 1" http://127.0.0.1:$PORT/ | grep -i '^content-type' | tr -d '\r')
-expect_sh "RSC negotiation on tier page" "echo '$CT' | grep -q text/x-component"
+RSC_HDRS=$(curl -s -D- -o /dev/null -H "RSC: 1" http://127.0.0.1:$PORT/ | tr -d '\r')
+expect_sh "RSC negotiation on tier page" "echo '$RSC_HDRS' | grep -qi '^content-type: text/x-component'"
+expect_sh "deployment skew header on RSC responses" "echo '$RSC_HDRS' | grep -qi '^x-nextjs-deployment-id: testdpl'"
+
+ICON_HDRS=$(curl -s -D- -o /dev/null http://127.0.0.1:$PORT/icon.svg | tr -d '\r')
+expect_sh "static metadata route tier-served with seed content-type" "echo '$ICON_HDRS' | grep -qi '^content-type: image/svg+xml' && echo '$ICON_HDRS' | grep -qi '^x-nextjs-cache: HIT'"
 
 BODY=$(curl -s http://127.0.0.1:$PORT/ppr)
 expect_sh "PPR streams shell + resumed hole" "grep -q 'static shell' <<<'$BODY' && grep -q 'hole rendered at' <<<'$BODY'"
@@ -125,7 +132,7 @@ open('next.config.ts','w').write(config)
 EOF
 rmrf_retry .next server
 bunx next build >"$WORK/build2.log" 2>&1 || { tail -10 "$WORK/build2.log"; exit 1; }
-expect "rule-covered page excluded from tiers" grep -q "Serving 10 assets + 1 prerendered pages" "$WORK/build2.log"
+expect "rule-covered page excluded from tiers" grep -q "Serving 11 assets + 2 prerendered pages" "$WORK/build2.log"
 boot "$APP"
 HDR=$(curl -s -D- -o /dev/null http://127.0.0.1:$PORT/action | grep -ci 'x-custom-policy: test' || true)
 expect "custom header applied via Next" test "$HDR" = "1"
@@ -138,6 +145,8 @@ mkdir -p "$DEPLOY"
 cp "$APP/server" "$DEPLOY/server"
 boot "$DEPLOY" NBC_RUNTIME_DIR="$RUNTIME"
 expect_sh "serves with relocated runtime dir" "test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/) = 200 && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/ssr) = 200"
+# Hermetic: no project .next to mask a tree missing seeds or route modules.
+expect "static metadata seeds+module present in tree" test "$(code_of http://127.0.0.1:$PORT/icon.svg)" = "200"
 expect "deploy dir untouched (read-only-fs safe)" test "$(ls -A "$DEPLOY" | wc -l | tr -d ' ')" = "1"
 expect "runtime files extracted to NBC_RUNTIME_DIR" test -d "$RUNTIME/.next"
 shutdown_server
