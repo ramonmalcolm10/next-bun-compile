@@ -48,7 +48,7 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
    import type { NextConfig } from "next";
 
    const nextConfig: NextConfig = {
-     adapterPath: "next-bun-compile/adapter",
+     adapterPath: "next-bun-compile",
    };
 
    export default nextConfig;
@@ -59,7 +59,7 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
    config at all:
 
    ```bash
-   NEXT_ADAPTER_PATH=next-bun-compile/adapter next build
+   NEXT_ADAPTER_PATH=next-bun-compile next build
    ```
 
 3. ### Build the binary
@@ -86,7 +86,7 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
 Three changes:
 
 1. Remove `output: "standalone"` from `next.config.ts` and add
-   `adapterPath: "next-bun-compile/adapter"`.
+   `adapterPath: "next-bun-compile"`.
 2. Change your build script from `next build && next-bun-compile`
    to just `next build`.
 3. Cross-compiling? `--target=bun-linux-x64` becomes

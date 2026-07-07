@@ -3,7 +3,7 @@ title: Troubleshooting
 description: Common errors and their fixes when building or running a next-bun-compile binary.
 ---
 
-## `Cannot find module 'next-bun-compile/adapter'`
+## `Cannot find module 'next-bun-compile'`
 
 Next resolves `adapterPath` from its own package location. In
 monorepos or linked workspaces, resolve from the app dir instead:
@@ -13,7 +13,7 @@ import { createRequire } from "node:module";
 const req = createRequire(process.cwd() + "/");
 
 const nextConfig: NextConfig = {
-  adapterPath: req.resolve("next-bun-compile/adapter"),
+  adapterPath: req.resolve("next-bun-compile"),
 };
 ```
 
@@ -21,7 +21,7 @@ const nextConfig: NextConfig = {
 
 The compile pipeline ran without the adapter (e.g. against a stale
 `.next`). Build through the adapter — `adapterPath` in `next.config`
-or `NEXT_ADAPTER_PATH=next-bun-compile/adapter next build` — and make
+or `NEXT_ADAPTER_PATH=next-bun-compile next build` — and make
 sure nothing removed `.next/nbc-adapter-outputs.json` between the
 build and the compile.
 
@@ -36,7 +36,7 @@ node_modules.
 
 ```ts
 const nextConfig: NextConfig = {
-  adapterPath: "next-bun-compile/adapter",
+  adapterPath: "next-bun-compile",
   transpilePackages: ["pino", "pino-pretty"],
 };
 ```
