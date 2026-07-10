@@ -1,0 +1,8 @@
+---
+import Default from '@astrojs/starlight/components/Head.astro';
+import { ClientRouter } from 'astro:transitions';
+---
+
+<Default />
+{/* SPA-style navigation: swap the changed DOM instead of a full reload. */}
+<ClientRouter />
