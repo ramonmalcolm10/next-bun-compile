@@ -18,6 +18,7 @@ export default defineConfig({
       ],
       components: {
         SocialIcons: "./src/components/SocialIcons.astro",
+        Head: "./src/components/Head.astro",
       },
       editLink: {
         baseUrl:
