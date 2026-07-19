@@ -119,6 +119,17 @@ expect "gzip negotiation on tier page" test "$ENC" = "1"
 ACTION_ID=$(curl -s http://127.0.0.1:$PORT/action | grep -o 'name="\$ACTION_ID_[^"]*"' | head -1 | cut -d'"' -f2)
 expect_sh "server action POST executes (no-JS form)" "test -n '$ACTION_ID' && test \$(curl -s -o /dev/null -w '%{http_code}' -X POST -F '$ACTION_ID=' http://127.0.0.1:$PORT/action) = 200"
 expect_sh "pages healthy after tag invalidation (tier drop path)" "test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/) = 200 && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/cached) = 200"
+
+# Aborted client connections (probes, gateways, users navigating away) must
+# tear down silently — they used to log "unhandledRejection: Error: aborted"
+# on every disconnect. head closes the pipe early → curl aborts mid-stream.
+for _ in 1 2 3 4 5; do
+  curl -sN http://127.0.0.1:$PORT/ppr | head -c 16 >/dev/null 2>&1 || true
+  curl -sN http://127.0.0.1:$PORT/ssr | head -c 16 >/dev/null 2>&1 || true
+done
+sleep 1
+expect_sh "aborted connections are silent (no unhandledRejection)" "! grep -q 'unhandledRejection\|Error: aborted' '$SERVER_LOG'"
+expect "server alive after aborted connections" test "$(code_of http://127.0.0.1:$PORT/ssr)" = "200"
 shutdown_server
 
 echo "== routing-rule exclusion (custom headers) =="
