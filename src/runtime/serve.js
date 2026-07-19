@@ -175,6 +175,9 @@ class NodeResponseShim extends Writable {
   flush() {}
   // ---- body ----
   _write(chunk, encoding, callback) {
+    // Writes racing a client disconnect go nowhere on a real socket too —
+    // drop them quietly instead of erroring Next's render pipeline.
+    if (this.destroyed || this.req.aborted) return callback();
     this._implicitHeader();
     try {
       this._controller.enqueue(
@@ -195,8 +198,14 @@ class NodeResponseShim extends Writable {
   }
   _destroy(err, callback) {
     if (!this.finished) {
+      this.finished = true;
       try {
-        this._controller.error(err ?? new Error("aborted"));
+        // A real error must propagate to the client's stream; but a plain
+        // teardown (client disconnect, bodyless cancel) closes it cleanly.
+        // error()-ing on abort surfaced every routine disconnect as an
+        // "unhandledRejection: Error: aborted" in Bun's response pump.
+        if (err) this._controller.error(err);
+        else this._controller.close();
       } catch {}
     }
     callback(err);
@@ -722,3 +731,6 @@ async function start(opts) {
 }
 
 module.exports = { start };
+// Test-only escape hatch for unit-testing the fetch→node bridge. Not a public
+// API — may change or disappear in any release without notice.
+module.exports._internal = { createBridge, NodeResponseShim, makeNodeRequest };
