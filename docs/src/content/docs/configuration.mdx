@@ -19,6 +19,8 @@ description: Environment variables and Next.js config options that affect next-b
 | -------------------------- | -------------- | ----------------------------------------------------------------- |
 | `NEXT_ADAPTER_PATH`        | —              | Enable the adapter without touching `next.config`: `NEXT_ADAPTER_PATH=next-bun-compile next build` |
 | `NBC_TARGET`               | host platform  | Cross-compile target, e.g. `bun-linux-x64`. See [Cross-compilation](/next-bun-compile/guides/cross-compilation/). |
+| `NBC_OUT`                  | project root   | Directory for the compiled binary (created if missing), relative to the project or absolute. See [Where the binary appears](#where-the-binary-appears). |
+| `NBC_BINARY`               | `server`       | Filename of the compiled binary.                                  |
 | `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
 
 ## `next.config.ts` options
@@ -87,6 +89,22 @@ Static assets are still served from memory.
 
 ## Where the binary appears
 
-`./server` next to the `package.json` of the project being built.
-In a monorepo, this is `apps/<your-app>/server`. Monorepo layouts
+By default, `./server` next to the `package.json` of the project being
+built. In a monorepo, this is `apps/<your-app>/server`. Monorepo layouts
 are detected automatically.
+
+Override the location with `NBC_OUT` (directory) and `NBC_BINARY` (filename):
+
+```bash
+NBC_OUT=dist NBC_BINARY=app next build   # → ./dist/app
+```
+
+The directory is created if it doesn't exist. Writing the binary to a
+sub-directory like `dist/` keeps it out of the project root — it's a build
+artifact, not source — and lets you match a deploy tool's expected artifact
+path (e.g. homeport's `dist/app`).
+
+:::note
+A future major version will make `dist/app` the default. If you rely on the
+current `./server` location, set `NBC_OUT` / `NBC_BINARY` explicitly.
+:::

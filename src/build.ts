@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { generateEntryPoint } from "./generate.js";
 import { compile } from "./compile.js";
 
@@ -12,6 +12,29 @@ export interface RunBuildOptions {
   serverDir: string;
   /** Extra args appended to the `bun build` invocation. */
   extraArgs?: string[];
+  /**
+   * Output directory for the binary, relative to projectDir (or absolute).
+   * Default: the project root. A future major moves this to "dist".
+   */
+  out?: string;
+  /** Binary filename. Default: "server". */
+  binaryName?: string;
+}
+
+/**
+ * Where the compiled binary is written. Overridable so callers can place it
+ * off-root — e.g. dist/app to match homeport's other framework adapters, which
+ * also avoids ever naming a file `server` (Nitro treats server/ as a
+ * convention dir). Precedence: explicit option → env (NBC_OUT / NBC_BINARY,
+ * for the adapter and CLI flows that have no argv) → the historical default
+ * <projectDir>/server. The default is preserved for backward compatibility;
+ * a future major moves it to dist/app.
+ */
+function resolveOutfile(projectDir: string, options: RunBuildOptions): string {
+  const outDir = options.out ?? process.env.NBC_OUT ?? projectDir;
+  const binaryName = options.binaryName ?? process.env.NBC_BINARY ?? "server";
+  const base = isAbsolute(outDir) ? outDir : join(projectDir, outDir);
+  return join(base, binaryName);
 }
 
 /**
@@ -93,7 +116,8 @@ export async function runBuild(options: RunBuildOptions): Promise<string> {
   await ensureServerRuntime(projectDir, standaloneDir);
 
   generateEntryPoint({ standaloneDir, serverDir, distDir, projectDir });
-  const outfile = join(projectDir, "server");
+  const outfile = resolveOutfile(projectDir, options);
+  mkdirSync(dirname(outfile), { recursive: true });
   compile({ serverDir, outfile, extraArgs });
   return outfile;
 }
