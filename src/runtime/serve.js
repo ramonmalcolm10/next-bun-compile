@@ -270,10 +270,16 @@ function acceptsGzip(req) {
   return !!ae && ae.includes("gzip");
 }
 
+// __runtime/ assets may be stored gzipped in the binary (they're
+// extraction-bound; only Tier-2 page seeds are ever read back here).
+// start() fills this with the build's gzip-embedded urlPaths.
+let gzippedAssetSet = new Set();
+
 async function loadBytes(assetMap, key) {
   const ref = assetMap.get(key);
   if (ref == null) return null;
-  return await Bun.file(ref).bytes();
+  const bytes = await Bun.file(ref).bytes();
+  return gzippedAssetSet.has(key) ? Bun.gunzipSync(bytes) : bytes;
 }
 
 function contentTypeFor(assetMap, key, fallback) {
@@ -467,6 +473,7 @@ async function buildTier2Routes(staticPages, assetMap, bridge, deploymentId) {
 async function start(opts) {
   const {
     assetMap,
+    gzippedAssets,
     nextConfig,
     port,
     hostname,
@@ -476,6 +483,7 @@ async function start(opts) {
     baseDir,
     enableL1 = true,
   } = opts;
+  if (gzippedAssets) gzippedAssetSet = gzippedAssets;
 
   // Next boots lazily on the first Tier-3 request; static tiers serve
   // immediately. This keeps time-to-first-static-byte low while Next's

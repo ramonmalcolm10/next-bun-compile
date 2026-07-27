@@ -4,11 +4,16 @@ import {
   writeFileSync,
   existsSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { generateEntryPoint, isPrunableModuleFile } from "./generate.js";
+import {
+  generateEntryPoint,
+  isPrunableModuleFile,
+  shouldCompressEmbeddedAsset,
+} from "./generate.js";
 
 const tmpBase = join(import.meta.dir, "..", ".test-fixtures");
 
@@ -707,6 +712,73 @@ describe("generateEntryPoint", () => {
     expect(assets).not.toContain("webpack/bundle5.js");
     expect(assets).not.toContain("react-dom.development.js");
   });
+
+  test("gzip-embeds large compressible runtime files, leaves the rest raw", () => {
+    const root = join(tmpBase, "gzip-embed");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    const big = `// big chunk\n${"const filler = 1; // repeated line that gzips well\n".repeat(1000)}`;
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "test-build-id",
+      ".next/standalone/.next/server/chunks/ssr.js": `// no externals`,
+      ".next/standalone/.next/server/chunks/big.js": big,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      "public/favicon.ico": "icon",
+    });
+
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
+
+    const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+    // the big chunk is embedded from the gz store and marked
+    expect(assets).toContain(".next/__gz/");
+    const setLine = assets
+      .split("\n")
+      .find((l) => l.includes("gzippedAssets"));
+    expect(setLine).toContain('"__runtime/.next/server/chunks/big.js"');
+    // small files stay raw
+    expect(setLine).not.toContain("ssr.js");
+    expect(setLine).not.toContain("BUILD_ID");
+    // staged bytes gunzip back to the original content
+    const gzDir = join(standaloneDir, ".next/__gz");
+    const staged = readdirSync(gzDir);
+    expect(staged.length).toBe(1);
+    const roundTrip = Bun.gunzipSync(readFileSync(join(gzDir, staged[0])));
+    expect(new TextDecoder().decode(roundTrip)).toBe(big);
+    // server-entry gunzips marked assets during extraction and hands the
+    // set to the serve runtime
+    const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+    expect(entry).toContain("gzippedAssets");
+    expect(entry).toContain("gunzipSync");
+  });
+});
+
+describe("shouldCompressEmbeddedAsset", () => {
+  const cases: Array<[string, string, number, number, boolean]> = [
+    // compressible extraction-bound runtime file
+    ["large runtime chunk", "__runtime/.next/server/chunks/app.js", 100_000, 30_000, true],
+    ["runtime node_modules file", "__runtime/.next/node_modules/next/dist/server/router-server.js", 500_000, 120_000, true],
+    // only the __runtime/ tree is extraction-bound
+    ["static asset served from memory", "/_next/static/chunks/main.js", 100_000, 30_000, false],
+    ["public file", "/favicon.ico", 100_000, 30_000, false],
+    // too small to bother
+    ["below size floor", "__runtime/.next/tiny.js", 4_095, 100, false],
+    ["at size floor", "__runtime/.next/small.js", 4_096, 1_000, true],
+    // barely compresses (native binaries, already-compressed formats)
+    ["poor ratio native binary", "__runtime/.next/node_modules/@img/sharp.node", 1_000_000, 950_000, false],
+    ["ratio exactly at threshold", "__runtime/.next/x.js", 100_000, 90_000, false],
+  ];
+  for (const [name, urlPath, raw, gz, want] of cases) {
+    test(`${name} → ${want ? "compressed" : "raw"}`, () => {
+      expect(shouldCompressEmbeddedAsset(urlPath, raw, gz)).toBe(want);
+    });
+  }
 });
 
 describe("isPrunableModuleFile", () => {
