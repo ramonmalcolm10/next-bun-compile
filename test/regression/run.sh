@@ -106,6 +106,21 @@ expect_sh "static metadata route tier-served with seed content-type" "echo '$ICO
 BODY=$(curl -s http://127.0.0.1:$PORT/ppr)
 expect_sh "PPR streams shell + resumed hole" "grep -q 'static shell' <<<'$BODY' && grep -q 'hole rendered at' <<<'$BODY'"
 
+# PPR resume protocol (Next's ppr-platform-guide, CDN-to-origin): a CDN
+# serving a cached shell POSTs the route with `next-resume: 1` and the
+# postponedState blob as the body; the origin must render only the
+# deferred holes, never a second shell. The blob lives in the page's
+# .meta file, extracted next to the binary at boot.
+python3 - >"$WORK/postponed.txt" <<'PYEOF'
+import json
+print(json.load(open('.next/server/app/ppr.meta'))['postponed'], end='')
+PYEOF
+# The resumed stream legitimately carries the shell's text inside the
+# escaped RSC flight payload (hydration data) — only rendered shell
+# MARKUP (<main>/<h1>) must be absent.
+RESUME=$(curl -s -X POST -H 'next-resume: 1' --data-binary @"$WORK/postponed.txt" http://127.0.0.1:$PORT/ppr)
+expect_sh "PPR resume POST renders only the dynamic hole" "test -s '$WORK/postponed.txt' && grep -q 'hole rendered at' <<<'$RESUME' && ! grep -q '<h1>' <<<'$RESUME' && ! grep -q '<main>' <<<'$RESUME'"
+
 S1=$(curl -s http://127.0.0.1:$PORT/cached | grep -o 'stamp: <!-- -->[0-9]*')
 S2=$(curl -s http://127.0.0.1:$PORT/cached | grep -o 'stamp: <!-- -->[0-9]*')
 expect_sh "ISR page stable across requests (L1)" "test -n '$S1' && test '$S1' = '$S2'"
