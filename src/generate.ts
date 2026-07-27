@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { join, relative, basename } from "node:path";
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 
 interface GenerateOptions {
   standaloneDir: string;
@@ -537,6 +538,31 @@ export function isPrunableModuleFile(mod: string): boolean {
   // ensureServerRuntime's trace ignores).
   if (mod.startsWith("next/dist/compiled/webpack/")) return true;
   return false;
+}
+
+/** Minimum raw size before gzip-embedding is worth the extraction-time
+ *  gunzip; below this the binary savings are noise. */
+const GZ_EMBED_MIN_BYTES = 4096;
+
+/**
+ * Whether an embedded asset should be stored gzipped in the binary.
+ *
+ * Only the __runtime/ tree qualifies: those files exist solely to be
+ * extracted to disk at first boot, so they're decompressed exactly once
+ * per fresh filesystem (each deploy — or each pod start on ephemeral
+ * filesystems). Static and public assets are served straight from the
+ * embedded bytes on every request and stay raw. Files that barely
+ * compress (native .node binaries, woff2, images) also stay raw — the
+ * savings don't cover the extraction cost.
+ */
+export function shouldCompressEmbeddedAsset(
+  urlPath: string,
+  rawSize: number,
+  gzSize: number
+): boolean {
+  if (!urlPath.startsWith("__runtime/")) return false;
+  if (rawSize < GZ_EMBED_MIN_BYTES) return false;
+  return gzSize < rawSize * 0.9;
 }
 
 function collectExternalModules(
@@ -1074,6 +1100,33 @@ export function generateEntryPoint(options: GenerateOptions): string {
     `next-bun-compile: Embedding ${assetsToEmbed.length} assets (${staticFiles.length} static + ${publicFiles.length} public + ${runtimeFiles.length} runtime)`
   );
 
+  // Gzip the extraction-bound __runtime/ tree before embedding. The
+  // runtime gunzips each marked asset once, during extraction (and for
+  // the few Tier-2 seeds read back into memory at boot).
+  const gzStoreDir = join(serverDir, ".next/__gz");
+  const gzippedAssets: string[] = [];
+  let gzSavedBytes = 0;
+  for (const [i, asset] of assetsToEmbed.entries()) {
+    if (!asset.urlPath.startsWith("__runtime/")) continue;
+    const raw = readFileSync(asset.absolutePath);
+    if (raw.length < GZ_EMBED_MIN_BYTES) continue;
+    const gz = gzipSync(raw, { level: 6 });
+    if (!shouldCompressEmbeddedAsset(asset.urlPath, raw.length, gz.length)) {
+      continue;
+    }
+    mkdirSync(gzStoreDir, { recursive: true });
+    const staged = join(gzStoreDir, `${i}.gz`);
+    writeFileSync(staged, gz);
+    asset.absolutePath = staged;
+    gzippedAssets.push(asset.urlPath);
+    gzSavedBytes += raw.length - gz.length;
+  }
+  if (gzippedAssets.length > 0) {
+    console.log(
+      `next-bun-compile: gzip-embedded ${gzippedAssets.length} runtime files (binary −${(gzSavedBytes / 1024 / 1024).toFixed(1)} MB)`
+    );
+  }
+
   // Content hash of everything embedded (post chunk-rewrite). The runtime
   // stamps this (plus the resolved baseDir) into a manifest file after a
   // complete extraction; a boot that finds a matching manifest skips
@@ -1104,7 +1157,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
 
   writeFileSync(
     join(serverDir, "assets.generated.js"),
-    `${imports.join("\n")}\nexport const assetMap = new Map([\n${mapEntries.join("\n")}\n]);\n`
+    `${imports.join("\n")}\nexport const assetMap = new Map([\n${mapEntries.join("\n")}\n]);\nexport const gzippedAssets = new Set(${JSON.stringify(gzippedAssets)});\n`
   );
 
   // Copy the Bun.serve runtime next to the entry so the bundler picks it up.
@@ -1131,7 +1184,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
   });
 
   // Generate server-entry.js
-  const serverEntry = `import { assetMap } from "./assets.generated.js";
+  const serverEntry = `import { assetMap, gzippedAssets } from "./assets.generated.js";
 const path = require("path");
 const fs = require("fs");
 const Module = require("module");
@@ -1353,9 +1406,16 @@ async function extractAssets() {
       const embedded = assetMap.get(urlPath);
       if (!embedded) continue;
       const fullPath = path.join(baseDir, diskPath);
-      if (rewrittenChunks.has(diskPath)) {
-        const text = await Bun.file(embedded).text();
-        await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
+      const gz = gzippedAssets.has(urlPath);
+      if (gz || rewrittenChunks.has(diskPath)) {
+        let bytes = await Bun.file(embedded).bytes();
+        if (gz) bytes = Bun.gunzipSync(bytes);
+        if (rewrittenChunks.has(diskPath)) {
+          const text = new TextDecoder().decode(bytes);
+          await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
+        } else {
+          await Bun.write(fullPath, bytes);
+        }
       } else {
         await Bun.write(fullPath, Bun.file(embedded));
       }
@@ -1376,6 +1436,7 @@ extractAssets().then(() => {
   const { start } = require("./nbc-serve.js");
   return start({
     assetMap,
+    gzippedAssets,
     nextConfig,
     port: currentPort,
     hostname,
