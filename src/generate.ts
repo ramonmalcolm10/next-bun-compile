@@ -508,6 +508,37 @@ function patchRequireHook(standaloneDir: string): void {
  * Returns array of {mod, src} where mod is the canonical module path
  * (e.g. "next/dist/server/next.js") and src is the absolute path on disk.
  */
+/**
+ * Build-time-only files that reach the standalone tree through the
+ * adapter's per-route traces (which don't apply ensureServerRuntime's
+ * nodeFileTrace ignore list) but can never load at runtime — embedding
+ * them costs binary size, ship time, and extraction bytes for nothing.
+ * On a fresh app this is over half the embedded node_modules tree,
+ * dominated by the next-server *.js.map files.
+ *
+ * `mod` is the canonical module path relative to node_modules
+ * (e.g. "next/dist/compiled/next-server/app-page.runtime.prod.js").
+ *
+ * Kept deliberately: the turbo/experimental runtime variants —
+ * module.compiled.js picks its variant from the real process env at
+ * runtime, not from the defines baked into the bundled entry graph.
+ */
+export function isPrunableModuleFile(mod: string): boolean {
+  // Sourcemaps are referenced only by sourceMappingURL comments, never
+  // require()d — and stack traces in extracted files aren't remapped
+  // by the compiled binary anyway.
+  if (mod.endsWith(".map")) return true;
+  // server-entry.js hard-sets NODE_ENV=production before any Next code
+  // loads, so the development builds are unreachable.
+  if (/^next\/dist\/compiled\/next-server\/.*\.dev\.js$/.test(mod)) return true;
+  if (/^(react|react-dom)\/.*\.development\.js$/.test(mod)) return true;
+  // Webpack machinery is never loaded by output builds in production
+  // (same position as compile.ts's --external list and
+  // ensureServerRuntime's trace ignores).
+  if (mod.startsWith("next/dist/compiled/webpack/")) return true;
+  return false;
+}
+
 function collectExternalModules(
   standaloneDir: string
 ): Array<{ mod: string; src: string }> {
@@ -582,15 +613,25 @@ function collectExternalModules(
 
   const results: Array<{ mod: string; src: string }> = [];
   const seenMods = new Set<string>();
+  let pruned = 0;
   for (const [name, paths] of pkgRoots) {
     for (const pkgPath of paths) {
       for (const f of walkDir(pkgPath)) {
         const mod = `${name}/${f.relativePath.replace(/\\/g, "/")}`;
         if (seenMods.has(mod)) continue;
         seenMods.add(mod);
+        if (isPrunableModuleFile(mod)) {
+          pruned++;
+          continue;
+        }
         results.push({ mod, src: f.absolutePath });
       }
     }
+  }
+  if (pruned > 0) {
+    console.log(
+      `next-bun-compile: pruned ${pruned} build-time-only module files (sourcemaps, dev builds, webpack)`
+    );
   }
   return results;
 }

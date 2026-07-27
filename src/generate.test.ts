@@ -8,7 +8,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { generateEntryPoint } from "./generate.js";
+import { generateEntryPoint, isPrunableModuleFile } from "./generate.js";
 
 const tmpBase = join(import.meta.dir, "..", ".test-fixtures");
 
@@ -670,4 +670,75 @@ describe("generateEntryPoint", () => {
     expect(serverDir).toBe(join(standaloneDir, "packages/apps/web"));
     expect(existsSync(join(serverDir, "server-entry.js"))).toBe(true);
   });
+
+  test("prunes build-time-only module files from the embedded assets", () => {
+    const root = join(tmpBase, "prune");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "test-build-id",
+      ".next/standalone/.next/server/chunks/ssr.js": `// no externals`,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      // must survive the prune
+      ".next/standalone/node_modules/next/dist/compiled/next-server/app-page.runtime.prod.js": "// prod runtime",
+      ".next/standalone/node_modules/next/dist/compiled/next-server/app-page-turbo.runtime.prod.js": "// turbo variant",
+      // must be pruned
+      ".next/standalone/node_modules/next/dist/compiled/next-server/app-page.runtime.prod.js.map": "{}",
+      ".next/standalone/node_modules/next/dist/compiled/next-server/app-page.runtime.dev.js": "// dev runtime",
+      ".next/standalone/node_modules/next/dist/compiled/webpack/bundle5.js": "// webpack",
+      ".next/standalone/node_modules/react-dom/cjs/react-dom.development.js": "// dev react",
+      "public/favicon.ico": "icon",
+    });
+
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
+
+    const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+    expect(assets).toContain("app-page.runtime.prod.js");
+    expect(assets).toContain("app-page-turbo.runtime.prod.js");
+    expect(assets).not.toContain("app-page.runtime.prod.js.map");
+    expect(assets).not.toContain("app-page.runtime.dev.js");
+    expect(assets).not.toContain("webpack/bundle5.js");
+    expect(assets).not.toContain("react-dom.development.js");
+  });
+});
+
+describe("isPrunableModuleFile", () => {
+  const cases: Array<[string, boolean]> = [
+    // sourcemaps anywhere in node_modules — referenced only by
+    // sourceMappingURL comments, never require()d
+    ["next/dist/compiled/next-server/app-page.runtime.prod.js.map", true],
+    ["sharp/lib/index.js.map", true],
+    // dev runtimes — unreachable, server-entry hard-sets NODE_ENV=production
+    ["next/dist/compiled/next-server/app-page.runtime.dev.js", true],
+    ["next/dist/compiled/next-server/pages.runtime.dev.js", true],
+    ["react/cjs/react.development.js", true],
+    ["react-dom/cjs/react-dom.development.js", true],
+    // webpack machinery — never loaded by output builds in production
+    ["next/dist/compiled/webpack/bundle5.js", true],
+    ["next/dist/compiled/webpack/webpack.js", true],
+    // everything that must survive
+    ["next/dist/compiled/next-server/app-page.runtime.prod.js", false],
+    // turbo/experimental variants: module.compiled.js picks at runtime
+    // from the real env, not the bundled defines — they must stay
+    ["next/dist/compiled/next-server/app-page-turbo.runtime.prod.js", false],
+    ["next/dist/compiled/next-server/app-page-experimental.runtime.prod.js", false],
+    ["next/dist/server/router-server.js", false],
+    ["react-dom/cjs/react-dom.production.js", false],
+    ["react/index.js", false],
+    ["@img/sharp-linux-x64/lib/sharp-linux-x64.node", false],
+    // .development.js pruning is scoped to react/react-dom only
+    ["some-lib/dist/some-lib.development.js", false],
+  ];
+  for (const [mod, want] of cases) {
+    test(`${mod} → ${want ? "pruned" : "kept"}`, () => {
+      expect(isPrunableModuleFile(mod)).toBe(want);
+    });
+  }
 });
