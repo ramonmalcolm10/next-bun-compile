@@ -536,9 +536,15 @@ function buildShellRoutes(baseDir) {
       const payload = JSON.stringify({ shell, postponed, buildId });
       const headers = {
         "Content-Type": "application/json",
-        // Build-time content: edge caches may hold it; a zone purge on
-        // deploy (or this max-age) refreshes it.
-        "Cache-Control": "public, max-age=3600",
+        // Open mode: build-time content, shared caches may hold it (a
+        // zone purge on deploy or this max-age refreshes it). Token
+        // mode: must be unstorable by shared caches — a zone-wide CDN
+        // cache rule would otherwise cache the tokened 200 and serve it
+        // to anyone, defeating the token. The edge worker re-wraps the
+        // response for its own private cache.
+        "Cache-Control": token
+          ? "private, no-store"
+          : "public, max-age=3600",
       };
       routes[SHELL_PREFIX + rel] = token
         ? (req) =>
