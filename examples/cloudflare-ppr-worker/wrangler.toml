@@ -2,15 +2,16 @@ name = "ppr-shell-worker"
 main = "worker.js"
 compatibility_date = "2026-07-01"
 
-# One namespace serves every app; keys are prefixed with the hostname.
-# Create it once:  wrangler kv namespace create PPR
-kv_namespaces = [
-  { binding = "PPR", id = "<your-kv-namespace-id>" }
-]
-
 # Attach only the paths that are actually PPR — everything else should
 # never invoke the Worker (keeps it off your cache-rule fast path and
-# out of your request quota). Add one line per app/route family.
+# out of your request quota). Add one line per app/route family; one
+# Worker deployment serves any number of zones in your account.
 routes = [
   { pattern = "example.com/dashboard*", zone_name = "example.com" },
 ]
+
+# Only needed when the origin endpoint runs in token mode
+# (NBC_PPR_SHELL=<token>). Prefer a secret over a plain var:
+#   wrangler secret put SHELL_TOKEN
+# [vars]
+# SHELL_TOKEN = "..."

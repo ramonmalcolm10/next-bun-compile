@@ -175,6 +175,38 @@ expect_sh "serves with relocated runtime dir" "test \$(curl -s -o /dev/null -w '
 expect "static metadata seeds+module present in tree" test "$(code_of http://127.0.0.1:$PORT/icon.svg)" = "200"
 expect "deploy dir untouched (read-only-fs safe)" test "$(ls -A "$DEPLOY" | wc -l | tr -d ' ')" = "1"
 expect "runtime files extracted to NBC_RUNTIME_DIR" test -d "$RUNTIME/.next"
+expect "shell endpoint off by default → 404" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "404"
+shutdown_server
+
+echo "== PPR shell endpoint (edge-shell protocol) =="
+# Same deploy dir + runtime dir: extraction manifest matches, so these
+# boots are fast and the endpoint must read from the EXTRACTED tree.
+boot "$DEPLOY" NBC_RUNTIME_DIR="$RUNTIME" NBC_PPR_SHELL=1
+curl -s "http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr" >"$WORK/shell.json" || true
+expect "shell endpoint serves shell + postponed + buildId" python3 -c "
+import json
+e = json.load(open('$WORK/shell.json'))
+assert 'static shell' in e['shell'], 'shell html missing static content'
+assert e['postponed'] and isinstance(e['postponed'], str), 'postponed missing'
+assert e['buildId'], 'buildId missing'
+"
+# Full protocol round-trip: the postponed state the ENDPOINT returned must
+# resume cleanly — this is exactly what an edge worker will do.
+python3 -c "import json; print(json.load(open('$WORK/shell.json'))['postponed'], end='')" >"$WORK/endpoint-postponed.txt" 2>/dev/null || true
+RESUMED=$(curl -s -X POST -H 'next-resume: 1' --data-binary @"$WORK/endpoint-postponed.txt" http://127.0.0.1:$PORT/ppr)
+expect_sh "endpoint postponed state resumes cleanly" "grep -q 'hole rendered at' <<<'$RESUMED'"
+# /cached is ISR without a postponed state — no PPR pair to serve.
+# (Note /ssr DOES have one under cacheComponents: its shell is the
+# loading fallback, and serving it is correct protocol behavior.)
+expect "shell endpoint 404 for non-PPR route" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/cached)" = "404"
+# Encoded traversal: %2F survives URL normalization, so this is the form
+# that actually reaches the handler's path check.
+expect "shell endpoint rejects path traversal" test "$(code_of --path-as-is "http://127.0.0.1:$PORT/_nbc/ppr-shell/..%2F..%2FBUILD_ID")" = "404"
+shutdown_server
+
+boot "$DEPLOY" NBC_RUNTIME_DIR="$RUNTIME" NBC_PPR_SHELL=sekret-token
+expect "shell endpoint token mode: 401 without header" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "401"
+expect "shell endpoint token mode: 200 with header" test "$(code_of -H 'x-nbc-shell-token: sekret-token' http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "200"
 shutdown_server
 
 echo

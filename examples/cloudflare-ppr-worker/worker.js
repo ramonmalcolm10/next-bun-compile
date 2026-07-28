@@ -1,29 +1,30 @@
 /**
  * Cloudflare Worker implementing the CDN side of Next.js's PPR
  * platform protocol (CDN shell + origin compute) against a
- * next-bun-compile origin. The origin side is guaranteed by the
- * package's regression suite: a POST with `next-resume: 1` and the
- * postponedState blob as the body renders only the deferred holes.
+ * next-bun-compile origin — self-populating edition.
  *
- * One deployment serves any number of apps: KV keys are namespaced by
- * hostname, so each app's CI pushes its own entries and the Worker
- * never changes. See README.md for the KV entry format and the
- * deploy-time push/reconcile script.
+ * No KV, no build-time push pipeline: on a cache miss the request
+ * passes through to the origin unchanged (never slower than no
+ * worker), while the shell is fetched once in the background from the
+ * origin's opt-in endpoint (`NBC_PPR_SHELL=...` on the origin):
  *
- * Request flow:
- *   1. Only GET document requests are candidates; everything else
- *      (assets, APIs, RSC payload requests, POSTs) passes through —
- *      your cache rules and origin behave exactly as without the
- *      Worker.
- *   2. KV lookup `page:<host>:<path>`. Miss → pass through (route
- *      isn't PPR, or artifacts not pushed yet).
- *   3. Hit → stream the cached shell to the visitor immediately
- *      (edge latency), while a resume POST to the origin renders the
- *      dynamic holes in parallel. The hole stream is appended to the
- *      same response.
- *   4. Any resume failure (origin down, postponed/build skew during a
- *      deploy's KV propagation window) degrades to the shell with its
- *      Suspense fallbacks — never a broken or mixed-build page.
+ *   GET /_nbc/ppr-shell/<route>  →  { shell, postponed, buildId }
+ *
+ * and stored in `caches.default` — Cloudflare's native zone cache,
+ * nothing to provision or administer. Warm requests stream the cached
+ * shell at edge latency while a resume POST renders only the dynamic
+ * holes at the origin.
+ *
+ * Staleness is handled by infrastructure you already run:
+ *   - a purge-on-deploy job clears the zone cache, shells included
+ *     (the endpoint's max-age is the backstop);
+ *   - a failed resume (e.g. build skew inside the purge window)
+ *     evicts the cached shell and degrades that one request to the
+ *     shell's Suspense fallbacks — never mixed builds.
+ *
+ * Optional env var (wrangler.toml [vars] or a secret):
+ *   SHELL_TOKEN — sent as x-nbc-shell-token when the origin runs the
+ *                 endpoint in token mode (NBC_PPR_SHELL=<token>).
  */
 
 export default {
@@ -41,26 +42,49 @@ export default {
     ) {
       return fetch(req);
     }
-    // Draft/preview mode is per-request — let the origin handle it.
+    // Draft mode (next's COOKIE_NAME_PRERENDER_BYPASS) is per-request —
+    // let the origin handle it.
     if ((req.headers.get("cookie") || "").includes("__prerender_bypass")) {
       return fetch(req);
     }
 
-    const entry = await env.PPR.get(
-      `page:${url.hostname}:${url.pathname}`,
-      "json"
-    );
+    const route = url.pathname === "/" ? "/index" : url.pathname;
+    const shellUrl = new URL(`/_nbc/ppr-shell${route}`, url.origin);
+    const cacheKey = new Request(shellUrl.toString());
+    const cached = await caches.default.match(cacheKey);
+
+    if (!cached) {
+      // Cold PoP: this visitor takes the normal origin path (exactly the
+      // no-worker behavior); the shell warms in the background for the
+      // next one. Same-zone subrequests bypass this Worker — no
+      // recursion, no separate origin URL needed.
+      ctx.waitUntil(
+        (async () => {
+          const res = await fetch(shellUrl.toString(), {
+            headers: env.SHELL_TOKEN
+              ? { "x-nbc-shell-token": env.SHELL_TOKEN }
+              : {},
+          });
+          if (res.ok) await caches.default.put(cacheKey, res);
+        })()
+      );
+      return fetch(req);
+    }
+
+    let entry;
+    try {
+      entry = await cached.json();
+    } catch {
+      entry = null;
+    }
     if (!entry || !entry.shell || !entry.postponed) return fetch(req);
 
-    // Same-zone subrequests bypass this Worker and hit the origin
-    // directly — no recursion, no separate origin URL needed. (For a
-    // split setup, set an ORIGIN var and swap url.origin here.)
+    // The dynamic holes are per-user — the origin needs the original
+    // headers (cookies included) to render THIS visitor's content. They
+    // flow only worker → origin, the same path they already travel;
+    // nothing user-specific is ever cached.
     const resumeHeaders = new Headers(req.headers);
     resumeHeaders.set("next-resume", "1");
-    // Informational: lets origin logs correlate skew during the ~60s
-    // KV propagation window after a deploy.
-    if (entry.buildId) resumeHeaders.set("x-ppr-shell-build", entry.buildId);
-
     const resume = fetch(url.toString(), {
       method: "POST",
       headers: resumeHeaders,
@@ -76,11 +100,12 @@ export default {
           writer.releaseLock();
           const res = await resume;
           if (res.ok && res.body) {
-            // Holes stream in as the origin renders them.
             await res.body.pipeTo(writable);
           } else {
-            // Degraded: visitor keeps the shell's Suspense fallbacks.
-            // A stale postponed state racing a fresh origin lands here.
+            // Likely build skew: evict so the next request re-warms
+            // against the current build. This visitor keeps the shell's
+            // Suspense fallbacks — degraded, never mixed builds.
+            await caches.default.delete(cacheKey);
             await writable.close();
           }
         } catch {
