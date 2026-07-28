@@ -65,7 +65,21 @@ export default {
               ? { "x-nbc-shell-token": env.SHELL_TOKEN }
               : {},
           });
-          if (res.ok) await caches.default.put(cacheKey, res);
+          if (!res.ok) return;
+          // Re-wrap before caching: the origin marks token-mode
+          // responses private/no-store so the zone CDN can never serve
+          // them without the token — only this worker-private copy may
+          // hold them.
+          const body = await res.arrayBuffer();
+          await caches.default.put(
+            cacheKey,
+            new Response(body, {
+              headers: {
+                "content-type": "application/json",
+                "cache-control": "public, max-age=3600",
+              },
+            })
+          );
         })()
       );
       return fetch(req);
@@ -85,6 +99,11 @@ export default {
     // nothing user-specific is ever cached.
     const resumeHeaders = new Headers(req.headers);
     resumeHeaders.set("next-resume", "1");
+    // Without this, fetch() stamps string bodies text/plain — which Next
+    // 405s before its resume branch (as do octet-stream and friends).
+    // Urlencoded takes the no-JS form-post path, where next-resume is
+    // honored (verified against production Next 16.2.4).
+    resumeHeaders.set("content-type", "application/x-www-form-urlencoded");
     const resume = fetch(url.toString(), {
       method: "POST",
       headers: resumeHeaders,
@@ -99,6 +118,9 @@ export default {
           await writer.write(new TextEncoder().encode(entry.shell));
           writer.releaseLock();
           const res = await resume;
+          if (!res.ok) {
+            console.log(`resume failed ${url.pathname}: status=${res.status}`);
+          }
           if (res.ok && res.body) {
             await res.body.pipeTo(writable);
           } else {

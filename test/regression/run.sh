@@ -207,6 +207,10 @@ shutdown_server
 boot "$DEPLOY" NBC_RUNTIME_DIR="$RUNTIME" NBC_PPR_SHELL=sekret-token
 expect "shell endpoint token mode: 401 without header" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "401"
 expect "shell endpoint token mode: 200 with header" test "$(code_of -H 'x-nbc-shell-token: sekret-token' http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "200"
+# Token-mode responses must never be storable by a shared cache: a
+# zone-wide CDN cache rule would otherwise cache the tokened 200 and
+# serve it to anyone, defeating the token entirely (found in prod).
+expect_sh "shell endpoint token mode: private, no-store" "curl -s -D- -o /dev/null -H 'x-nbc-shell-token: sekret-token' http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr | grep -qi '^cache-control: private, no-store'"
 shutdown_server
 
 echo
