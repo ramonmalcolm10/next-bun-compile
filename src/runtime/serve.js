@@ -16,6 +16,7 @@
  *            process, one listener — Next never opens a socket.
  */
 const path = require("path");
+const fs = require("fs");
 const { Readable, Writable } = require("stream");
 
 /* ---------------------------------------------------------------- *
@@ -467,6 +468,97 @@ async function buildTier2Routes(staticPages, assetMap, bridge, deploymentId) {
 }
 
 /* ---------------------------------------------------------------- *
+ * Edge-shell endpoint (opt-in via NBC_PPR_SHELL)
+ *
+ * Serves each PPR route's build-frozen artifacts — shell HTML,
+ * postponedState, BUILD_ID — so an edge worker can cache the shell
+ * and drive the resume protocol with no build-time push pipeline.
+ * All three artifacts are computed at `next build` time, before any
+ * request exists: they cannot contain per-user data by construction.
+ *
+ * Like the tiers, everything is precomputed at boot from the
+ * extracted tree and served from memory as exact routes — request
+ * data never touches the filesystem, and unknown paths fall through
+ * to the normal 404 flow.
+ *
+ * NBC_PPR_SHELL="1"/"true" → open; any other value is a shared token
+ * that must arrive in the x-nbc-shell-token header (keeps auth-gated
+ * routes' skeletons from being publicly enumerable).
+ * ---------------------------------------------------------------- */
+const SHELL_PREFIX = "/_nbc/ppr-shell/";
+
+function buildShellRoutes(baseDir) {
+  const raw = process.env.NBC_PPR_SHELL;
+  if (!raw) return {};
+  const token = raw === "1" || raw === "true" ? null : raw;
+  const appDir = path.join(baseDir, ".next", "server", "app");
+  let buildId = "";
+  try {
+    buildId = fs
+      .readFileSync(path.join(baseDir, ".next", "BUILD_ID"), "utf-8")
+      .trim();
+  } catch {}
+  const routes = {};
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!e.name.endsWith(".meta")) continue;
+      let meta;
+      try {
+        meta = JSON.parse(fs.readFileSync(full, "utf-8"));
+      } catch {
+        continue;
+      }
+      const postponed = meta && meta.postponed;
+      // Only PPR pairs qualify; fully static/dynamic routes have none.
+      if (!postponed || typeof postponed !== "string") continue;
+      let shell;
+      try {
+        shell = fs.readFileSync(full.slice(0, -".meta".length) + ".html", "utf-8");
+      } catch {
+        continue;
+      }
+      const rel = path
+        .relative(appDir, full)
+        .slice(0, -".meta".length)
+        .split(path.sep)
+        .join("/");
+      const payload = JSON.stringify({ shell, postponed, buildId });
+      const headers = {
+        "Content-Type": "application/json",
+        // Build-time content: edge caches may hold it; a zone purge on
+        // deploy (or this max-age) refreshes it.
+        "Cache-Control": "public, max-age=3600",
+      };
+      routes[SHELL_PREFIX + rel] = token
+        ? (req) =>
+            req.headers.get("x-nbc-shell-token") === token
+              ? new Response(payload, { headers })
+              : new Response(null, { status: 401 })
+        : new Response(payload, { headers });
+    }
+  };
+  walk(appDir);
+  const count = Object.keys(routes).length;
+  if (count > 0) {
+    console.log(
+      `next-bun-compile: PPR shell endpoint serving ${count} route(s) from memory`
+    );
+  }
+  return routes;
+}
+
+/* ---------------------------------------------------------------- *
  * start()
  * ---------------------------------------------------------------- */
 
@@ -621,7 +713,11 @@ async function start(opts) {
     ),
   ]);
 
-  const routes = { ...tier1Routes, ...tier2Routes };
+  const routes = {
+    ...tier1Routes,
+    ...tier2Routes,
+    ...buildShellRoutes(baseDir),
+  };
   const tier2Paths = new Set(Object.keys(tier2Routes));
 
   // Bun's idleTimeout is in seconds, capped at 255. Default to the max —
@@ -665,10 +761,23 @@ async function start(opts) {
     );
     return true;
   };
+  // A revalidated PPR page regenerates its shell + postponed pair on
+  // disk; a boot-frozen endpoint entry must not outlive its pair, or an
+  // edge worker would resume a new origin with an old postponed state.
+  const dropShell = (p) => {
+    const key = SHELL_PREFIX + (p === "/" ? "index" : p.replace(/^\/+/, ""));
+    if (!(key in routes)) return false;
+    delete routes[key];
+    console.log(
+      `next-bun-compile: ${p} revalidated — shell endpoint entry dropped`
+    );
+    return true;
+  };
   const onInvalidate = (tags, pathnameKey) => {
     let dropped = false;
     if (typeof pathnameKey === "string") {
       dropped = dropPage(pathnameKey) || dropped;
+      dropped = dropShell(pathnameKey) || dropped;
       l1DropPath(pathnameKey); // regeneration → refresh on next request
     }
     for (const tag of Array.isArray(tags) ? tags : tags ? [tags] : []) {
@@ -679,7 +788,9 @@ async function start(opts) {
       for (const p of tagIndex.get(tag) ?? []) dropped = dropPage(p) || dropped;
       if (tag.startsWith("_N_T_")) {
         const p = tag.slice("_N_T_".length);
-        dropped = dropPage(p === "/index" ? "/" : p) || dropped;
+        const norm = p === "/index" ? "/" : p;
+        dropped = dropPage(norm) || dropped;
+        dropped = dropShell(norm) || dropped;
       }
     }
     if (dropped) server.reload(serveOptions());
@@ -711,7 +822,11 @@ async function start(opts) {
       err && err.message
     );
     l1Enabled = false;
-    if (tier2Paths.size > 0) {
+    const shellKeys = Object.keys(routes).filter((k) =>
+      k.startsWith(SHELL_PREFIX)
+    );
+    for (const k of shellKeys) delete routes[k];
+    if (tier2Paths.size > 0 || shellKeys.length > 0) {
       for (const p of Array.from(tier2Paths)) {
         tier2Paths.delete(p);
         delete routes[p];
