@@ -1,0 +1,148 @@
+---
+title: Edge PPR
+description: Serve PPR static shells from your CDN's edge while the compiled binary renders only the dynamic holes — no KV, no push pipeline, no per-release steps.
+---
+
+Partial Prerendering splits a page into a build-frozen static shell and
+per-request dynamic holes. Compiled binaries handle PPR **origin-only out
+of the box**: the shell flushes immediately (TTFB never waits on data)
+and the holes stream into the same response. Nothing on this page is
+required for PPR to work.
+
+What this guide adds is the CDN half of Next's
+[PPR platform protocol](https://nextjs.org/docs/app/guides/ppr-platform-guide):
+serving the shell from the edge (~10–30ms first paint, asset preloads
+starting immediately) while your origin renders only the holes. In a
+real deployment this took a warm dashboard hard-load from ~350ms of
+blank tab to a 23ms first byte.
+
+**Do you need this?** Only for routes that mix a static frame with
+per-request content *and* whose first paint matters. Fully static pages
+get the same edge TTFB from a plain CDN cache rule with zero moving
+parts. The holes render at origin speed either way.
+
+## How it fits together
+
+1. **The resume protocol (built in, always on).** A `POST` to a PPR
+   route with the `next-resume: 1` header and the route's
+   `postponedState` as the body renders only the deferred holes. The
+   regression suite pins this.
+2. **The shell endpoint (opt-in, `NBC_PPR_SHELL`).** The binary serves
+   each PPR route's build-frozen artifacts:
+
+   ```
+   GET /_nbc/ppr-shell/<route>  →  { shell, postponed, buildId }
+   ```
+
+   Pairs are discovered at boot from the extracted tree and served from
+   memory as exact routes — request data never touches the filesystem.
+   All three artifacts are computed at `next build` time, before any
+   request exists, so they cannot contain per-user data.
+3. **An edge worker (yours, ~100 lines).** Caches the shell, streams it
+   instantly, resumes the holes from your origin, stitches one
+   response. A complete self-populating Cloudflare implementation ships
+   in
+   [`examples/cloudflare-ppr-worker`](https://github.com/ramonmalcolm10/next-bun-compile/tree/main/examples/cloudflare-ppr-worker).
+
+## Enabling the endpoint
+
+```bash
+NBC_PPR_SHELL=1 ./server            # open mode
+NBC_PPR_SHELL=some-shared-token ./server   # token mode
+```
+
+- **Open mode** responses are `Cache-Control: public, max-age=3600` —
+  build-time content that shared caches may hold.
+- **Token mode** requires the value in an `x-nbc-shell-token` header
+  (401 otherwise) and responds `private, no-store`. Use token mode for
+  auth-gated routes so their skeletons aren't publicly enumerable —
+  and note the header is load-bearing: behind a zone-wide "cache
+  everything" CDN rule, a publicly-cacheable tokened response would be
+  cached once and served to anyone, silently defeating the token.
+- Routes without a PPR pair (fully static, or fully dynamic) return
+  404. Unset the variable and the endpoint doesn't exist.
+
+## The Cloudflare worker
+
+The example worker needs **no KV, no build-time push pipeline, and no
+CI changes**:
+
+- **Cache miss** → the visitor passes through to the origin unchanged
+  (exactly the no-worker behavior) while the shell warms into
+  `caches.default` in the background. No request is ever slower than
+  having no worker.
+- **Cache hit** → the shell streams from the edge; in parallel a
+  resume `POST` renders the holes at the origin and pipes onto the
+  same response.
+- **Resume failure** (origin down, build skew) → the cached shell is
+  evicted and that visitor keeps the shell's Suspense fallbacks —
+  degraded, never mixed builds.
+
+Deploy once, ever:
+
+```bash
+cd examples/cloudflare-ppr-worker
+# set your route pattern(s) in wrangler.toml
+wrangler secret put SHELL_TOKEN     # token mode only
+wrangler deploy
+```
+
+One deployment serves every app in your account — the shell cache key
+derives from each request's hostname, so apps never mix. Attach route
+patterns narrowly (only PPR paths): everything else should never invoke
+the worker.
+
+### Staleness
+
+- **Deploys:** a purge-on-deploy job (zone `purge_everything`) clears
+  cached shells with everything else; the endpoint's `max-age` is the
+  backstop.
+- **Runtime revalidation:** when a PPR route revalidates, the binary
+  drops its endpoint entry (a frozen shell must never outlive its
+  postponed pair). The worker's cached copy then fails its next
+  resume, self-evicts, and re-warms.
+
+## Hard-won details
+
+The example worker already handles these; they're documented so you
+don't rediscover them in an integration of your own:
+
+- **The resume POST must not be `text/plain`** (or
+  `application/octet-stream`). Workers' `fetch()` stamps string bodies
+  `text/plain`, and Next rejects that with 405 *before* its resume
+  branch — the symptom is an intermittent stuck-on-fallbacks page as
+  the worker's cache self-evicts and re-warms. The example sends
+  `application/x-www-form-urlencoded`, the no-JS form-post path where
+  `next-resume` is honored.
+- **Forward the original request headers on the resume POST** — the
+  holes are per-user and the origin needs cookies to render them. They
+  flow only worker → origin (the path they already travel); nothing
+  user-specific is ever cached, and the combined response is
+  `private, no-store`.
+- **Only document GETs take the shell path.** RSC/prefetch requests,
+  draft mode, POSTs, and non-HTML `Accept` headers pass through — the
+  client router's own requests never hit the worker's logic.
+- **Auth-gated routes change redirect UX.** The worker serves the
+  (public, build-time) shell before your auth can 302, so logged-out
+  visitors get the shell and are redirected client-side after
+  hydration instead of instantly. Decide per route whether that's
+  acceptable.
+- **Edge shells only apply to document loads** — first visits,
+  reloads, direct links. Client-side navigations fetch RSC payloads
+  and never make document requests.
+
+## Verifying
+
+```bash
+# token gate
+curl -s -o /dev/null -w '%{http_code}\n' https://your-app.com/_nbc/ppr-shell/route   # 401
+# warm document: edge shell + streamed holes
+curl -s -D- -o /dev/null -H 'Accept: text/html' https://your-app.com/route \
+  | grep x-ppr-shell-build
+```
+
+In the browser: hard-reload the route twice with DevTools open. The
+warm load's document shows `x-ppr-shell-build`, first byte in tens of
+milliseconds, and the full response streaming in behind it. For live
+worker telemetry, `wrangler tail` — the example logs only failed
+resumes.

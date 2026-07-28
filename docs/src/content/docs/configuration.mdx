@@ -11,6 +11,7 @@ description: Environment variables and Next.js config options that affect next-b
 | `HOSTNAME`                 | `0.0.0.0`            | Server hostname                                                   |
 | `KEEP_ALIVE_TIMEOUT`       | —                    | HTTP keep-alive timeout (ms)                                      |
 | `NBC_RUNTIME_DIR`          | binary's directory   | Where runtime files extract and `.next/cache` lives. Point at tmpfs (e.g. `/tmp/app`) for RAM-backed runtime files and read-only root filesystems. |
+| `NBC_PPR_SHELL`            | off                  | Enables the edge-shell endpoint for PPR routes. `1`/`true` serves openly; any other value is a shared token required in `x-nbc-shell-token`. See [Edge PPR](/next-bun-compile/guides/edge-ppr/). |
 | `NEXT_BUN_COMPILE_DEBUG`   | `0`                  | Set to `1` to log every resolver-hook decision. See [Debug mode](/next-bun-compile/guides/debug-mode/). |
 
 ## Environment variables (build time)
