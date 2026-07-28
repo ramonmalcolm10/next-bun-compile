@@ -1,0 +1,16 @@
+name = "ppr-shell-worker"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# One namespace serves every app; keys are prefixed with the hostname.
+# Create it once:  wrangler kv namespace create PPR
+kv_namespaces = [
+  { binding = "PPR", id = "<your-kv-namespace-id>" }
+]
+
+# Attach only the paths that are actually PPR — everything else should
+# never invoke the Worker (keeps it off your cache-rule fast path and
+# out of your request quota). Add one line per app/route family.
+routes = [
+  { pattern = "example.com/dashboard*", zone_name = "example.com" },
+]
