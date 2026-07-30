@@ -213,6 +213,27 @@ expect "shell endpoint token mode: 200 with header" test "$(code_of -H 'x-nbc-sh
 expect_sh "shell endpoint token mode: private, no-store" "curl -s -D- -o /dev/null -H 'x-nbc-shell-token: sekret-token' http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr | grep -qi '^cache-control: private, no-store'"
 shutdown_server
 
+echo "== extract mode (bake the tree at image build) =="
+# `server --extract` materializes the runtime tree and exits without
+# serving. Run it in a Dockerfile RUN step so pod boot hits the manifest
+# fast path — the CPU-throttled extraction phase disappears from startup.
+EXTRACT_RT="$WORK/extract-runtime"
+( cd "$DEPLOY"; exec env NBC_RUNTIME_DIR="$EXTRACT_RT" PORT=$PORT ./server --extract >"$WORK/extract.log" 2>&1 ) &
+EX_PID=$!
+EX_CODE=124
+for _ in $(seq 1 60); do
+  if ! kill -0 "$EX_PID" 2>/dev/null; then wait "$EX_PID"; EX_CODE=$?; break; fi
+  sleep 0.5
+done
+kill -9 "$EX_PID" 2>/dev/null || true
+expect "--extract exits 0 instead of serving" test "$EX_CODE" = "0"
+expect_sh "--extract never starts the server" "! grep -q 'Next.js' '$WORK/extract.log'"
+expect "--extract writes the extraction manifest" test -f "$EXTRACT_RT/.next/.nbc-extracted"
+boot "$DEPLOY" NBC_RUNTIME_DIR="$EXTRACT_RT"
+expect_sh "boot after --extract skips extraction (manifest fast path)" "! grep -q 'Extracted' '$SERVER_LOG'"
+expect "serves normally from the pre-extracted tree" test "$(code_of http://127.0.0.1:$PORT/ppr)" = "200"
+shutdown_server
+
 echo
 echo "== result: $PASS passed, $FAIL failed =="
 [ "$FAIL" = "0" ]

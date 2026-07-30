@@ -1432,6 +1432,17 @@ async function extractAssets() {
 const __NBC_TIER1 = ${JSON.stringify(tier1)};
 const __NBC_STATIC_PAGES = ${JSON.stringify(staticPages)};
 
+// Image-build hook: \`server --extract\` materializes the runtime tree and
+// exits. A later boot with the same NBC_RUNTIME_DIR hits the manifest
+// fast path above — startup drops from a full (possibly CPU-throttled)
+// extraction to a single file read. Run it as a Dockerfile step, e.g.:
+//   RUN ["/app/server", "--extract"]   (exec form works in distroless)
+if (process.argv.includes("--extract")) {
+  extractAssets()
+    .then(() => process.exit(0))
+    .catch((err) => { console.error(err); process.exit(1); });
+} else {
+
 extractAssets().then(() => {
   const { start } = require("./nbc-serve.js");
   return start({
@@ -1450,6 +1461,8 @@ extractAssets().then(() => {
     enableL1: ${JSON.stringify(!hasCustomCacheHandler)},
   });
 }).catch((err) => { console.error(err); process.exit(1); });
+
+}
 `;
 
   writeFileSync(join(serverDir, "server-entry.js"), serverEntry);

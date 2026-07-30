@@ -66,6 +66,51 @@ volumes:
     emptyDir: { medium: Memory }
 ```
 
+## Pre-extract at image build (`--extract`)
+
+On first boot the binary extracts its runtime tree (server chunks,
+`node_modules`, manifests) to `NBC_RUNTIME_DIR`. On generous hardware
+that's a couple of seconds — but under a Kubernetes CPU limit it can
+stretch to 30s+ and trip liveness probes into killing the container
+mid-boot.
+
+`server --extract` runs that extraction and exits. Do it once at image
+build time, and every container boot skips straight past extraction
+(one manifest-file read) to serving:
+
+```dockerfile
+FROM gcr.io/distroless/base-debian12:nonroot AS runner
+WORKDIR /app
+ENV NBC_RUNTIME_DIR=/runtime
+COPY --from=builder --chown=nonroot:nonroot /app/server ./
+# Bake the extracted tree into an image layer. Exec form — no shell
+# needed, works in distroless.
+RUN ["/app/server", "--extract"]
+CMD ["./server"]
+```
+
+Two things to keep consistent:
+
+- **Same `NBC_RUNTIME_DIR` at build and boot.** The extraction manifest
+  stamps the directory it extracted into; a different path at runtime
+  means a full re-extraction (correct, just slow again).
+- **Don't mount a volume over the whole runtime dir** — that would
+  shadow the baked layer. Mount writable storage only where writes
+  happen, `$NBC_RUNTIME_DIR/.next/cache` (ISR/revalidation):
+
+```yaml
+# k8s: tree stays a read-only image layer; only the cache is writable
+volumes:
+  - name: next-cache
+    emptyDir: { sizeLimit: 512Mi }
+volumeMounts:
+  - name: next-cache
+    mountPath: /runtime/.next/cache
+```
+
+The binary stays self-sufficient: if the tree is missing or stale it
+re-extracts on boot as usual — pre-extraction is purely a fast path.
+
 ## Multi-arch builds in CI
 
 GitHub Actions example for building both amd64 and arm64:
