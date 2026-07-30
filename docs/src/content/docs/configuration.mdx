@@ -14,6 +14,11 @@ description: Environment variables and Next.js config options that affect next-b
 | `NBC_PPR_SHELL`            | off                  | Enables the edge-shell endpoint for PPR routes. `1`/`true` serves openly; any other value is a shared token required in `x-nbc-shell-token`. See [Edge PPR](/next-bun-compile/guides/edge-ppr/). |
 | `NEXT_BUN_COMPILE_DEBUG`   | `0`                  | Set to `1` to log every resolver-hook decision. See [Debug mode](/next-bun-compile/guides/debug-mode/). |
 
+The binary also accepts one flag: `server --extract` extracts the
+runtime tree to `NBC_RUNTIME_DIR` and exits — run it at image build
+time so container boots skip extraction. See
+[Pre-extract at image build](/next-bun-compile/guides/docker/#pre-extract-at-image-build---extract).
+
 ## Environment variables (build time)
 
 | Variable                   | Default        | Description                                                       |

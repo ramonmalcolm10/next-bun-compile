@@ -145,6 +145,13 @@ export default {
         // The combined stream contains per-request content — neither
         // the edge cache nor the browser may store it.
         "cache-control": "private, no-store",
+        // Worker-served documents never transit the origin/gateway, so
+        // its security headers must be mirrored here. Keep in sync with
+        // the gateway's ResponseHeaderModifier set.
+        "strict-transport-security": "max-age=31536000",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+        "referrer-policy": "same-origin",
         ...(entry.buildId && { "x-ppr-shell-build": entry.buildId }),
       },
     });
