@@ -1020,10 +1020,11 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // point at.
   const standaloneNextDir = join(serverDir, ".next");
 
-  // The runtime observes revalidations by patching the default filesystem
-  // cache handler in-process. With a custom cacheHandler configured those
-  // events never reach it, so frozen pages could go stale — keep them
-  // with Next instead.
+  // The runtime's invalidation hook is in-process. A custom cacheHandler
+  // is typically a shared store (Redis) where an invalidation issued on
+  // one pod must take effect on all — frozen in-memory copies on other
+  // pods would never hear about it. Keep prerendered pages with Next,
+  // which reads through the handler and honors shared invalidation.
   const hasCustomCacheHandler = customCacheHandler;
   if (staticPages.length > 0 && hasCustomCacheHandler) {
     console.log(

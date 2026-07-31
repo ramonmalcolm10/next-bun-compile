@@ -88,10 +88,16 @@ for when you need this.
 ## Custom cache handlers
 
 If you configure a custom `cacheHandler`, the in-memory page tiers
-turn themselves off automatically (revalidation events flow through
-your handler, which the memory tiers can't observe) — every page
-request goes through Next exactly as it would under `next start`.
-Static assets are still served from memory.
+turn themselves off automatically — every page request goes through
+Next exactly as it would under `next start`. Static assets are still
+served from memory.
+
+The reason is multi-instance semantics, not observability: a custom
+handler is typically a shared store (Redis), where an invalidation
+issued on one instance is expected to take effect on all of them.
+Next honors that by reading through your handler on every request;
+a frozen in-memory copy on another instance would never hear about
+the invalidation.
 
 ## Where the binary appears
 

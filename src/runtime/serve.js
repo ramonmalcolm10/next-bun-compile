@@ -608,6 +608,12 @@ async function start(opts) {
           keepAliveTimeout,
           onDevServerCleanup: undefined,
         });
+        // Must run before the first request is handled (invalidations can
+        // only originate from Next code paths, so none can flow earlier),
+        // and can't run before initialize(): the wrapper module's import
+        // chain touches AsyncLocalStorage at load time and throws until
+        // Next has set up its server environment.
+        installInvalidationHook();
         return requestHandler;
       })();
     }
@@ -746,11 +752,13 @@ async function start(opts) {
 
   const server = Bun.serve(serveOptions());
 
-  // Invalidation: patch the default filesystem cache handler in-process —
-  // every revalidateTag/revalidatePath and fresh cache write flows through
-  // it. A Tier-2 page whose build-time tag set matches gets dropped from
-  // the route table so the next request re-renders through Next. The
-  // config is untouched, so Next's in-memory LRU stays enabled.
+  // Invalidation: patch the IncrementalCache wrapper in-process — every
+  // revalidateTag/revalidatePath and fresh cache write flows through it
+  // before it delegates to whichever handler is configured (the default
+  // filesystem one or a custom `cacheHandler`), so the observation is
+  // handler-agnostic. A Tier-2 page whose build-time tag set matches gets
+  // dropped from the route table so the next request re-renders through
+  // Next. The config is untouched, so Next's in-memory LRU stays enabled.
   const tagIndex = new Map(); // tag → Set<pathname>
   for (const spec of staticPages) {
     for (const tag of spec.tags || []) {
@@ -801,45 +809,49 @@ async function start(opts) {
     }
     if (dropped) server.reload(serveOptions());
   };
-  try {
-    const mod = nextModule(
-      "dist/server/lib/incremental-cache/file-system-cache.js"
-    );
-    const FsCache = mod.default || mod;
-    const origRevalidateTag = FsCache.prototype.revalidateTag;
-    FsCache.prototype.revalidateTag = function (...args) {
-      try {
-        onInvalidate(args[0], null);
-      } catch {}
-      return origRevalidateTag.apply(this, args);
-    };
-    const origSet = FsCache.prototype.set;
-    FsCache.prototype.set = function (key, ...rest) {
-      try {
-        onInvalidate(null, key);
-      } catch {}
-      return origSet.apply(this, [key, ...rest]);
-    };
-  } catch (err) {
-    // Fail safe: without revalidation events the memory tiers could go
-    // stale — hand everything back to Next.
-    console.warn(
-      "next-bun-compile: cache handler patch failed, memory page tiers disabled:",
-      err && err.message
-    );
-    l1Enabled = false;
-    const shellKeys = Object.keys(routes).filter((k) =>
-      k.startsWith(SHELL_PREFIX)
-    );
-    for (const k of shellKeys) delete routes[k];
-    if (tier2Paths.size > 0 || shellKeys.length > 0) {
-      for (const p of Array.from(tier2Paths)) {
-        tier2Paths.delete(p);
-        delete routes[p];
+  const installInvalidationHook = () => {
+    try {
+      const mod = nextModule("dist/server/lib/incremental-cache/index.js");
+      const IncCache = mod.IncrementalCache;
+      // The wrapper's set() sees the pathname before normalizePagePath
+      // (the concrete handler sees it after) — "/" not "/index"; spec
+      // paths and the _N_T_ branch already use the "/" form.
+      const normKey = (k) => (k === "/index" ? "/" : k);
+      const origRevalidateTag = IncCache.prototype.revalidateTag;
+      IncCache.prototype.revalidateTag = function (...args) {
+        try {
+          onInvalidate(args[0], null);
+        } catch {}
+        return origRevalidateTag.apply(this, args);
+      };
+      const origSet = IncCache.prototype.set;
+      IncCache.prototype.set = function (key, ...rest) {
+        try {
+          onInvalidate(null, typeof key === "string" ? normKey(key) : key);
+        } catch {}
+        return origSet.apply(this, [key, ...rest]);
+      };
+    } catch (err) {
+      // Fail safe: without revalidation events the memory tiers could go
+      // stale — hand everything back to Next.
+      console.warn(
+        "next-bun-compile: cache handler patch failed, memory page tiers disabled:",
+        err && err.message
+      );
+      l1Enabled = false;
+      const shellKeys = Object.keys(routes).filter((k) =>
+        k.startsWith(SHELL_PREFIX)
+      );
+      for (const k of shellKeys) delete routes[k];
+      if (tier2Paths.size > 0 || shellKeys.length > 0) {
+        for (const p of Array.from(tier2Paths)) {
+          tier2Paths.delete(p);
+          delete routes[p];
+        }
+        server.reload(serveOptions());
       }
-      server.reload(serveOptions());
     }
-  }
+  };
 
   const shutdown = async () => {
     try {

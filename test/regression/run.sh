@@ -234,6 +234,64 @@ expect_sh "boot after --extract skips extraction (manifest fast path)" "! grep -
 expect "serves normally from the pre-extracted tree" test "$(code_of http://127.0.0.1:$PORT/ppr)" = "200"
 shutdown_server
 
+echo "== invalidation observation (tier drop end-to-end) =="
+# The runtime observes invalidations by patching the IncrementalCache
+# wrapper — the layer that delegates to whichever cache handler is
+# configured. revalidatePath("/") must drop the frozen route for "/"
+# (the drop log line is the proof the hook fired) and the page must
+# keep serving through Next afterwards. Only revalidate:false pages are
+# frozen, so this is the one invalidation path the tiers depend on.
+cd "$APP"
+boot "$APP"
+expect_sh "frozen page served from memory before invalidation" "grep -q '2 prerendered pages served from memory' '$SERVER_LOG'"
+curl -s -X POST http://127.0.0.1:$PORT/api/revalidate-path >/dev/null
+sleep 1
+expect_sh "revalidatePath drops the frozen page (hook fired)" "grep -q '/ revalidated — serving via Next from now on' '$SERVER_LOG'"
+expect "dropped page keeps serving through Next" test "$(code_of http://127.0.0.1:$PORT/)" = "200"
+shutdown_server
+
+echo "== custom cacheHandler (singular): failsafe engages =="
+# With a custom cacheHandler the frozen tiers are disabled at build:
+# in-process observation can't see invalidations issued on OTHER pods
+# when the handler is a shared store (Redis), so frozen copies could
+# serve stale cross-pod. Pages stay with Next, which reads through the
+# handler and honors shared invalidation.
+cat > cache-handler.mjs <<'EOF'
+// Minimal in-memory singular cacheHandler — the same contract a Redis
+// handler implements. The constructor log proves Next instantiated it.
+export default class TestCacheHandler {
+  constructor() {
+    console.log("nbc-test: custom cache handler loaded");
+    this.store = new Map();
+  }
+  async get(key) {
+    return this.store.get(key) ?? null;
+  }
+  async set(key, data) {
+    this.store.set(key, { value: data, lastModified: Date.now() });
+  }
+  async revalidateTag() {}
+  resetRequestCache() {}
+}
+EOF
+python3 - <<'EOF'
+config = open('next.config.ts').read()
+config = config.replace('cacheComponents: true,',
+  'cacheComponents: true,\n  cacheHandler: process.cwd() + "/cache-handler.mjs",')
+open('next.config.ts','w').write(config)
+EOF
+rmrf_retry .next server
+bunx next build >"$WORK/build3.log" 2>&1 || { tail -10 "$WORK/build3.log"; exit 1; }
+expect "build announces the tier-off failsafe" grep -q "custom cacheHandler detected" "$WORK/build3.log"
+boot "$APP"
+expect_sh "no frozen pages at runtime (failsafe active)" "grep -q '0 prerendered pages served from memory' '$SERVER_LOG'"
+C1=$(curl -s http://127.0.0.1:$PORT/cached | grep -o 'stamp: <!-- -->[0-9]*')
+curl -s -X POST http://127.0.0.1:$PORT/api/revalidate >/dev/null
+sleep 1
+expect_sh "custom handler instantiated by Next" "grep -q 'nbc-test: custom cache handler loaded' '$SERVER_LOG'"
+expect_sh "pages serve and revalidate through the custom handler" "test -n '$C1' && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/cached) = 200"
+shutdown_server
+
 echo
 echo "== result: $PASS passed, $FAIL failed =="
 [ "$FAIL" = "0" ]
