@@ -41,10 +41,11 @@ fastest tier that can answer them correctly:
   exact stack `next start` runs, minus its HTTP listener. ISR and
   cache-component responses additionally get an in-memory L1 cache.
 
-**Revalidation stays Next's job.** The runtime patches the default
-filesystem cache handler so every `revalidateTag`/`revalidatePath`
+**Revalidation stays Next's job.** The runtime patches Next's
+incremental-cache wrapper — the layer that delegates to whichever
+cache handler is configured — so every `revalidateTag`/`revalidatePath`
 and background regeneration drops the affected page from the memory
-tiers — semantics are identical to `next start`, just faster between
+tiers. Semantics are identical to `next start`, just faster between
 changes. With a custom `cacheHandler` configured, the page tiers turn
 themselves off entirely.
 
