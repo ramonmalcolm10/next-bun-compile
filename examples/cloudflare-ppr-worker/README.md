@@ -39,10 +39,19 @@ infrastructure you already run (see below).
 
 | Situation | What happens |
 |---|---|
-| Cold PoP (first request in a region / after a purge) | Pass through to origin — exactly the no-worker behavior — while the shell warms in the background |
+| Cold PoP (first request in a region / after a purge) | Pass through to origin (zone cache bypassed — see below) while the shell warms in the background |
 | Warm PoP | Shell streams from the edge (~10ms first paint, `<head>` asset preloads start immediately); a parallel `next-resume` POST renders only the per-user holes at the origin and streams them onto the same response |
-| RSC / prefetch / draft-mode / non-GET / non-HTML | Pass through untouched |
+| RSC / prefetch / draft-mode / non-GET / non-HTML | Pass through, zone cache bypassed |
 | Resume fails (origin down, build skew) | Cached shell is evicted; this visitor keeps the shell's Suspense fallbacks — degraded, never mixed builds |
+
+Every pass-through uses `fetch(req, { cache: "no-store" })`, and the
+bypass is load-bearing: a Worker subrequest transits Cloudflare's zone
+cache, which keys on URL alone and ignores `Vary` — and Next serves a
+PPR route's segment-prefetch payloads with `s-maxage=31536000` at the
+**same URL** as its document. Without the bypass, one passed-through
+prefetch caches flight data under the document's URL, and every
+document load on that route returns raw RSC to the browser until the
+zone is purged.
 
 ## Staleness
 

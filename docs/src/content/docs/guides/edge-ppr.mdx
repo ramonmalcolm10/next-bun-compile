@@ -67,10 +67,9 @@ NBC_PPR_SHELL=some-shared-token ./server   # token mode
 The example worker needs **no KV, no build-time push pipeline, and no
 CI changes**:
 
-- **Cache miss** → the visitor passes through to the origin unchanged
-  (exactly the no-worker behavior) while the shell warms into
-  `caches.default` in the background. No request is ever slower than
-  having no worker.
+- **Cache miss** → the visitor passes through to the origin while the
+  shell warms into `caches.default` in the background. No request is
+  ever slower than having no worker.
 - **Cache hit** → the shell streams from the edge; in parallel a
   resume `POST` renders the holes at the origin and pipes onto the
   same response.
@@ -107,7 +106,17 @@ the worker.
 The example worker already handles these; they're documented so you
 don't rediscover them in an integration of your own:
 
-- **The resume POST must not be `text/plain`** (or
+- **Every pass-through must bypass the zone cache**
+  (`fetch(req, { cache: "no-store" })`). A worker subrequest is *not*
+  automatically the no-worker behavior: it transits Cloudflare's cache,
+  which keys on URL alone and ignores `Vary` — and Next serves a PPR
+  route's segment-prefetch payloads with `s-maxage=31536000` at the
+  same URL as its document. Without the bypass, one passed-through
+  prefetch caches flight data under the document's URL and every
+  document load on that route returns raw RSC until the zone is
+  purged. The symptom is a page rendering as `text/x-component`
+  protocol text right after a deploy (the purge empties the cache and
+  the refill race begins). (or
   `application/octet-stream`). Workers' `fetch()` stamps string bodies
   `text/plain`, and Next rejects that with 405 *before* its resume
   branch — the symptom is an intermittent stuck-on-fallbacks page as
