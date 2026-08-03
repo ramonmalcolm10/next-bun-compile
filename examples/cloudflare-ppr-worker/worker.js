@@ -29,7 +29,15 @@
 
 export default {
   async fetch(req, env, ctx) {
-    if (req.method !== "GET") return fetch(req);
+    // Pass-through is NOT the no-worker behavior by default: a Worker
+    // subrequest transits the zone cache, which keys on URL alone and
+    // ignores Vary — and Next serves segment-prefetch flight payloads
+    // with s-maxage=31536000 at the same URL as the document. Let one
+    // into the cache and every document load on the route returns raw
+    // flight data until the zone is purged. no-store skips the zone
+    // cache in both directions.
+    const passThrough = () => fetch(req, { cache: "no-store" });
+    if (req.method !== "GET") return passThrough();
 
     const url = new URL(req.url);
     // Documents only: RSC/flight requests carry per-request negotiation
@@ -37,15 +45,16 @@ export default {
     if (
       req.headers.has("rsc") ||
       req.headers.has("next-router-prefetch") ||
+      req.headers.has("next-router-segment-prefetch") ||
       url.searchParams.has("_rsc") ||
       !(req.headers.get("accept") || "").includes("text/html")
     ) {
-      return fetch(req);
+      return passThrough();
     }
     // Draft mode (next's COOKIE_NAME_PRERENDER_BYPASS) is per-request —
     // let the origin handle it.
     if ((req.headers.get("cookie") || "").includes("__prerender_bypass")) {
-      return fetch(req);
+      return passThrough();
     }
 
     const route = url.pathname === "/" ? "/index" : url.pathname;
@@ -54,10 +63,9 @@ export default {
     const cached = await caches.default.match(cacheKey);
 
     if (!cached) {
-      // Cold PoP: this visitor takes the normal origin path (exactly the
-      // no-worker behavior); the shell warms in the background for the
-      // next one. Same-zone subrequests bypass this Worker — no
-      // recursion, no separate origin URL needed.
+      // Cold PoP: this visitor takes the origin path; the shell warms in
+      // the background for the next one. Same-zone subrequests bypass
+      // this Worker — no recursion, no separate origin URL needed.
       ctx.waitUntil(
         (async () => {
           const res = await fetch(shellUrl.toString(), {
@@ -82,7 +90,7 @@ export default {
           );
         })()
       );
-      return fetch(req);
+      return passThrough();
     }
 
     let entry;
@@ -91,7 +99,7 @@ export default {
     } catch {
       entry = null;
     }
-    if (!entry || !entry.shell || !entry.postponed) return fetch(req);
+    if (!entry || !entry.shell || !entry.postponed) return passThrough();
 
     // The dynamic holes are per-user — the origin needs the original
     // headers (cookies included) to render THIS visitor's content. They
