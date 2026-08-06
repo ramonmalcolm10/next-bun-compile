@@ -487,6 +487,159 @@ async function buildTier2Routes(staticPages, assetMap, bridge, deploymentId) {
  * ---------------------------------------------------------------- */
 const SHELL_PREFIX = "/_nbc/ppr-shell/";
 
+// Captured from the patched IncrementalCache prototype. A regenerated
+// pair lands wherever the configured handler puts it: on disk for the
+// default one, in a shared store for a custom one — where a regeneration
+// on any pod never touches this pod's disk, and a pod that only reads
+// never sees a set() either. Reading through the cache is the one source
+// that is correct for both, so the endpoint asks it first and falls back
+// to the prerender on disk.
+let incrementalCache = null;
+
+// Only PPR pairs qualify; fully static/dynamic routes have none.
+function readShellPair(metaPath, htmlPath) {
+  let meta;
+  try {
+    meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+  } catch {
+    return null;
+  }
+  const postponed = meta && meta.postponed;
+  if (!postponed || typeof postponed !== "string") return null;
+  let shell;
+  try {
+    shell = fs.readFileSync(htmlPath, "utf-8");
+  } catch {
+    return null;
+  }
+  // Next's own tag set for the route — both revalidateTag and
+  // revalidatePath land here (the latter as `_N_T_/<path>`). Passed
+  // through so a tag-aware CDN can index the shell and purge it by tag
+  // instead of waiting out its TTL.
+  const raw = (meta.headers && meta.headers["x-next-cache-tags"]) || "";
+  const tags = raw
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  return { shell, postponed, tags };
+}
+
+function pairStamp(metaPath, htmlPath) {
+  try {
+    return `${fs.statSync(metaPath).mtimeMs}:${fs.statSync(htmlPath).mtimeMs}`;
+  } catch {
+    return "";
+  }
+}
+
+// A route's endpoint entry. The pair is held in memory and re-read only
+// when the prerender is rewritten on disk — an ISR expiry, or a `use
+// cache` region inside the shell whose tag was revalidated — so the edge
+// serves the same shell the origin would. A shell that never regenerates
+// (a static frame around dynamic holes) keeps its build-frozen pair for
+// the life of the process: the postponed state is code-shaped, and only a
+// new build changes it, which is a new process that re-reads at boot.
+// Nothing but a per-PoP cache miss reaches this handler, so the stat is
+// never on a hot path, and an unreadable pair keeps the last good copy
+// rather than darkening a working shell.
+// The route's current pair as the cache handler holds it. Returns null
+// when Next hasn't booted, the handler has no entry yet (it fills on
+// demand, so the build output is still the truth), or the read fails.
+async function shellPairFromCache(route, fallbackTags) {
+  const cache = incrementalCache;
+  if (!cache) return null;
+  try {
+    const res = await cache.get(route, {
+      kind: "APP_PAGE",
+      isRoutePPREnabled: true,
+    });
+    const value = res && res.value;
+    if (!value || value.kind !== "APP_PAGE") return null;
+    const postponed = value.postponed;
+    if (typeof postponed !== "string" || !postponed) return null;
+    const shell =
+      typeof value.html === "string"
+        ? value.html
+        : value.html && typeof value.html.toString === "function"
+          ? value.html.toString("utf-8")
+          : null;
+    if (typeof shell !== "string" || !shell) return null;
+    const raw =
+      (value.headers && value.headers["x-next-cache-tags"]) || "";
+    const tags = raw
+      ? raw
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean)
+      : fallbackTags;
+    return { shell, postponed, tags };
+  } catch {
+    return null;
+  }
+}
+
+function shellRoute(metaPath, htmlPath, route, buildId, token, pair) {
+  let stamp = pairStamp(metaPath, htmlPath);
+  let payload = "";
+  let etag = "";
+  let headers = null;
+  // Bun's automatic ETag covers static `Response` routes only; this one
+  // must be a handler (token check, and the pair can change under it), so
+  // the tag is computed the same way tiers 1 and 2 do it.
+  const adopt = (p) => {
+    payload = JSON.stringify({ ...p, buildId });
+    etag = `"${Bun.hash(payload).toString(36)}"`;
+    headers = {
+      "Content-Type": "application/json",
+      // Open mode: prerendered content, shared caches may hold it (a zone
+      // purge on deploy or this max-age refreshes it). Token mode: must
+      // be unstorable by shared caches — a zone-wide CDN cache rule would
+      // otherwise cache the tokened 200 and serve it to anyone, defeating
+      // the token. The edge worker re-wraps the response for its own
+      // private cache.
+      "Cache-Control": token ? "private, no-store" : "public, max-age=3600",
+      // A CDN's copy outlives the regeneration that replaced it, so it
+      // needs to ask "is mine still current?" for the price of a 304
+      // rather than a full body on every check.
+      ETag: etag,
+      // Next's tag set for the route, so a tag-aware CDN (Fastly
+      // surrogate keys, Cloudflare Enterprise cache tags) can purge this
+      // shell on revalidation instead of waiting out its TTL.
+      ...(p.tags.length && { "Cache-Tag": p.tags.join(",") }),
+    };
+  };
+  adopt(pair);
+  const current = async () => {
+    const viaCache = await shellPairFromCache(route, pair.tags);
+    if (viaCache) {
+      // Adopt only on a real change: the payload is what the ETag is
+      // computed from, and a stable ETag is what lets an edge worker
+      // revalidate for the price of a 304.
+      const next = JSON.stringify({ ...viaCache, buildId });
+      if (next !== payload) adopt(viaCache);
+      return;
+    }
+    const now = pairStamp(metaPath, htmlPath);
+    if (now && now !== stamp) {
+      const fresh = readShellPair(metaPath, htmlPath);
+      if (fresh) {
+        adopt(fresh);
+        stamp = now;
+      }
+    }
+  };
+  return async (req) => {
+    if (token && req.headers.get("x-nbc-shell-token") !== token) {
+      return new Response(null, { status: 401 });
+    }
+    await current();
+    if (req.headers.get("if-none-match") === etag) {
+      return new Response(null, { status: 304, headers });
+    }
+    return new Response(payload, { headers });
+  };
+}
+
 function buildShellRoutes(baseDir) {
   const raw = process.env.NBC_PPR_SHELL;
   if (!raw) return {};
@@ -513,45 +666,22 @@ function buildShellRoutes(baseDir) {
         continue;
       }
       if (!e.name.endsWith(".meta")) continue;
-      let meta;
-      try {
-        meta = JSON.parse(fs.readFileSync(full, "utf-8"));
-      } catch {
-        continue;
-      }
-      const postponed = meta && meta.postponed;
-      // Only PPR pairs qualify; fully static/dynamic routes have none.
-      if (!postponed || typeof postponed !== "string") continue;
-      let shell;
-      try {
-        shell = fs.readFileSync(full.slice(0, -".meta".length) + ".html", "utf-8");
-      } catch {
-        continue;
-      }
+      const htmlPath = full.slice(0, -".meta".length) + ".html";
+      const pair = readShellPair(full, htmlPath);
+      if (!pair) continue;
       const rel = path
         .relative(appDir, full)
         .slice(0, -".meta".length)
         .split(path.sep)
         .join("/");
-      const payload = JSON.stringify({ shell, postponed, buildId });
-      const headers = {
-        "Content-Type": "application/json",
-        // Open mode: build-time content, shared caches may hold it (a
-        // zone purge on deploy or this max-age refreshes it). Token
-        // mode: must be unstorable by shared caches — a zone-wide CDN
-        // cache rule would otherwise cache the tokened 200 and serve it
-        // to anyone, defeating the token. The edge worker re-wraps the
-        // response for its own private cache.
-        "Cache-Control": token
-          ? "private, no-store"
-          : "public, max-age=3600",
-      };
-      routes[SHELL_PREFIX + rel] = token
-        ? (req) =>
-            req.headers.get("x-nbc-shell-token") === token
-              ? new Response(payload, { headers })
-              : new Response(null, { status: 401 })
-        : new Response(payload, { headers });
+      routes[SHELL_PREFIX + rel] = shellRoute(
+        full,
+        htmlPath,
+        rel === "index" ? "/" : "/" + rel,
+        buildId,
+        token,
+        pair
+      );
     }
   };
   walk(appDir);
@@ -775,23 +905,18 @@ async function start(opts) {
     );
     return true;
   };
-  // A revalidated PPR page regenerates its shell + postponed pair on
-  // disk; a boot-frozen endpoint entry must not outlive its pair, or an
-  // edge worker would resume a new origin with an old postponed state.
-  const dropShell = (p) => {
-    const key = SHELL_PREFIX + (p === "/" ? "index" : p.replace(/^\/+/, ""));
-    if (!(key in routes)) return false;
-    delete routes[key];
-    console.log(
-      `next-bun-compile: ${p} revalidated — shell endpoint entry dropped`
-    );
-    return true;
-  };
+  // The shell endpoint is NOT dropped on revalidation. A PPR route's
+  // postponed pair is code-shaped, not data-shaped: it encodes where the
+  // Suspense holes are, which only a new build changes — and a new build
+  // is a new process that re-reads the pair at boot. Within a process the
+  // boot-frozen shell stays valid and its holes resume fresh per request.
+  // These routes never regenerate at runtime (revalidate:false, no set()),
+  // so dropping the entry left it dropped until reboot — forcing an edge
+  // worker onto origin RTT for the life of the process.
   const onInvalidate = (tags, pathnameKey) => {
-    let dropped = false;
+    let changed = false;
     if (typeof pathnameKey === "string") {
-      dropped = dropPage(pathnameKey) || dropped;
-      dropped = dropShell(pathnameKey) || dropped;
+      changed = dropPage(pathnameKey) || changed;
       l1DropPath(pathnameKey); // regeneration → refresh on next request
     }
     for (const tag of Array.isArray(tags) ? tags : tags ? [tags] : []) {
@@ -799,15 +924,14 @@ async function start(opts) {
       // L1 entries don't carry tag metadata (stripped upstream); a tag
       // revalidation clears the whole L1 — it refills request by request.
       l1.clear();
-      for (const p of tagIndex.get(tag) ?? []) dropped = dropPage(p) || dropped;
+      for (const p of tagIndex.get(tag) ?? []) changed = dropPage(p) || changed;
       if (tag.startsWith("_N_T_")) {
         const p = tag.slice("_N_T_".length);
         const norm = p === "/index" ? "/" : p;
-        dropped = dropPage(norm) || dropped;
-        dropped = dropShell(norm) || dropped;
+        changed = dropPage(norm) || changed;
       }
     }
-    if (dropped) server.reload(serveOptions());
+    if (changed) server.reload(serveOptions());
   };
   const installInvalidationHook = () => {
     try {
@@ -817,8 +941,18 @@ async function start(opts) {
       // (the concrete handler sees it after) — "/" not "/index"; spec
       // paths and the _N_T_ branch already use the "/" form.
       const normKey = (k) => (k === "/index" ? "/" : k);
+      // Next owns the instance, so the shell endpoint borrows it here.
+      // get() is the hook that matters: a pod which only ever reads a
+      // shared cache handler never calls set(), and its endpoint would
+      // otherwise never see a pair regenerated on another pod.
+      const origGet = IncCache.prototype.get;
+      IncCache.prototype.get = function (...args) {
+        incrementalCache = this;
+        return origGet.apply(this, args);
+      };
       const origRevalidateTag = IncCache.prototype.revalidateTag;
       IncCache.prototype.revalidateTag = function (...args) {
+        incrementalCache = this;
         try {
           onInvalidate(args[0], null);
         } catch {}
@@ -826,6 +960,7 @@ async function start(opts) {
       };
       const origSet = IncCache.prototype.set;
       IncCache.prototype.set = function (key, ...rest) {
+        incrementalCache = this;
         try {
           onInvalidate(null, typeof key === "string" ? normKey(key) : key);
         } catch {}

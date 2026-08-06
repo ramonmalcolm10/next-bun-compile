@@ -41,6 +41,7 @@ infrastructure you already run (see below).
 |---|---|
 | Cold PoP (first request in a region / after a purge) | Pass through to origin (zone cache bypassed — see below) while the shell warms in the background |
 | Warm PoP | Shell streams from the edge (~10ms first paint, `<head>` asset preloads start immediately); a parallel `next-resume` POST renders only the per-user holes at the origin and streams them onto the same response |
+| Warm PoP, copy older than a minute | Same, plus a background `If-None-Match` check against the endpoint — `304` (no body) if the shell is unchanged, otherwise the cached copy is replaced |
 | RSC / prefetch / draft-mode / non-GET / non-HTML | Pass through, zone cache bypassed |
 | Resume fails (origin down, build skew) | Cached shell is evicted; this visitor keeps the shell's Suspense fallbacks — degraded, never mixed builds |
 
@@ -59,13 +60,43 @@ zone is purged.
   clears cached shells with everything else; the next request per PoP
   re-warms from the new build. The endpoint's `max-age` is the backstop
   if you don't purge.
-- **Runtime revalidation**: if a PPR route revalidates on the origin,
-  the binary drops that route's endpoint entry (it would pair an old
-  postponed state with a new origin). The Worker's cached copy then
-  fails its next resume, self-evicts, and re-warms.
-- Nothing user-specific is ever cached: the shell, postponed state,
-  and buildId are all computed at `next build` time, before any
-  request exists. The personalized stream is `private, no-store`.
+- **Runtime revalidation**: a route revalidating on the origin does
+  *not* drop its endpoint entry. The binary re-reads the pair when the
+  prerender is rewritten — an ISR expiry, or a `use cache` region inside
+  the shell whose tag was revalidated — so the endpoint serves what the
+  origin would. A shell that never regenerates keeps its build-frozen
+  pair for the life of the process; only a new build changes the
+  postponed state, and that is a new process which re-reads at boot.
+- **The cached copy revalidates itself**: the origin cannot evict a
+  Cloudflare cache entry, so the Worker re-checks instead. On a warm hit
+  whose cached copy is older than `SHELL_REVALIDATE_SECONDS` (60 by
+  default) it asks the endpoint with `If-None-Match` in the background —
+  an unchanged shell answers `304` with no body, a regenerated one
+  replaces the copy. A regenerated shell therefore reaches visitors about
+  a minute later rather than up to an hour, for one bodiless subrequest
+  per PoP per minute.
+
+  **Tune it to your shells.** A shell that carries `use cache` data earns
+  the default. A shell that only changes on deploy (a static frame around
+  dynamic holes) does not: behind a purge-on-deploy job every check
+  returns `304`, so `1800`–`3600` is the honest setting. Drop the purge
+  and it inverts — the check becomes what carries the edge across a
+  deploy, and until it runs a stale shell resumes against a new build,
+  fails, and degrades that visitor to the shell's fallbacks. Set it in
+  `wrangler.toml`:
+
+  ```toml
+  [vars]
+  SHELL_REVALIDATE_SECONDS = "1800"
+  ```
+- **Tag-aware zones can skip the wait**: the endpoint sends `Cache-Tag`
+  (Next's tag set for the route) and the Worker carries it onto the
+  cached copy, so a Cloudflare Enterprise zone can purge a shell by tag
+  on revalidation instead of waiting for the next check.
+- Nothing user-specific is ever cached: the shell, postponed state, and
+  buildId all come from a prerender — at build time, or a later
+  regeneration — never from the context of a visitor's request. The
+  personalized stream is `private, no-store`.
 
 ## Cost
 
