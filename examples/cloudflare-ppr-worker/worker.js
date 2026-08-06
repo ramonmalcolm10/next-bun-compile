@@ -56,6 +56,9 @@ const shellHeaders = (src) => {
   };
   const etag = src.headers.get("etag");
   if (etag) headers.etag = etag;
+  // Cache-Tag is Enterprise-only: other plans strip it before it ever
+  // reaches this Worker, so this is a no-op there and carries the tags
+  // onto the cached copy where a tag-aware zone can purge by them.
   const tags = src.headers.get("cache-tag");
   if (tags) headers["cache-tag"] = tags;
   return headers;
@@ -83,6 +86,12 @@ export default {
     // flight data until the zone is purged. no-store skips the zone
     // cache in both directions.
     const passThrough = () => fetch(req, { cache: "no-store" });
+    // Set SHELL_DEBUG in wrangler.toml [vars] to trace which branch a
+    // request takes. Off by default: on a warm route this would log once
+    // per request.
+    const debug = (msg) => {
+      if (env.SHELL_DEBUG) console.log(msg);
+    };
     if (req.method !== "GET") return passThrough();
 
     const url = new URL(req.url);
@@ -105,22 +114,58 @@ export default {
 
     const route = url.pathname === "/" ? "/index" : url.pathname;
     const shellUrl = new URL(`/_nbc/ppr-shell${route}`, url.origin);
-    const cacheKey = new Request(shellUrl.toString());
+    // A cache key is an identifier, not a fetch target, and must never be
+    // a URL this Worker also fetches. caches.default IS the zone cache,
+    // so keying on the endpoint's own URL inherits whatever cacheability
+    // that URL picked up — and the shell fetch below asks for it with
+    // `cache: "no-store"`. Telling Cloudflare never to cache a URL and
+    // then asking it to cache that URL loses: put() resolves fine and
+    // stores nothing, so the shell re-warms on every request and is
+    // never served, with no error raised anywhere. A synthetic key is
+    // judged only on the response it is handed.
+    const cacheKey = new Request(`${url.origin}/__nbc-shell${route}`);
     const cached = await caches.default.match(cacheKey);
 
     if (!cached) {
+      debug(`shell miss ${url.pathname} — warming`);
       // Cold PoP: this visitor takes the origin path; the shell warms in
       // the background for the next one. Same-zone subrequests bypass
       // this Worker — no recursion, no separate origin URL needed.
       ctx.waitUntil(
         (async () => {
           const res = await fetchShell(shellUrl, env);
-          if (!res.ok) return;
+          if (!res.ok) {
+            // A warm that never succeeds is otherwise invisible: the
+            // visitor still gets a correct page from the origin, so the
+            // only symptom is an edge that never warms. 401 means the
+            // token doesn't match the origin's NBC_PPR_SHELL, 404 that
+            // the route has no PPR pair to hand out.
+            console.log(
+              `shell warm failed ${url.pathname}: status=${res.status}`
+            );
+            return;
+          }
           const body = await res.arrayBuffer();
-          await caches.default.put(
-            cacheKey,
-            new Response(body, { headers: shellHeaders(res) })
-          );
+          try {
+            await caches.default.put(
+              cacheKey,
+              new Response(body, { headers: shellHeaders(res) })
+            );
+            if (env.SHELL_DEBUG) {
+              // A put Cloudflare declines resolves without throwing, so
+              // reading the key straight back is the only way to tell
+              // "written" from "accepted and discarded". Costs a second
+              // lookup per warm, so it stays behind the flag.
+              const check = await caches.default.match(cacheKey);
+              console.log(
+                `shell warmed ${url.pathname} (${body.byteLength}b) verify=${check ? "STORED" : "NOT STORED"}`
+              );
+            }
+          } catch (err) {
+            console.log(
+              `shell cache put failed ${url.pathname}: ${err && err.message}`
+            );
+          }
         })()
       );
       return passThrough();
@@ -145,7 +190,16 @@ export default {
     } catch {
       entry = null;
     }
-    if (!entry || !entry.shell || !entry.postponed) return passThrough();
+    if (!entry || !entry.shell || !entry.postponed) {
+      // A cached entry that can't be used is worth hearing about
+      // unconditionally: it means this route pass-throughs on every hit
+      // while the cache reports a hit, so nothing else would show it.
+      console.log(
+        `shell entry unusable ${url.pathname}: parsed=${!!entry} shell=${!!(entry && entry.shell)} postponed=${!!(entry && entry.postponed)}`
+      );
+      return passThrough();
+    }
+    debug(`shell hit ${url.pathname} — serving from edge`);
 
     if (recheck) {
       ctx.waitUntil(

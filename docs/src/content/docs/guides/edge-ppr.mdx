@@ -145,6 +145,18 @@ don't rediscover them in an integration of your own:
   the worker's cache self-evicts and re-warms. The example sends
   `application/x-www-form-urlencoded`, the no-JS form-post path where
   `next-resume` is honored.
+- **Never key the cache on a URL you also fetch.** A cache key is an
+  identifier, not a fetch target, and `caches.default` *is* the zone
+  cache — so keying on `/_nbc/ppr-shell/<route>` inherits whatever
+  cacheability that URL has picked up, including from the worker's own
+  `cache: "no-store"` shell fetch. Telling Cloudflare never to cache a
+  URL and then asking it to cache that URL loses: `put()` resolves
+  normally and stores nothing, so the shell re-warms on every request
+  and is never served, with no error raised anywhere. The example keys
+  on a synthetic `/__nbc-shell/<route>` instead, judged only on the
+  response it is handed. A declined `put()` does not throw, so reading
+  the key straight back is the only way to tell a real write from a
+  discarded one — worth doing once when bringing up an integration.
 - **A freshness check must bypass the zone cache too.** In open mode the
   endpoint's own response is `public, max-age=3600`, so a worker
   subrequest that transits the zone can be answered with the very copy

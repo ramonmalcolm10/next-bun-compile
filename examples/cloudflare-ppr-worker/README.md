@@ -45,6 +45,16 @@ infrastructure you already run (see below).
 | RSC / prefetch / draft-mode / non-GET / non-HTML | Pass through, zone cache bypassed |
 | Resume fails (origin down, build skew) | Cached shell is evicted; this visitor keeps the shell's Suspense fallbacks — degraded, never mixed builds |
 
+The cached shell is keyed on a synthetic `/__nbc-shell/<route>` URL, not
+on the shell endpoint's own address. `caches.default` is the zone cache,
+so a key that names a real URL inherits that URL's cacheability — and
+this Worker fetches the endpoint with `cache: "no-store"`. Keying there
+would mean asking Cloudflare to cache a URL it has just been told never
+to cache: `put()` resolves normally and stores nothing, the shell
+re-warms on every request, and nothing is ever served from the edge. No
+error is raised, so set `SHELL_DEBUG` and watch for `verify=NOT STORED`
+if an integration of your own never seems to warm.
+
 Every pass-through uses `fetch(req, { cache: "no-store" })`, and the
 bypass is load-bearing: a Worker subrequest transits Cloudflare's zone
 cache, which keys on URL alone and ignores `Vary` — and Next serves a
