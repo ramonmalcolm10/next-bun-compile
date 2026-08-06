@@ -31,13 +31,14 @@ parts. The holes render at origin speed either way.
    each PPR route's build-frozen artifacts:
 
    ```
-   GET /_nbc/ppr-shell/<route>  →  { shell, postponed, buildId }
+   GET /_nbc/ppr-shell/<route>  →  { shell, postponed, buildId, tags }
    ```
 
    Pairs are discovered at boot from the extracted tree and served from
    memory as exact routes — request data never touches the filesystem.
-   All three artifacts are computed at `next build` time, before any
-   request exists, so they cannot contain per-user data.
+   All three artifacts come from a prerender — at build time, or a later
+   regeneration — never from the context of a visitor's request, so they
+   cannot contain per-user data.
 3. **An edge worker (yours, ~100 lines).** Caches the shell, streams it
    instantly, resumes the holes from your origin, stitches one
    response. A complete self-populating Cloudflare implementation ships
@@ -96,10 +97,31 @@ the worker.
 - **Deploys:** a purge-on-deploy job (zone `purge_everything`) clears
   cached shells with everything else; the endpoint's `max-age` is the
   backstop.
-- **Runtime revalidation:** when a PPR route revalidates, the binary
-  drops its endpoint entry (a frozen shell must never outlive its
-  postponed pair). The worker's cached copy then fails its next
-  resume, self-evicts, and re-warms.
+- **Runtime revalidation:** the endpoint entry is never dropped. It reads
+  the route's pair back through Next's own incremental cache — the same
+  source Next serves from — and falls back to the prerender on disk. A
+  shell that regenerates (an ISR expiry, or a `use cache` region inside
+  it whose tag was revalidated) therefore follows the origin wherever the
+  configured handler put it: on disk, in a memory tier, or in the shared
+  store a custom `cacheHandler` writes — including on a pod that only
+  ever reads what a different pod regenerated. A shell that never
+  regenerates (a static frame around dynamic holes) keeps its
+  build-frozen pair: the postponed state is code-shaped, only a new build
+  changes it, and that is a new process which re-reads at boot.
+- **Before the first render there is nothing to read back.** An endpoint
+  request that arrives before the binary has booted Next serves the build
+  output; it self-corrects as soon as the process handles a request.
+- **The edge copy converges on its own.** An origin cannot evict a CDN's
+  copy, so the example worker revalidates instead: on a warm hit older
+  than a minute it re-checks the endpoint in the background with
+  `If-None-Match`. An unchanged shell answers `304` with no body; a
+  regenerated one replaces the cached copy. The edge therefore follows a
+  regeneration within about a minute instead of sitting stale for the
+  rest of its hour, at the cost of one bodiless request per PoP per
+  minute. The endpoint also emits `Cache-Tag` — Next's own tag set for
+  the route — so a tag-aware CDN (Fastly surrogate keys, Cloudflare
+  Enterprise cache tags) can purge the shell outright rather than wait
+  for the next check.
 
 ## Hard-won details
 
@@ -123,6 +145,12 @@ don't rediscover them in an integration of your own:
   the worker's cache self-evicts and re-warms. The example sends
   `application/x-www-form-urlencoded`, the no-JS form-post path where
   `next-resume` is honored.
+- **A freshness check must bypass the zone cache too.** In open mode the
+  endpoint's own response is `public, max-age=3600`, so a worker
+  subrequest that transits the zone can be answered with the very copy
+  you are trying to replace — the check validates against itself and
+  never sees the new shell. The example fetches the endpoint with
+  `cache: "no-store"` for exactly this reason.
 - **Forward the original request headers on the resume POST** — the
   holes are per-user and the origin needs cookies to render them. They
   flow only worker → origin (the path they already travel); nothing

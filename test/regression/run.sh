@@ -202,6 +202,75 @@ expect "shell endpoint 404 for non-PPR route" test "$(code_of http://127.0.0.1:$
 # Encoded traversal: %2F survives URL normalization, so this is the form
 # that actually reaches the handler's path check.
 expect "shell endpoint rejects path traversal" test "$(code_of --path-as-is "http://127.0.0.1:$PORT/_nbc/ppr-shell/..%2F..%2FBUILD_ID")" = "404"
+
+# Conditional revalidation: an edge worker holding a cached shell asks
+# "is mine still current?" on a throttle, and an unchanged shell must
+# answer with a bodiless 304 — otherwise every check pays a full payload
+# and the worker can't afford to run them often enough to matter.
+shell_etag() {
+  curl -s -D- -o /dev/null "http://127.0.0.1:$PORT/_nbc/ppr-shell/$1" \
+    | grep -i '^etag' | cut -d' ' -f2 | tr -d '\r'
+}
+PPR_ETAG=$(shell_etag ppr)
+expect_sh "shell endpoint serves an ETag" "test -n '$PPR_ETAG'"
+expect "shell endpoint 304s on a matching If-None-Match" test "$(code_of -H "If-None-Match: $PPR_ETAG" http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "304"
+expect "shell endpoint 200s on a stale If-None-Match" test "$(code_of -H 'If-None-Match: "stale"' http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "200"
+
+# Revalidation must NOT dark the shell endpoint. A static-shell PPR route
+# (revalidate:false) never regenerates at runtime — no set() fires — so a
+# dropped entry stayed dropped until reboot, leaving an edge worker on
+# origin RTT for the life of the process. The postponed pair is code-shaped
+# (same build → still valid), so the endpoint keeps serving it, and the
+# served pair still resumes cleanly.
+curl -s -X POST http://127.0.0.1:$PORT/api/revalidate-ppr >/dev/null
+sleep 1
+expect "shell endpoint stays warm across revalidation" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "200"
+curl -s "http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr" >"$WORK/shell-reval.json" || true
+python3 -c "import json; print(json.load(open('$WORK/shell-reval.json'))['postponed'], end='')" >"$WORK/reval-postponed.txt" 2>/dev/null || true
+REVAL=$(curl -s -X POST -H 'next-resume: 1' --data-binary @"$WORK/reval-postponed.txt" http://127.0.0.1:$PORT/ppr)
+expect_sh "post-revalidation shell still resumes cleanly" "grep -q 'hole rendered at' <<<'$REVAL'"
+
+# `use cache` data read in a SHELL (not a hole) must not stay build-frozen
+# at the edge. Revalidating its tag regenerates the prerender on disk;
+# Next serves the new value out of the box, so an endpoint feeding a CDN
+# has to match it or the edge serves indefinitely stale content.
+shell_stamp() {
+  curl -s "http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr-cached" | python3 -c "
+import json, re, sys
+try:
+    shell = json.load(sys.stdin)['shell']
+except Exception:
+    print(''); raise SystemExit
+m = re.search(r'shell stamp: <!-- -->(\d+)', shell)
+print(m.group(1) if m else '')
+"
+}
+expect "shell endpoint serves the cached-shell PPR route" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr-cached)" = "200"
+# The route's tag set travels with the shell so a tag-aware CDN (Fastly
+# surrogate keys, Cloudflare Enterprise cache tags) can purge it on
+# revalidation instead of waiting out its TTL.
+curl -s "http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr-cached" >"$WORK/shell-cached.json" || true
+expect "shell endpoint exposes the route's cache tags" python3 -c "
+import json
+entry = json.load(open('$WORK/shell-cached.json'))
+assert 'ppr-shell-demo' in entry['tags'], entry.get('tags')
+"
+expect_sh "shell endpoint sets Cache-Tag for tag-aware CDNs" "curl -s -D- -o /dev/null http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr-cached | grep -qi '^cache-tag:.*ppr-shell-demo'"
+STAMP_BEFORE=$(shell_stamp)
+ETAG_BEFORE=$(shell_etag ppr-cached)
+curl -s -X POST http://127.0.0.1:$PORT/api/revalidate-shell >/dev/null
+STAMP_AFTER="$STAMP_BEFORE"
+for _ in $(seq 1 10); do
+  curl -s http://127.0.0.1:$PORT/ppr-cached >/dev/null  # request → regenerate
+  sleep 1
+  STAMP_AFTER=$(shell_stamp)
+  [ -n "$STAMP_AFTER" ] && [ "$STAMP_AFTER" != "$STAMP_BEFORE" ] && break
+done
+ETAG_AFTER=$(shell_etag ppr-cached)
+expect_sh "shell endpoint picks up regenerated cached shell data" "test -n '$STAMP_BEFORE' && test '$STAMP_AFTER' != '$STAMP_BEFORE'"
+# The ETag must move with the content, or a worker's conditional check
+# would 304 forever against a shell that has already changed.
+expect_sh "shell ETag changes when the shell regenerates" "test -n '$ETAG_BEFORE' && test '$ETAG_AFTER' != '$ETAG_BEFORE'"
 shutdown_server
 
 boot "$DEPLOY" NBC_RUNTIME_DIR="$RUNTIME" NBC_PPR_SHELL=sekret-token
@@ -259,16 +328,22 @@ echo "== custom cacheHandler (singular): failsafe engages =="
 cat > cache-handler.mjs <<'EOF'
 // Minimal in-memory singular cacheHandler — the same contract a Redis
 // handler implements. The constructor log proves Next instantiated it.
+//
+// The store is module-level on purpose: Next builds a handler per
+// IncrementalCache, so per-instance state would start empty every time
+// and every lookup would miss — nothing like the shared backing store
+// this stands in for.
+const store = new Map();
+
 export default class TestCacheHandler {
   constructor() {
     console.log("nbc-test: custom cache handler loaded");
-    this.store = new Map();
   }
   async get(key) {
-    return this.store.get(key) ?? null;
+    return store.get(key) ?? null;
   }
   async set(key, data) {
-    this.store.set(key, { value: data, lastModified: Date.now() });
+    store.set(key, { value: data, lastModified: Date.now() });
   }
   async revalidateTag() {}
   resetRequestCache() {}
@@ -290,6 +365,37 @@ curl -s -X POST http://127.0.0.1:$PORT/api/revalidate >/dev/null
 sleep 1
 expect_sh "custom handler instantiated by Next" "grep -q 'nbc-test: custom cache handler loaded' '$SERVER_LOG'"
 expect_sh "pages serve and revalidate through the custom handler" "test -n '$C1' && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/cached) = 200"
+shutdown_server
+
+# The shell endpoint keeps serving under a custom cacheHandler. Its pairs
+# come from the build output every pod carries, so they are identical
+# everywhere — unlike the frozen page tiers, there is nothing here a
+# shared store could make inconsistent between pods. A shell that carries
+# `use cache` data does stay build-frozen (regeneration goes to the
+# handler, not to disk), which is staleness, not divergence.
+boot "$APP" NBC_PPR_SHELL=1
+expect "shell endpoint still serves under a custom cacheHandler" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "200"
+expect_sh "shell endpoint pair resumes under a custom cacheHandler" "curl -s 'http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr' | python3 -c \"
+import json,sys
+print(json.load(sys.stdin)['postponed'], end='')
+\" > '$WORK/handler-postponed.txt' && curl -s -X POST -H 'next-resume: 1' --data-binary @'$WORK/handler-postponed.txt' http://127.0.0.1:$PORT/ppr | grep -q 'hole rendered at'"
+
+# A regeneration under a custom handler is stored in the handler and
+# never touches this pod's disk, so the endpoint can only reflect it by
+# reading through the cache — the same source Next reads, and the only
+# one that is also correct for a pod that merely reads a shared store
+# another pod wrote. Without the read-through this shell stays
+# build-frozen until the next deploy.
+HSTAMP_BEFORE=$(shell_stamp)
+curl -s -X POST http://127.0.0.1:$PORT/api/revalidate-shell >/dev/null
+HSTAMP_AFTER="$HSTAMP_BEFORE"
+for _ in $(seq 1 10); do
+  curl -s http://127.0.0.1:$PORT/ppr-cached >/dev/null  # request → regenerate
+  sleep 1
+  HSTAMP_AFTER=$(shell_stamp)
+  [ -n "$HSTAMP_AFTER" ] && [ "$HSTAMP_AFTER" != "$HSTAMP_BEFORE" ] && break
+done
+expect_sh "shell endpoint reflects regeneration under a custom cacheHandler" "test -n '$HSTAMP_BEFORE' && test '$HSTAMP_AFTER' != '$HSTAMP_BEFORE'"
 shutdown_server
 
 echo

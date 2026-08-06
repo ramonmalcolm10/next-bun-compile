@@ -27,6 +27,52 @@
  *                 endpoint in token mode (NBC_PPR_SHELL=<token>).
  */
 
+// How long a PoP may hold a shell, and how long before a warm hit checks
+// the origin for a newer one. The check is conditional, so an unchanged
+// shell costs a bodiless 304 — cheap enough to run far more often than
+// the TTL, which is what keeps a regenerated shell from sitting stale at
+// the edge for the rest of its hour.
+//
+// Override the gap per app with SHELL_REVALIDATE_SECONDS in
+// wrangler.toml [vars]. A shell that only changes on deploy (a static
+// frame around dynamic holes) can check far less often — behind a
+// purge-on-deploy job the check buys it nothing at all. Drop the purge
+// and the opposite holds: the check is what carries the edge across a
+// deploy, and until it runs, a stale shell resumes against a new build,
+// fails, and degrades that visitor to the shell's fallbacks.
+const SHELL_TTL = 3600;
+const REVALIDATE_AFTER_SECONDS = 60;
+
+// The origin marks token-mode responses private/no-store so the zone CDN
+// can never serve them without the token — only this worker-private copy
+// may hold them, so every cached shell is re-wrapped on the way in. ETag
+// and Cache-Tag carry over: the first drives conditional revalidation,
+// the second lets a tag-aware zone purge the shell on revalidation.
+const shellHeaders = (src) => {
+  const headers = {
+    "content-type": "application/json",
+    "cache-control": `public, max-age=${SHELL_TTL}`,
+    "x-nbc-cached-at": String(Date.now()),
+  };
+  const etag = src.headers.get("etag");
+  if (etag) headers.etag = etag;
+  const tags = src.headers.get("cache-tag");
+  if (tags) headers["cache-tag"] = tags;
+  return headers;
+};
+
+const fetchShell = (shellUrl, env, etag) =>
+  fetch(shellUrl.toString(), {
+    // The endpoint's own response is cacheable (public, max-age=3600) in
+    // open mode — without this the zone could answer a freshness check
+    // with the very copy we are trying to replace.
+    cache: "no-store",
+    headers: {
+      ...(env.SHELL_TOKEN ? { "x-nbc-shell-token": env.SHELL_TOKEN } : {}),
+      ...(etag ? { "if-none-match": etag } : {}),
+    },
+  });
+
 export default {
   async fetch(req, env, ctx) {
     // Pass-through is NOT the no-worker behavior by default: a Worker
@@ -68,30 +114,30 @@ export default {
       // this Worker — no recursion, no separate origin URL needed.
       ctx.waitUntil(
         (async () => {
-          const res = await fetch(shellUrl.toString(), {
-            headers: env.SHELL_TOKEN
-              ? { "x-nbc-shell-token": env.SHELL_TOKEN }
-              : {},
-          });
+          const res = await fetchShell(shellUrl, env);
           if (!res.ok) return;
-          // Re-wrap before caching: the origin marks token-mode
-          // responses private/no-store so the zone CDN can never serve
-          // them without the token — only this worker-private copy may
-          // hold them.
           const body = await res.arrayBuffer();
           await caches.default.put(
             cacheKey,
-            new Response(body, {
-              headers: {
-                "content-type": "application/json",
-                "cache-control": "public, max-age=3600",
-              },
-            })
+            new Response(body, { headers: shellHeaders(res) })
           );
         })()
       );
       return passThrough();
     }
+
+    // A shell regenerates when its route revalidates — an ISR expiry, or
+    // a `use cache` region inside the shell whose tag was revalidated.
+    // The origin serves the new one immediately; this copy would other-
+    // wise sit stale until its TTL ran out, so check in the background
+    // once the copy is old enough. The visitor is never blocked.
+    const configured = Number(env.SHELL_REVALIDATE_SECONDS);
+    const revalidateAfter =
+      (Number.isFinite(configured) && configured > 0
+        ? configured
+        : REVALIDATE_AFTER_SECONDS) * 1000;
+    const cachedAt = Number(cached.headers.get("x-nbc-cached-at") || 0);
+    const recheck = Date.now() - cachedAt > revalidateAfter;
 
     let entry;
     try {
@@ -100,6 +146,32 @@ export default {
       entry = null;
     }
     if (!entry || !entry.shell || !entry.postponed) return passThrough();
+
+    if (recheck) {
+      ctx.waitUntil(
+        (async () => {
+          const res = await fetchShell(shellUrl, env, cached.headers.get("etag"));
+          if (res.status === 304) {
+            // Unchanged — restamp so the next hit doesn't check again
+            // immediately. Re-serializing the entry we just parsed keeps
+            // the body we already hold.
+            await caches.default.put(
+              cacheKey,
+              new Response(JSON.stringify(entry), {
+                headers: shellHeaders(cached),
+              })
+            );
+            return;
+          }
+          if (!res.ok) return;
+          const body = await res.arrayBuffer();
+          await caches.default.put(
+            cacheKey,
+            new Response(body, { headers: shellHeaders(res) })
+          );
+        })()
+      );
+    }
 
     // The dynamic holes are per-user — the origin needs the original
     // headers (cookies included) to render THIS visitor's content. They
