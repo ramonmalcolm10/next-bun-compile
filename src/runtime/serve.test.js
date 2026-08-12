@@ -68,6 +68,19 @@ test("client abort mid-stream ends the response body cleanly (no Error: aborted)
   }
 });
 
+test("selfOrigin maps bind addresses to a dialable host", () => {
+  // A wildcard bind is "every interface", not an address to connect back to —
+  // and https://0.0.0.0:3000 is exactly what broke action redirects in prod.
+  for (const wildcard of ["0.0.0.0", "::", "[::]", "", undefined]) {
+    expect(_internal.selfOrigin(wildcard)).toBe("localhost");
+  }
+  expect(_internal.selfOrigin("127.0.0.1")).toBe("127.0.0.1");
+  expect(_internal.selfOrigin("example.internal")).toBe("example.internal");
+  // Bare IPv6 needs brackets or the URL parser reads the last colon as a port.
+  expect(_internal.selfOrigin("::1")).toBe("[::1]");
+  expect(_internal.selfOrigin("[::1]")).toBe("[::1]");
+});
+
 test("handler writes racing a client abort do not error the response", async () => {
   const ac = new AbortController();
   const { getRes, stopWriting } = await streamingRequest(ac.signal);

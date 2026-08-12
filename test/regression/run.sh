@@ -135,6 +135,28 @@ ACTION_ID=$(curl -s http://127.0.0.1:$PORT/action | grep -o 'name="\$ACTION_ID_[
 expect_sh "server action POST executes (no-JS form)" "test -n '$ACTION_ID' && test \$(curl -s -o /dev/null -w '%{http_code}' -X POST -F '$ACTION_ID=' http://127.0.0.1:$PORT/action) = 200"
 expect_sh "pages healthy after tag invalidation (tier drop path)" "test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/) = 200 && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/cached) = 200"
 
+# A *fetch* action (JS-driven, `Next-Action` header) that redirect()s is
+# answered by Next self-fetching the target's RSC payload and streaming it
+# back, so the client can soft-navigate. It takes the origin from
+# __NEXT_PRIVATE_ORIGIN, which `next start` sets on its listening handler —
+# and we replace that listener. Left unset, Next fell back to the request's
+# initURL, `${x-forwarded-proto}://${HOSTNAME}:${PORT}`, i.e. https://0.0.0.0
+# behind any TLS-terminating gateway: handshake failure, empty body, and
+# every action redirect in production silently degraded to a full page
+# reload. The no-JS form POST above never caught it — that path takes a 303
+# Location and never self-fetches. Second form on /action, so ACTION_ID #2.
+REDIRECT_FIELD=$(curl -s http://127.0.0.1:$PORT/action | grep -o 'name="\$ACTION_ID_[^"]*"' | sed -n '2p' | cut -d'"' -f2)
+REDIRECT_ID="${REDIRECT_FIELD#'$ACTION_ID_'}"
+REDIRECT_BODY="$WORK/action-redirect.body"
+# `[]` is how the client encodes a zero-argument action call.
+REDIRECT_HDRS=$(curl -s -D- -o "$REDIRECT_BODY" -X POST \
+  -H "Next-Action: $REDIRECT_ID" -H "x-forwarded-proto: https" \
+  -H 'Content-Type: text/plain;charset=UTF-8' --data-binary '[]' \
+  http://127.0.0.1:$PORT/action | tr -d '\r')
+expect_sh "fetch action redirect signals the client" "echo '$REDIRECT_HDRS' | grep -qi 'x-action-redirect: /'"
+expect_sh "fetch action redirect streams the target RSC payload (not an empty body)" "test -s '$REDIRECT_BODY'"
+expect_sh "self-fetch origin survives x-forwarded-proto: https" "! grep -q 'failed to get redirect response' '$SERVER_LOG'"
+
 # Aborted client connections (probes, gateways, users navigating away) must
 # tear down silently — they used to log "unhandledRejection: Error: aborted"
 # on every disconnect. head closes the pipe early → curl aborts mid-stream.
