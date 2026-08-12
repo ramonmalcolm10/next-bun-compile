@@ -698,6 +698,16 @@ function buildShellRoutes(baseDir) {
  * start()
  * ---------------------------------------------------------------- */
 
+/** Host this server can dial itself on, given the address it binds. */
+function selfOrigin(hostname) {
+  if (!hostname || hostname === "0.0.0.0" || hostname === "::" || hostname === "[::]")
+    return "localhost";
+  // Bare IPv6 needs brackets to survive URL parsing.
+  return hostname.includes(":") && !hostname.startsWith("[")
+    ? `[${hostname}]`
+    : hostname;
+}
+
 async function start(opts) {
   const {
     assetMap,
@@ -712,6 +722,19 @@ async function start(opts) {
     enableL1 = true,
   } = opts;
   if (gzippedAssets) gzippedAssetSet = gzippedAssets;
+
+  // `next start` sets this on its listening handler; we replace that listener,
+  // so nothing did. Unset, a fetch action that redirect()s falls back to the
+  // request's initURL — `${x-forwarded-proto}://${hostname}:${port}` — which
+  // behind any TLS-terminating gateway is https://0.0.0.0:PORT. This listener
+  // terminates no TLS, so the self-fetch for the redirect target's RSC payload
+  // failed the handshake, the action returned an empty body, and the client
+  // fell back to a full page reload (blank screen until the document lands).
+  // Always http, and 0.0.0.0/:: means "every interface" — not an address to
+  // dial back on.
+  if (process.env.__NEXT_PRIVATE_ORIGIN === undefined) {
+    process.env.__NEXT_PRIVATE_ORIGIN = `http://${selfOrigin(hostname)}:${port}`;
+  }
 
   // Next boots lazily on the first Tier-3 request; static tiers serve
   // immediately. This keeps time-to-first-static-byte low while Next's
@@ -1009,4 +1032,9 @@ async function start(opts) {
 module.exports = { start };
 // Test-only escape hatch for unit-testing the fetch→node bridge. Not a public
 // API — may change or disappear in any release without notice.
-module.exports._internal = { createBridge, NodeResponseShim, makeNodeRequest };
+module.exports._internal = {
+  createBridge,
+  NodeResponseShim,
+  makeNodeRequest,
+  selfOrigin,
+};
