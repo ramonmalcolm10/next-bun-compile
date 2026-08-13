@@ -84,7 +84,7 @@ echo "== build (adapter, single command) =="
 # a catch-all that once disabled the tiers entirely (0 assets + 0 pages).
 BUILD_LOG="$WORK/build.log"
 NEXT_DEPLOYMENT_ID=testdpl bunx next build >"$BUILD_LOG" 2>&1 || { tail -10 "$BUILD_LOG"; exit 1; }
-expect "tier eligibility: 11 assets + 3 pages frozen (deploymentId set)" grep -q "Serving 11 assets + 3 prerendered pages" "$BUILD_LOG"
+expect "tier eligibility: 11 assets + 4 pages frozen (deploymentId set)" grep -q "Serving 11 assets + 4 prerendered pages" "$BUILD_LOG"
 expect "binary produced by next build alone" test -f server
 
 echo "== behavior =="
@@ -157,6 +157,35 @@ expect_sh "fetch action redirect signals the client" "echo '$REDIRECT_HDRS' | gr
 expect_sh "fetch action redirect streams the target RSC payload (not an empty body)" "test -s '$REDIRECT_BODY'"
 expect_sh "self-fetch origin survives x-forwarded-proto: https" "! grep -q 'failed to get redirect response' '$SERVER_LOG'"
 
+# A server action carrying a file. Next parses multipart with busboy,
+# piping the request stream through `pipeline()` — the only path here
+# that reads a request body of real size through the Node-stream bridge,
+# and until now the suite never exercised it at all.
+#
+# Checked against `next start` on the same build: byte-identical result,
+# so this pins parity rather than a suspicion. (A hand-rolled multipart
+# payload with a Next-Action header 500s with "Connection closed." —
+# on plain Node too. That is Next rejecting a body React didn't encode,
+# not a bridge defect, which is why this uses the form-post shape a
+# browser actually sends.)
+UPLOAD_SRC="$WORK/upload-blob.bin"
+head -c 65536 /dev/urandom > "$UPLOAD_SRC"
+UPLOAD_SUM=$(python3 -c "
+import sys
+d = open('$UPLOAD_SRC','rb').read()
+s = 0
+for b in d: s = (s + b) % 1000000007
+print(s)
+")
+UPLOAD_FIELD=$(curl -s http://127.0.0.1:$PORT/upload | grep -o 'name="\$ACTION_ID_[^"]*"' | head -1 | cut -d'"' -f2)
+UPLOAD_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -F "$UPLOAD_FIELD=" -F "file=@$UPLOAD_SRC;filename=blob.bin" \
+  http://127.0.0.1:$PORT/upload)
+expect "server action accepts a file upload" test "$UPLOAD_CODE" = "200"
+# Length alone would pass on a truncated-then-padded stream; the checksum
+# is what proves the bytes survived the bridge unaltered.
+expect_sh "uploaded file arrives intact through the request bridge" "grep -q 'UPLOAD_OK name=blob.bin bytes=65536 sum=$UPLOAD_SUM' '$SERVER_LOG'"
+
 # Aborted client connections (probes, gateways, users navigating away) must
 # tear down silently — they used to log "unhandledRejection: Error: aborted"
 # on every disconnect. head closes the pipe early → curl aborts mid-stream.
@@ -214,7 +243,7 @@ open('next.config.ts','w').write(config)
 EOF
 rmrf_retry .next server
 bunx next build >"$WORK/build2.log" 2>&1 || { tail -10 "$WORK/build2.log"; exit 1; }
-expect "rule-covered page excluded from tiers" grep -q "Serving 11 assets + 2 prerendered pages" "$WORK/build2.log"
+expect "rule-covered page excluded from tiers" grep -q "Serving 11 assets + 3 prerendered pages" "$WORK/build2.log"
 boot "$APP"
 HDR=$(curl -s -D- -o /dev/null http://127.0.0.1:$PORT/action | grep -ci 'x-custom-policy: test' || true)
 expect "custom header applied via Next" test "$HDR" = "1"
@@ -394,7 +423,7 @@ echo "== invalidation observation (tier drop end-to-end) =="
 # frozen, so this is the one invalidation path the tiers depend on.
 cd "$APP"
 boot "$APP"
-expect_sh "frozen page served from memory before invalidation" "grep -q '2 prerendered pages served from memory' '$SERVER_LOG'"
+expect_sh "frozen page served from memory before invalidation" "grep -q '3 prerendered pages served from memory' '$SERVER_LOG'"
 curl -s -X POST http://127.0.0.1:$PORT/api/revalidate-path >/dev/null
 sleep 1
 expect_sh "revalidatePath drops the frozen page (hook fired)" "grep -q '/ revalidated — serving via Next from now on' '$SERVER_LOG'"
