@@ -640,9 +640,47 @@ function shellRoute(metaPath, htmlPath, route, buildId, token, pair) {
   };
 }
 
-function buildShellRoutes(baseDir) {
+/**
+ * Compile the build's coverage rules (proxy/middleware matchers plus
+ * response-altering routing rules) into a single predicate. Mirrors
+ * computeStaticTiersFromSnapshot in src/generate.ts, including its
+ * fail-closed handling of a source this engine won't parse.
+ */
+function shellGuard(sources) {
+  const res = [];
+  for (const source of sources) {
+    try {
+      res.push(new RegExp(source));
+    } catch {
+      res.push(/.*/); // unparseable rule: fail closed
+    }
+  }
+  return (p) => res.some((re) => re.test(p));
+}
+
+/**
+ * Publish the PPR shell/postponed pairs a CDN may serve.
+ *
+ * `guards` is what keeps this honest. Handing a shell to a CDN moves the
+ * response head to the edge, where it is committed before the origin has
+ * rendered anything — so a Set-Cookie, a redirect, or a non-200 that the
+ * request would have earned at the origin can no longer reach the client.
+ * The CDN has already sent 200 + headers and can only append body bytes.
+ *
+ * The invariant: a route that can emit a Set-Cookie, a redirect, or a
+ * non-200 status before or during its dynamic render must not have an
+ * edge-served shell. Middleware coverage is the part of that we can see
+ * from a build, and it is the part that bites hardest — an auth gate that
+ * silently stops running is indistinguishable from no auth gate. It is
+ * not the whole invariant: a `redirect()` or `notFound()` from inside a
+ * dynamic hole fails the same way on a route no matcher covers. Those
+ * routes must be kept off the CDN by hand (drop them from the worker's
+ * route list); this only guarantees the statically-provable half.
+ */
+function buildShellRoutes(baseDir, guards = []) {
   const raw = process.env.NBC_PPR_SHELL;
   if (!raw) return {};
+  const covered = shellGuard(guards);
   const token = raw === "1" || raw === "true" ? null : raw;
   const appDir = path.join(baseDir, ".next", "server", "app");
   let buildId = "";
@@ -652,6 +690,7 @@ function buildShellRoutes(baseDir) {
       .trim();
   } catch {}
   const routes = {};
+  let excluded = 0;
   const walk = (dir) => {
     let entries;
     try {
@@ -674,10 +713,17 @@ function buildShellRoutes(baseDir) {
         .slice(0, -".meta".length)
         .split(path.sep)
         .join("/");
+      const routePath = rel === "index" ? "/" : "/" + rel;
+      // No route, so the endpoint 404s and the CDN passes through
+      // permanently — the origin keeps owning this response head.
+      if (covered(routePath)) {
+        excluded++;
+        continue;
+      }
       routes[SHELL_PREFIX + rel] = shellRoute(
         full,
         htmlPath,
-        rel === "index" ? "/" : "/" + rel,
+        routePath,
         buildId,
         token,
         pair
@@ -689,6 +735,13 @@ function buildShellRoutes(baseDir) {
   if (count > 0) {
     console.log(
       `next-bun-compile: PPR shell endpoint serving ${count} route(s) from memory`
+    );
+  }
+  // Worth saying out loud: someone who put these routes in a CDN route
+  // list is otherwise left staring at 404s with no explanation.
+  if (excluded > 0) {
+    console.log(
+      `next-bun-compile: PPR shell endpoint withholding ${excluded} route(s) covered by proxy/routing rules — their response head belongs to the origin`
     );
   }
   return routes;
@@ -720,6 +773,7 @@ async function start(opts) {
     staticPages = [],
     baseDir,
     enableL1 = true,
+    shellGuards = [],
   } = opts;
   if (gzippedAssets) gzippedAssetSet = gzippedAssets;
 
@@ -881,7 +935,7 @@ async function start(opts) {
   const routes = {
     ...tier1Routes,
     ...tier2Routes,
-    ...buildShellRoutes(baseDir),
+    ...buildShellRoutes(baseDir, shellGuards),
   };
   const tier2Paths = new Set(Object.keys(tier2Routes));
 
@@ -1037,4 +1091,5 @@ module.exports._internal = {
   NodeResponseShim,
   makeNodeRequest,
   selfOrigin,
+  shellGuard,
 };
