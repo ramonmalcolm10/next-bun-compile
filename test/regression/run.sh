@@ -166,6 +166,36 @@ for _ in 1 2 3 4 5; do
 done
 sleep 1
 expect_sh "aborted connections are silent (no unhandledRejection)" "! grep -q 'unhandledRejection\|Error: aborted' '$SERVER_LOG'"
+
+# The other half of the same problem: a client that vanishes mid-UPLOAD,
+# while the handler is still reading the request body. That tears down the
+# Readable.fromWeb wrapper around the incoming web stream, whose cancelled
+# reader rejected with nowhere to go — "unhandledRejection: AbortError:
+# The operation was aborted". Distinct from the response-side abort above,
+# which is why that check stayed green while this fired in production on
+# every dropped upload.
+cat > "$WORK/abort-upload.js" <<'EOF'
+const url = process.argv[2];
+for (let i = 0; i < 5; i++) {
+  const ac = new AbortController();
+  // Never-ending body: guarantees the abort lands while the server reads.
+  const body = new ReadableStream({
+    async pull(c) {
+      c.enqueue(new Uint8Array(64 * 1024));
+      await new Promise((r) => setTimeout(r, 25));
+    },
+  });
+  const done = fetch(url, {
+    method: "POST", body, signal: ac.signal, duplex: "half",
+  }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 150));
+  ac.abort();
+  await done;
+}
+EOF
+bun "$WORK/abort-upload.js" "http://127.0.0.1:$PORT/api/slow-body" >/dev/null 2>&1 || true
+sleep 1
+expect_sh "aborted uploads are silent (no unhandledRejection)" "! grep -q 'unhandledRejection' '$SERVER_LOG'"
 expect "server alive after aborted connections" test "$(code_of http://127.0.0.1:$PORT/ssr)" = "200"
 shutdown_server
 
