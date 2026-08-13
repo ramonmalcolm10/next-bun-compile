@@ -81,6 +81,26 @@ test("selfOrigin maps bind addresses to a dialable host", () => {
   expect(_internal.selfOrigin("[::1]")).toBe("[::1]");
 });
 
+test("shellGuard refuses covered routes and fails closed", () => {
+  // The shape Next actually emits for `matcher: ["/agent/:path*"]`.
+  const covered = _internal.shellGuard(["^/agent(?:/(.*))?$"]);
+  expect(covered("/agent")).toBe(true);
+  expect(covered("/agent/integrations/shopify")).toBe(true);
+  // Not a prefix match: /agent-account is its own route.
+  expect(covered("/agent-account")).toBe(false);
+  expect(covered("/")).toBe(false);
+
+  // No rules means nothing is withheld — the endpoint's prior behavior.
+  expect(_internal.shellGuard([])("/agent")).toBe(false);
+
+  // A source this engine can't parse must withhold everything rather than
+  // silently publish a shell for a route something upstream guards.
+  const broken = _internal.shellGuard(["(unclosed"]);
+  expect(broken("/anything")).toBe(true);
+  // ...and one bad rule must not disarm the good ones alongside it.
+  expect(_internal.shellGuard(["(unclosed", "^/ok$"])("/elsewhere")).toBe(true);
+});
+
 test("handler writes racing a client abort do not error the response", async () => {
   const ac = new AbortController();
   const { getRes, stopWriting } = await streamingRequest(ac.signal);

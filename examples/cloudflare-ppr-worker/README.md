@@ -20,12 +20,35 @@ speed either way. This Worker buys roughly `origin RTT − 10ms` on
 first paint (plus early asset preloading from the shell's `<head>`)
 for PPR pages — nothing else.
 
+## Which routes may go in the route list
+
+Serving a shell commits the response head **at the edge**, before the
+origin has rendered a byte. Only body bytes can follow it. That gives
+one hard rule:
+
+> A route that can emit a `Set-Cookie`, a redirect, or a non-200 status
+> before or during its dynamic render must never be routed to this
+> Worker.
+
+Auth gates are the obvious case, and the origin already refuses them for
+you: next-bun-compile withholds a shell for any route covered by a
+proxy/middleware matcher or a response-altering routing rule, so
+`/_nbc/ppr-shell/<route>` returns `404`, this Worker tombstones it, and
+the route passes through permanently. Listing such a route is harmless —
+it just does nothing.
+
+**What the build cannot see is on you.** A `redirect()` or `notFound()`
+reached from inside a dynamic hole fails exactly the same way on a route
+no matcher covers: the origin's resume returns a redirect, its status
+and `Location` have nowhere to go, and the visitor is left holding the
+shell's Suspense fallbacks. Route only pages whose response head is a
+foregone conclusion.
+
 ## Setup (once, ever)
 
 1. **Origin**: set `NBC_PPR_SHELL=1` (or `NBC_PPR_SHELL=<token>` to
-   require an `x-nbc-shell-token` header — recommended for auth-gated
-   routes so their skeletons aren't publicly enumerable). The binary
-   then serves `GET /_nbc/ppr-shell/<route>` →
+   require an `x-nbc-shell-token` header, so shells aren't publicly
+   enumerable). The binary then serves `GET /_nbc/ppr-shell/<route>` →
    `{ shell, postponed, buildId }`, precomputed at boot and served
    from memory like every other tier.
 2. **Worker**: set your route pattern(s) in `wrangler.toml`, add
@@ -40,6 +63,7 @@ infrastructure you already run (see below).
 | Situation | What happens |
 |---|---|
 | Cold PoP (first request in a region / after a purge) | Pass through to origin (zone cache bypassed — see below) while the shell warms in the background |
+| Origin has no shell for the route (`404`) | Tombstoned in the cache and passed through until the next purge — one wasted warm, not one per request |
 | Warm PoP | Shell streams from the edge (~10ms first paint, `<head>` asset preloads start immediately); a parallel `next-resume` POST renders only the per-user holes at the origin and streams them onto the same response |
 | Warm PoP, copy older than a minute | Same, plus a background `If-None-Match` check against the endpoint — `304` (no body) if the shell is unchanged, otherwise the cached copy is replaced |
 | RSC / prefetch / draft-mode / non-GET / non-HTML | Pass through, zone cache bypassed |

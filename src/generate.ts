@@ -737,6 +737,9 @@ type TierResult = {
   staticPages: StaticPageSpec[];
   disabled: string | null;
   customCacheHandler: boolean;
+  /** Regex sources for routes the PPR shell endpoint must refuse. See
+   *  buildShellRoutes in src/runtime/serve.js. */
+  shellGuards: string[];
 };
 
 /**
@@ -789,20 +792,25 @@ function computeStaticTiersFromSnapshot(
     assetPrefix: string;
   }
 ): TierResult {
+  const guardSources = [
+    ...snapshot.middlewareMatchers,
+    ...snapshot.routingRules,
+  ];
   const none = (why: string): TierResult => ({
     tier1: [],
     staticPages: [],
     disabled: why,
     customCacheHandler: snapshot.hasCustomCacheHandler,
+    // These matchers are written against the request path; with a basePath
+    // or i18n prefix in play we can't say which space a shell route's path
+    // is in, so we can't prove a route is uncovered. Refuse them all.
+    shellGuards: [".*"],
   });
   if (snapshot.basePath) return none("basePath is set");
   if (snapshot.i18n) return none("i18n is configured");
 
   const matchers: RegExp[] = [];
-  for (const source of [
-    ...snapshot.middlewareMatchers,
-    ...snapshot.routingRules,
-  ]) {
+  for (const source of guardSources) {
     try {
       matchers.push(new RegExp(source));
     } catch {
@@ -923,6 +931,7 @@ function computeStaticTiersFromSnapshot(
     staticPages,
     disabled: null,
     customCacheHandler: snapshot.hasCustomCacheHandler,
+    shellGuards: guardSources,
   };
 }
 
@@ -933,6 +942,11 @@ function computeStaticTiersFromSnapshot(
  * matcher or a response-altering routing rule. Everything else stays
  * with Next. On-demand revalidation of eligible pages is still honored —
  * the runtime drops a page from the route table when Next invalidates it.
+ *
+ * Also returns shellGuards: the same coverage rules, handed to the
+ * runtime so the PPR shell endpoint refuses the same routes. A frozen
+ * page and an edge shell fail identically when something upstream of the
+ * render owns the response head.
  *
  * Data source: the build adapter's typed snapshot (src/adapter.ts) —
  * the only supported build path.
@@ -997,6 +1011,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
     staticPages,
     disabled: tiersDisabled,
     customCacheHandler,
+    shellGuards,
   } = computeStaticTiers({
     distDir,
     staticFiles,
@@ -1432,6 +1447,9 @@ async function extractAssets() {
 
 const __NBC_TIER1 = ${JSON.stringify(tier1)};
 const __NBC_STATIC_PAGES = ${JSON.stringify(staticPages)};
+// Routes the PPR shell endpoint must refuse: their response head is
+// decided upstream of the render, so it can't be committed at a CDN.
+const __NBC_SHELL_GUARDS = ${JSON.stringify(shellGuards)};
 
 // Image-build hook: \`server --extract\` materializes the runtime tree and
 // exits. A later boot with the same NBC_RUNTIME_DIR hits the manifest
@@ -1455,6 +1473,7 @@ extractAssets().then(() => {
     keepAliveTimeout,
     tier1: __NBC_TIER1,
     staticPages: __NBC_STATIC_PAGES,
+    shellGuards: __NBC_SHELL_GUARDS,
     baseDir,
     // Revalidation events are observed on the default filesystem cache
     // handler; with a custom handler they never fire, so response

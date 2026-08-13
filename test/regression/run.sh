@@ -221,6 +221,32 @@ expect_sh "endpoint postponed state resumes cleanly" "grep -q 'hole rendered at'
 # (Note /ssr DOES have one under cacheComponents: its shell is the
 # loading fallback, and serving it is correct protocol behavior.)
 expect "shell endpoint 404 for non-PPR route" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/cached)" = "404"
+
+# An edge shell moves the response HEAD to the CDN, committed before the
+# origin renders a byte. Anything the request was going to decide at the
+# origin — a proxy redirect, a Set-Cookie, a non-200 — becomes
+# unreachable: the CDN has already sent 200 + headers and can only append
+# body bytes. So a route whose head isn't the build's to predict must
+# never have a shell to hand out.
+#
+# Middleware coverage is the one form of that we can see statically, and
+# Tier 2 already refuses those routes for exactly this reason. The shell
+# endpoint handed them out anyway — which in production silently disabled
+# the proxy on every warm-shell hit, so auth redirects lost the cookie
+# carrying where the user had been headed.
+#
+# Vacuity guard first: a proxy file Next ignored would make the exclusion
+# below pass for the wrong reason.
+expect_sh "adapter snapshot records the proxy matcher" "python3 -c \"
+import json
+s = json.load(open('$APP/.next/nbc-adapter-outputs.json'))
+assert s['middlewareMatchers'], 'no matchers recorded — is proxy.ts picked up?'
+\""
+expect "shell endpoint 404s for a proxy-covered PPR route" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr-guarded)" = "404"
+# ...while the route itself is untouched: still rendered, still gated.
+expect "proxy-covered route still serves from the origin" test "$(code_of http://127.0.0.1:$PORT/ppr-guarded)" = "200"
+expect_sh "proxy still decides the head on the covered route" "curl -s -D- -o /dev/null 'http://127.0.0.1:$PORT/ppr-guarded?bounce=1' | tr -d '\r' | grep -qi '^set-cookie: guarded=1'"
+
 # Encoded traversal: %2F survives URL normalization, so this is the form
 # that actually reaches the handler's path check.
 expect "shell endpoint rejects path traversal" test "$(code_of --path-as-is "http://127.0.0.1:$PORT/_nbc/ppr-shell/..%2F..%2FBUILD_ID")" = "404"

@@ -25,6 +25,26 @@
  * Optional env var (wrangler.toml [vars] or a secret):
  *   SHELL_TOKEN — sent as x-nbc-shell-token when the origin runs the
  *                 endpoint in token mode (NBC_PPR_SHELL=<token>).
+ *
+ * ── Which routes may be listed in wrangler.toml ──────────────────────
+ *
+ * Serving a shell commits the response head HERE, at the edge, before
+ * the origin has rendered anything. Only body bytes can follow. So:
+ *
+ *   A route that can emit a Set-Cookie, a redirect, or a non-200 status
+ *   before or during its dynamic render must never be routed here.
+ *
+ * The origin enforces the statically-provable half of that on its own:
+ * next-bun-compile withholds a shell for any route a proxy matcher or a
+ * response-altering routing rule covers, so /_nbc/ppr-shell/<route>
+ * 404s, this Worker tombstones it, and the route passes through for
+ * good. Auth gates are covered by that.
+ *
+ * The rest is on whoever writes the route list. A `redirect()` or
+ * `notFound()` reached from inside a dynamic hole is invisible to the
+ * build and fails the same way — the redirect is swallowed and the
+ * visitor is left holding the shell's Suspense fallbacks. Route only
+ * pages whose response head is a foregone conclusion.
  */
 
 // How long a PoP may hold a shell, and how long before a warm hit checks
@@ -134,12 +154,30 @@ export default {
       ctx.waitUntil(
         (async () => {
           const res = await fetchShell(shellUrl, env);
+          if (res.status === 404) {
+            // Not a failure — a standing answer. The origin has no shell
+            // for this route: either no PPR pair, or a route whose
+            // response head it refuses to hand to a CDN (see above).
+            // Either way it will keep saying 404 until the next deploy.
+            // Record that, or this warm re-runs on every document load
+            // forever, spending a subrequest each time to be told the
+            // same thing. The deploy purge clears the tombstone along
+            // with everything else.
+            await caches.default.put(
+              cacheKey,
+              new Response(JSON.stringify({ noShell: true }), {
+                headers: shellHeaders(res),
+              })
+            );
+            debug(`shell absent ${url.pathname} — tombstoned`);
+            return;
+          }
           if (!res.ok) {
             // A warm that never succeeds is otherwise invisible: the
             // visitor still gets a correct page from the origin, so the
             // only symptom is an edge that never warms. 401 means the
-            // token doesn't match the origin's NBC_PPR_SHELL, 404 that
-            // the route has no PPR pair to hand out.
+            // token doesn't match the origin's NBC_PPR_SHELL. Transient
+            // or misconfigured — keep retrying, and keep saying so.
             console.log(
               `shell warm failed ${url.pathname}: status=${res.status}`
             );
@@ -189,6 +227,11 @@ export default {
       entry = await cached.json();
     } catch {
       entry = null;
+    }
+    if (entry && entry.noShell) {
+      // Tombstone from a prior warm: this route is the origin's alone.
+      debug(`shell absent ${url.pathname} (cached) — passing through`);
+      return passThrough();
     }
     if (!entry || !entry.shell || !entry.postponed) {
       // A cached entry that can't be used is worth hearing about
