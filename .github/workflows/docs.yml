@@ -24,8 +24,9 @@ jobs:
         with:
           bun-version: latest
 
+      # Keeps this workflow's pinned setup-bun; just the install is retried.
       - name: Install dependencies
-        run: bun install
+        run: $GITHUB_WORKSPACE/.github/scripts/retry.sh bun install
         working-directory: docs
 
       - name: Build

@@ -12,12 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
+      - uses: ./.github/actions/bun-setup
 
       - name: Build
         run: bun run build
@@ -55,14 +50,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - uses: ./.github/actions/bun-setup
 
       - name: Build next-bun-compile
-        run: |
-          bun install
-          bun run build
+        run: bun run build
 
       - name: Pin Next.js ${{ matrix.next }} in example
         working-directory: examples/vps-deploy
@@ -72,7 +63,7 @@ jobs:
           # cache-copy error, so avoid it.
           node -e "const p=require('./package.json');p.dependencies.next='${{ matrix.next }}';p.dependencies.react='${{ matrix.react }}';p.dependencies['react-dom']='${{ matrix.react }}';require('fs').writeFileSync('./package.json',JSON.stringify(p,null,2)+'\n')"
           rm -rf node_modules bun.lock
-          bun install
+          $GITHUB_WORKSPACE/.github/scripts/retry.sh bun install
           echo "Using Next.js: $(node -p "require('next/package.json').version")"
 
       - name: Compile binary
@@ -113,14 +104,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - uses: ./.github/actions/bun-setup
 
       - name: Build next-bun-compile
-        run: |
-          bun install
-          bun run build
+        run: bun run build
 
       - name: Run regression suite
         run: bun run test:regression
@@ -132,18 +119,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - uses: ./.github/actions/bun-setup
 
       - name: Build next-bun-compile
-        run: |
-          bun install
-          bun run build
+        run: bun run build
 
       - name: Install example deps
         working-directory: examples/sharp
-        run: bun install
+        run: $GITHUB_WORKSPACE/.github/scripts/retry.sh bun install
 
       - name: Compile example binary
         working-directory: examples/sharp
@@ -190,18 +173,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - uses: ./.github/actions/bun-setup
 
       - name: Build next-bun-compile
-        run: |
-          bun install
-          bun run build
+        run: bun run build
 
       - name: Install monorepo deps (workspaces)
         working-directory: examples/monorepo
-        run: bun install
+        run: $GITHUB_WORKSPACE/.github/scripts/retry.sh bun install
 
       - name: Compile web app binary
         working-directory: examples/monorepo/apps/web
