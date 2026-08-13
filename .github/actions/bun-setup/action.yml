@@ -1,0 +1,31 @@
+name: Bun setup
+description: Install Bun, restore the shared module cache, and run a retried `bun install`.
+
+inputs:
+  install:
+    description: Run `bun install` at the repo root. Set false for jobs that install elsewhere.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    # Six jobs plus a four-way matrix each installed the same tree from
+    # scratch, so one CI run made ~10 cold trips to the registry for
+    # Next's tarball alone — ten independent chances to draw a transient
+    # extract failure. The cache collapses that to one download per
+    # lockfile change; the retry below covers the download that remains.
+    - uses: actions/cache@v4
+      with:
+        path: ~/.bun/install/cache
+        key: bun-cache-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+        restore-keys: |
+          bun-cache-${{ runner.os }}-
+
+    - if: inputs.install == 'true'
+      shell: bash
+      run: .github/scripts/retry.sh bun install
