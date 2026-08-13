@@ -168,12 +168,16 @@ sleep 1
 expect_sh "aborted connections are silent (no unhandledRejection)" "! grep -q 'unhandledRejection\|Error: aborted' '$SERVER_LOG'"
 
 # The other half of the same problem: a client that vanishes mid-UPLOAD,
-# while the handler is still reading the request body. That tears down the
-# Readable.fromWeb wrapper around the incoming web stream, whose cancelled
-# reader rejected with nowhere to go — "unhandledRejection: AbortError:
-# The operation was aborted". Distinct from the response-side abort above,
-# which is why that check stayed green while this fired in production on
-# every dropped upload.
+# while the handler is still reading the request body. That tears down a
+# different path — the Readable.fromWeb wrapper around the incoming web
+# stream — which the response-side check above cannot reach, so its
+# staying green says nothing about this one.
+#
+# No bug here: this was written to test a suspected leak in that path
+# (a cancelled reader rejecting with nowhere to go, the way the
+# response side once did) and it disproved it. Kept because the gap in
+# coverage was real even though the leak wasn't — nothing else in this
+# suite aborts a request while the server is still reading it.
 cat > "$WORK/abort-upload.js" <<'EOF'
 const url = process.argv[2];
 for (let i = 0; i < 5; i++) {
