@@ -131,6 +131,50 @@ expect "ETag revalidation → 304" test "$(code_of -H "If-None-Match: $ETAG" htt
 ENC=$(curl -s -D- -o /dev/null -H "Accept-Encoding: gzip" http://127.0.0.1:$PORT/ | grep -ci 'content-encoding: gzip' || true)
 expect "gzip negotiation on tier page" test "$ENC" = "1"
 
+# --- variant isolation in the L1 -------------------------------------------
+#
+# The L1 key encodes RSC-vs-HTML and gzip-vs-identity alongside the pathname.
+# If it ever stopped encoding one of them, an entry stored for one variant
+# would answer a request for another — the same defect as the cross-caller
+# leak (a key that fails to capture a dimension the response varies on), with
+# a wrong body instead of a wrong identity. The checks above negotiate each
+# variant once, in isolation, which a single-variant cache would still pass.
+# These interleave first, so a stored entry gets the chance to be wrong.
+#
+# /cached is the target because it is the L1-eligible route: cacheable, and
+# not covered by the proxy matcher.
+# An L1 entry can be created but never replaced — a request that hits one
+# returns it rather than storing its own. So each direction needs a route that
+# is COLD for the variant primed first, and the two directions cannot share a
+# route. /cached is already HTML-warm from the ISR check above, which is
+# exactly what the RSC-direction assertion needs; /cached-variant exists
+# untouched for the reverse. Getting this wrong is silent: the assertion
+# passes because nothing was ever stored to contradict it.
+prime() { local p="$1"; shift; for _ in 1 2 3; do curl -s -o /dev/null "$@" "http://127.0.0.1:$PORT$p"; done; }
+
+# /cached is warm with HTML → an RSC request must not be answered from it.
+V_RSC=$(curl -s -D- -o /dev/null -H 'RSC: 1' -H 'Accept-Encoding: identity' "http://127.0.0.1:$PORT/cached" | tr -d '\r')
+expect_sh "RSC request never served HTML after plain traffic" "echo '$V_RSC' | grep -qi '^content-type: text/x-component'"
+
+# /cached-variant is cold → prime it with RSC only, then ask plainly.
+prime /cached-variant -H 'RSC: 1'
+V_HTML=$(curl -s -D- -o /dev/null -H 'Accept-Encoding: identity' "http://127.0.0.1:$PORT/cached-variant" | tr -d '\r')
+expect_sh "plain request never served an RSC payload after RSC traffic" "echo '$V_HTML' | grep -qi '^content-type: text/html'"
+
+# No encoding-confusion assertion here on purpose. One was written and then
+# removed: dropping the encoding dimension from the L1 key left the whole
+# suite green, because compression happens below this cache — the stored
+# bytes are always identity, so there is only ever one encoding variant to
+# confuse. The check passed whether or not the key encoded anything, which
+# makes it worse than absent: it reads as coverage of a dimension nothing
+# actually tests. `gzip negotiation on tier page` above covers what is real.
+
+# An ETag minted for one variant must not satisfy a request for another: the
+# client would revalidate successfully and reuse a body it cannot parse.
+V_ETAG=$(echo "$V_HTML" | grep -i '^etag:' | cut -d' ' -f2)
+expect_sh "cached route serves an ETag (so the next check is load-bearing)" "test -n '$V_ETAG'"
+expect "HTML ETag does not 304 an RSC request" test "$(code_of -H 'RSC: 1' -H "If-None-Match: $V_ETAG" http://127.0.0.1:$PORT/cached)" != "304"
+
 ACTION_ID=$(curl -s http://127.0.0.1:$PORT/action | grep -o 'name="\$ACTION_ID_[^"]*"' | head -1 | cut -d'"' -f2)
 expect_sh "server action POST executes (no-JS form)" "test -n '$ACTION_ID' && test \$(curl -s -o /dev/null -w '%{http_code}' -X POST -F '$ACTION_ID=' http://127.0.0.1:$PORT/action) = 200"
 expect_sh "pages healthy after tag invalidation (tier drop path)" "test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/) = 200 && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/cached) = 200"
