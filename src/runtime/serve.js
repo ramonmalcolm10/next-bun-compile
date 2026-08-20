@@ -851,6 +851,16 @@ async function start(opts) {
     }
   };
   let l1Enabled = enableL1; // also turned off if the hook can't install
+  // Middleware owns the response head on the routes it covers, and it runs
+  // upstream of the render this cache stores. Whatever it attaches — a
+  // Set-Cookie, an x-user-id, a CSRF token — belongs to one caller, and the
+  // L1 key has no identity in it. The header-level guards in l1Ttl are the
+  // backstop for routes no matcher covers (a page that sets a cookie itself);
+  // this is the primary defence, and it is the same coverage rule that
+  // already revokes tier-2 eligibility and refuses an edge-served shell. A
+  // shared cache is a shared cache — the invariant does not change because
+  // this one happens to live in-process.
+  const l1ProxyCovered = shellGuard(shellGuards);
   const l1Cacheable = (req) => {
     if (!l1Enabled) return null;
     if (req.method !== "GET") return null;
@@ -866,6 +876,7 @@ async function start(opts) {
     const cookie = req.headers.get("cookie");
     if (cookie && cookie.includes("__prerender_bypass")) return null;
     const url = new URL(req.url);
+    if (l1ProxyCovered(url.pathname)) return null;
     const rsc = req.headers.has("rsc") || url.searchParams.has("_rsc");
     return `${url.pathname}|${rsc ? "r" : "h"}|${acceptsGzip(req) ? "z" : "i"}`;
   };

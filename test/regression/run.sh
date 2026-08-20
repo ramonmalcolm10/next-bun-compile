@@ -329,6 +329,15 @@ SLIDE_ANON=$(curl -s -D- -o /dev/null "http://127.0.0.1:$PORT/sliding" | tr -d '
 expect_sh "second caller never receives the first caller's session" "! echo '$SLIDE_B' | grep -qi 'set-cookie: session=alice'"
 expect_sh "anonymous caller never receives a session at all" "! echo '$SLIDE_ANON' | grep -qi 'set-cookie: session='"
 expect_sh "second caller still gets their own session" "echo '$SLIDE_B' | grep -qi '^set-cookie: session=bob'"
+# Per-caller state as a header with no Set-Cookie beside it. Next adds no
+# `Vary: Cookie` when middleware does this, so neither the Set-Cookie guard
+# nor the Vary guard fires — coverage has to carry it.
+HDR_A=$(curl -s -D- -o /dev/null -H 'Cookie: hdr=alice' "http://127.0.0.1:$PORT/sliding" | tr -d '\r')
+expect_sh "proxy issues a per-caller header with no cookie beside it" "echo '$HDR_A' | grep -qi '^x-caller: alice' && ! echo '$HDR_A' | grep -qi '^set-cookie:'"
+HDR_B=$(curl -s -D- -o /dev/null -H 'Cookie: hdr=bob' "http://127.0.0.1:$PORT/sliding" | tr -d '\r')
+HDR_ANON=$(curl -s -D- -o /dev/null "http://127.0.0.1:$PORT/sliding" | tr -d '\r')
+expect_sh "second caller never receives the first caller's header" "! echo '$HDR_B' | grep -qi 'x-caller: alice'"
+expect_sh "anonymous caller never receives a caller header" "! echo '$HDR_ANON' | grep -qi 'x-caller:'"
 
 # Encoded traversal: %2F survives URL normalization, so this is the form
 # that actually reaches the handler's path check.

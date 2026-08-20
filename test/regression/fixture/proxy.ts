@@ -18,6 +18,14 @@ export function proxy(request: NextRequest) {
     const res = NextResponse.next();
     const who = request.cookies.get("who")?.value;
     if (who) res.cookies.set("session", who);
+    // Per-caller state as a plain response header, with NO Set-Cookie beside
+    // it — middleware does this routinely (x-user-id, a CSRF token, a locale).
+    // Kept on its own caller key so the Set-Cookie guard cannot shadow it:
+    // if both rode the same response, refusing the entry for the cookie would
+    // hide whether the header was ever constrained on its own terms. Next adds
+    // no `Vary: Cookie` here, so the Vary guard does not see it either.
+    const hdr = request.cookies.get("hdr")?.value;
+    if (hdr) res.headers.set("x-caller", hdr);
     return res;
   }
 
