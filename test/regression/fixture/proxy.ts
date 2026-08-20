@@ -10,6 +10,25 @@ import { NextRequest, NextResponse } from "next/server";
  * before the route renders a single byte.
  */
 export function proxy(request: NextRequest) {
+  // Sliding-expiry session refresh: re-issue the caller's session cookie on a
+  // normal 200 pass-through. Stands in for any auth proxy that touches the
+  // session on each navigation — the response body is shared and cacheable,
+  // but the head now carries one caller's identity.
+  if (request.nextUrl.pathname === "/sliding") {
+    const res = NextResponse.next();
+    const who = request.cookies.get("who")?.value;
+    if (who) res.cookies.set("session", who);
+    // Per-caller state as a plain response header, with NO Set-Cookie beside
+    // it — middleware does this routinely (x-user-id, a CSRF token, a locale).
+    // Kept on its own caller key so the Set-Cookie guard cannot shadow it:
+    // if both rode the same response, refusing the entry for the cookie would
+    // hide whether the header was ever constrained on its own terms. Next adds
+    // no `Vary: Cookie` here, so the Vary guard does not see it either.
+    const hdr = request.cookies.get("hdr")?.value;
+    if (hdr) res.headers.set("x-caller", hdr);
+    return res;
+  }
+
   if (request.nextUrl.searchParams.has("bounce")) {
     const res = NextResponse.redirect(new URL("/", request.url));
     res.cookies.set("guarded", "1");
@@ -19,5 +38,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/ppr-guarded"],
+  matcher: ["/ppr-guarded", "/sliding"],
 };

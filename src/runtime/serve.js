@@ -851,6 +851,16 @@ async function start(opts) {
     }
   };
   let l1Enabled = enableL1; // also turned off if the hook can't install
+  // Middleware owns the response head on the routes it covers, and it runs
+  // upstream of the render this cache stores. Whatever it attaches — a
+  // Set-Cookie, an x-user-id, a CSRF token — belongs to one caller, and the
+  // L1 key has no identity in it. The header-level guards in l1Ttl are the
+  // backstop for routes no matcher covers (a page that sets a cookie itself);
+  // this is the primary defence, and it is the same coverage rule that
+  // already revokes tier-2 eligibility and refuses an edge-served shell. A
+  // shared cache is a shared cache — the invariant does not change because
+  // this one happens to live in-process.
+  const l1ProxyCovered = shellGuard(shellGuards);
   const l1Cacheable = (req) => {
     if (!l1Enabled) return null;
     if (req.method !== "GET") return null;
@@ -866,11 +876,45 @@ async function start(opts) {
     const cookie = req.headers.get("cookie");
     if (cookie && cookie.includes("__prerender_bypass")) return null;
     const url = new URL(req.url);
+    if (l1ProxyCovered(url.pathname)) return null;
     const rsc = req.headers.has("rsc") || url.searchParams.has("_rsc");
     return `${url.pathname}|${rsc ? "r" : "h"}|${acceptsGzip(req) ? "z" : "i"}`;
   };
   const l1Ttl = (res) => {
     if (res.status !== 200) return 0;
+    // A Set-Cookie is per-requester by definition, and the L1 key is just
+    // pathname + variant — no identity in it. Caching a response that carries
+    // one replays that cookie to every later requester of the same path, which
+    // hands them the first requester's session. Middleware is upstream of the
+    // cached render and can attach a Set-Cookie to an otherwise cacheable
+    // prerendered page (a session-refresh/sliding-expiry proxy does it on
+    // roughly every navigation), so `x-nextjs-cache: HIT` is no evidence the
+    // head is shared-safe. Refuse the entry outright rather than stripping the
+    // header: a response that needed to set a cookie has per-requester state,
+    // and serving its body while dropping the cookie silently breaks it.
+    if (res.headers.has("set-cookie")) return 0;
+    // The key encodes exactly three dimensions: pathname, RSC-vs-HTML, and
+    // gzip-vs-identity. A response that Vary's on anything else has variants
+    // this key cannot tell apart, so one caller's variant would be served to
+    // another. Fail closed on any dimension we don't provably key on — a
+    // future Next version adding a Vary then degrades to "not cached" rather
+    // than to "cross-served", and an app that adds its own (a locale, a device
+    // class, Cookie) is safe by default instead of quietly broken.
+    const vary = res.headers.get("vary") ?? "";
+    if (vary) {
+      for (const field of vary.split(",")) {
+        const f = field.trim().toLowerCase();
+        if (!f) continue;
+        // Keyed: encoded in the L1 key. Excluded: l1Cacheable already refuses
+        // any request carrying these, so they cannot reach a stored entry.
+        const keyed = f === "rsc" || f === "accept-encoding";
+        const excluded =
+          f === "next-router-state-tree" ||
+          f === "next-router-prefetch" ||
+          f === "next-router-segment-prefetch";
+        if (!keyed && !excluded) return 0;
+      }
+    }
     if (res.headers.get("x-nextjs-cache") !== "HIT") return 0;
     const cc = res.headers.get("cache-control") ?? "";
     const m = cc.match(/s-maxage=(\d+)/);
