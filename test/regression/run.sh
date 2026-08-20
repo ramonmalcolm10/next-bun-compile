@@ -310,6 +310,26 @@ expect "shell endpoint 404s for a proxy-covered PPR route" test "$(code_of http:
 expect "proxy-covered route still serves from the origin" test "$(code_of http://127.0.0.1:$PORT/ppr-guarded)" = "200"
 expect_sh "proxy still decides the head on the covered route" "curl -s -D- -o /dev/null 'http://127.0.0.1:$PORT/ppr-guarded?bounce=1' | tr -d '\r' | grep -qi '^set-cookie: guarded=1'"
 
+# --- L1 must never replay one caller's Set-Cookie to another ---------------
+#
+# /sliding is a cacheable 200 (x-nextjs-cache: HIT, long s-maxage, no
+# `private`) whose head carries a per-caller session cookie set by the proxy.
+# The L1 key is pathname + variant with no identity in it, so caching such a
+# response hands the first caller's session to everyone who follows.
+#
+# This shipped: a signed-in user's session was replayed to an unrelated
+# visitor, who then acted as them. Every guard looked reasonable in isolation
+# — the giveaway is only visible across two requests from different callers.
+SLIDE_A=$(curl -s -D- -o /dev/null -H 'Cookie: who=alice' "http://127.0.0.1:$PORT/sliding" | tr -d '\r')
+expect_sh "proxy issues the caller's own session on a cacheable 200" "echo '$SLIDE_A' | grep -qi '^set-cookie: session=alice'"
+expect_sh "the leak precondition holds (response is L1-eligible)" "echo '$SLIDE_A' | grep -qi '^x-nextjs-cache: HIT' && echo '$SLIDE_A' | grep -qi '^cache-control:.*s-maxage'"
+
+SLIDE_B=$(curl -s -D- -o /dev/null -H 'Cookie: who=bob' "http://127.0.0.1:$PORT/sliding" | tr -d '\r')
+SLIDE_ANON=$(curl -s -D- -o /dev/null "http://127.0.0.1:$PORT/sliding" | tr -d '\r')
+expect_sh "second caller never receives the first caller's session" "! echo '$SLIDE_B' | grep -qi 'set-cookie: session=alice'"
+expect_sh "anonymous caller never receives a session at all" "! echo '$SLIDE_ANON' | grep -qi 'set-cookie: session='"
+expect_sh "second caller still gets their own session" "echo '$SLIDE_B' | grep -qi '^set-cookie: session=bob'"
+
 # Encoded traversal: %2F survives URL normalization, so this is the form
 # that actually reaches the handler's path check.
 expect "shell endpoint rejects path traversal" test "$(code_of --path-as-is "http://127.0.0.1:$PORT/_nbc/ppr-shell/..%2F..%2FBUILD_ID")" = "404"

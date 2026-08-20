@@ -10,6 +10,17 @@ import { NextRequest, NextResponse } from "next/server";
  * before the route renders a single byte.
  */
 export function proxy(request: NextRequest) {
+  // Sliding-expiry session refresh: re-issue the caller's session cookie on a
+  // normal 200 pass-through. Stands in for any auth proxy that touches the
+  // session on each navigation — the response body is shared and cacheable,
+  // but the head now carries one caller's identity.
+  if (request.nextUrl.pathname === "/sliding") {
+    const res = NextResponse.next();
+    const who = request.cookies.get("who")?.value;
+    if (who) res.cookies.set("session", who);
+    return res;
+  }
+
   if (request.nextUrl.searchParams.has("bounce")) {
     const res = NextResponse.redirect(new URL("/", request.url));
     res.cookies.set("guarded", "1");
@@ -19,5 +30,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/ppr-guarded"],
+  matcher: ["/ppr-guarded", "/sliding"],
 };
