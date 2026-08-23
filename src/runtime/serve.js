@@ -761,6 +761,156 @@ function selfOrigin(hostname) {
     : hostname;
 }
 
+/* L1 memory budget. A fixed default is wrong in both directions — 64MB is a
+ * quarter of a 256MB pod's entire allowance and a rounding error on a 4GB one
+ * — so the ceiling is derived from the container's own limit where there is
+ * one, clamped at both ends and overridable outright. */
+const L1_DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
+const L1_MIN_MAX_BYTES = 8 * 1024 * 1024; // below this the tier evicts on nearly every store
+const L1_MAX_MAX_BYTES = 512 * 1024 * 1024; // past this we're hoarding, not caching
+const L1_LIMIT_DIVISOR = 8; // share of the container limit the tier may hold
+
+/**
+ * The container's memory limit in bytes, or null if there isn't one.
+ *
+ * cgroup v2 (every current Kubernetes node) exposes `memory.max`, which reads
+ * the literal string "max" when unbounded. v1 exposes `limit_in_bytes`, which
+ * signals unbounded with a sentinel near 2^63 rather than a word. Neither file
+ * exists off Linux. All three cases mean the same thing here: nothing to scale
+ * against.
+ */
+function readCgroupLimit(readFile = (p) => fs.readFileSync(p, "utf8")) {
+  for (const p of [
+    "/sys/fs/cgroup/memory.max", // v2
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1
+  ]) {
+    let raw;
+    try {
+      raw = readFile(p);
+    } catch {
+      continue; // not this version, or not in a container at all
+    }
+    const text = String(raw).trim();
+    // Named for the reader, not for the logic: "max" parses to NaN and ""
+    // to 0, so the numeric guard below would reject both anyway. Spelled out
+    // because "max" is the value a v2 file actually holds most of the time.
+    if (text === "" || text === "max") return null;
+    const n = Number(text);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    // v1's "unlimited" sentinel is a number, so it has to be recognised by
+    // magnitude — anything at that scale is not a real limit.
+    if (n >= Number.MAX_SAFE_INTEGER) return null;
+    return n;
+  }
+  return null;
+}
+
+/** Resolve the L1's byte ceiling: explicit override, else a share of the limit. */
+function resolveL1Budget(opts = {}) {
+  const { env = process.env, readCgroupLimit: read = readCgroupLimit } = opts;
+  // An explicit value is the operator's call — including a deliberately tiny
+  // one — so it bypasses the clamps entirely.
+  const explicit = Number(env.NBC_L1_MAX_BYTES);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+
+  const limit = read();
+  if (limit == null) return L1_DEFAULT_MAX_BYTES;
+  const derived = Math.floor(limit / L1_LIMIT_DIVISOR);
+  return Math.min(L1_MAX_MAX_BYTES, Math.max(L1_MIN_MAX_BYTES, derived));
+}
+
+/**
+ * The L1's backing store, bounded by total body bytes as well as entry count.
+ *
+ * An entry cap alone says nothing about memory: 256 entries is 25MB of 100KB
+ * pages but 512MB of 2MB pages, and the tier can't tell the difference. The
+ * byte budget is the real ceiling; the entry cap stays because a budget alone
+ * lets tiny responses pile up until per-entry overhead (key string, Headers,
+ * Map slot) dwarfs the bodies it is counting.
+ *
+ * Only `body` is accounted. Headers are small and bounded by what Next emits,
+ * and guessing at their retained size would buy precision the ceiling doesn't
+ * need — the budget is a safety bound, not an allocator.
+ */
+function createL1Store({ maxBytes, maxEntries }) {
+  const map = new Map(); // key → { body, status, headers, expires }
+  let bytes = 0;
+  const store = {
+    get size() {
+      return map.size;
+    },
+    get bytes() {
+      return bytes;
+    },
+    get: (key) => map.get(key),
+    keys: () => map.keys(),
+    delete(key) {
+      const entry = map.get(key);
+      if (entry === undefined) return false;
+      bytes -= entry.body.byteLength;
+      return map.delete(key);
+    },
+    clear() {
+      map.clear();
+      bytes = 0;
+    },
+    /** Drop every variant of one pathname (all keys are `${path}|...`). */
+    dropPath(p) {
+      for (const key of [...map.keys()]) {
+        if (key.startsWith(p + "|")) store.delete(key);
+      }
+    },
+    set(key, entry) {
+      store.delete(key); // replacing: retire the old body's accounting first
+      const size = entry.body.byteLength;
+      // An entry that can never fit would evict the whole tier and then sit
+      // there alone — strictly worse than serving that route from origin.
+      if (size > maxBytes) return false;
+      while (map.size > 0 && (bytes + size > maxBytes || map.size + 1 > maxEntries)) {
+        store.delete(map.keys().next().value); // oldest insertion first
+      }
+      map.set(key, entry);
+      bytes += size;
+      return true;
+    },
+  };
+  return store;
+}
+
+/**
+ * Drop `cache` when the OS reports memory pressure. Returns an unbind fn.
+ *
+ * This is a backstop, not the ceiling — createL1Store's byte budget is what
+ * actually bounds the tier. Measured, `clear()` returns the heap (16MB → 0.1MB
+ * for 256 100KB entries) but not RSS: mimalloc keeps the pages, and the cgroup
+ * accounting the OOM killer reads is RSS. So dropping stops further growth, it
+ * does not undo growth. What it does buy is reusable headroom — refilling the
+ * same 25MB after a clear cost 8MB of new RSS rather than 25MB — which is
+ * worth having when renders are competing for memory.
+ *
+ * The cooldown is load-bearing. Each drop/refill round costs those ~8MB of
+ * fresh pages plus the throughput cliff of serving from origin, and Linux
+ * raises pressure from a PSI trigger that can fire repeatedly; without a
+ * floor between drops the handler ratchets memory upward while making the
+ * process slower. Bun reports "warning" then "critical" on macOS and only
+ * "critical" on Linux and Windows — every level drops, since by the time the
+ * one signal you get on Linux arrives it is already urgent. The listener does
+ * not hold the event loop open.
+ */
+function bindMemoryPressure(cache, target = process, opts = {}) {
+  const { cooldownMs = 30_000, now = Date.now } = opts;
+  let nextAllowed = 0;
+  const onPressure = () => {
+    if (cache.size === 0) return;
+    const t = now();
+    if (t < nextAllowed) return;
+    nextAllowed = t + cooldownMs;
+    cache.clear();
+  };
+  target.on("memoryPressure", onPressure);
+  return () => target.off("memoryPressure", onPressure);
+}
+
 async function start(opts) {
   const {
     assetMap,
@@ -844,13 +994,14 @@ async function start(opts) {
    * exceeds the response's own s-maxage.
    * ------------------------------------------------------------ */
   const L1_MAX_ENTRIES = 256;
-  const l1 = new Map(); // key → { body, status, headers, expires }
-  const l1DropPath = (p) => {
-    for (const key of l1.keys()) {
-      if (key.startsWith(p + "|")) l1.delete(key);
-    }
-  };
+  const L1_MAX_BYTES = resolveL1Budget();
+  const l1 = createL1Store({
+    maxBytes: L1_MAX_BYTES,
+    maxEntries: L1_MAX_ENTRIES,
+  });
+  const l1DropPath = (p) => l1.dropPath(p);
   let l1Enabled = enableL1; // also turned off if the hook can't install
+  bindMemoryPressure(l1);
   // Middleware owns the response head on the routes it covers, and it runs
   // upstream of the render this cache stores. Whatever it attaches — a
   // Set-Cookie, an x-user-id, a CSRF token — belongs to one caller, and the
@@ -945,9 +1096,7 @@ async function start(opts) {
     new Response(toCache)
       .arrayBuffer()
       .then((buf) => {
-        if (l1.size >= L1_MAX_ENTRIES) {
-          l1.delete(l1.keys().next().value); // drop oldest insertion
-        }
+        // Eviction to fit the byte and entry budgets happens inside set().
         const headers = new Headers(res.headers);
         headers.delete("transfer-encoding");
         headers.set("content-length", String(buf.byteLength));
@@ -1124,6 +1273,13 @@ async function start(opts) {
   console.log(
     `   - Static:   ${tier1.length} assets, ${tier2Paths.size} prerendered pages served from memory`
   );
+  if (l1Enabled) {
+    // Worth printing: the ceiling is derived from the container limit, so an
+    // operator who sizes a pod down has no other way to see the tier follow.
+    console.log(
+      `   - Cache:    response cache up to ${Math.round(L1_MAX_BYTES / 1024 / 1024)}MB / ${L1_MAX_ENTRIES} entries`
+    );
+  }
   return server;
 }
 
@@ -1136,4 +1292,8 @@ module.exports._internal = {
   makeNodeRequest,
   selfOrigin,
   shellGuard,
+  bindMemoryPressure,
+  createL1Store,
+  readCgroupLimit,
+  resolveL1Budget,
 };
