@@ -27,7 +27,39 @@ time so container boots skip extraction. See
 | `NBC_TARGET`               | host platform  | Cross-compile target, e.g. `bun-linux-x64`. See [Cross-compilation](/next-bun-compile/guides/cross-compilation/). |
 | `NBC_OUT`                  | project root   | Directory for the compiled binary (created if missing), relative to the project or absolute. See [Where the binary appears](#where-the-binary-appears). |
 | `NBC_BINARY`               | `server`       | Filename of the compiled binary.                                  |
+| `NBC_BUILD_ARGS`           | —              | Extra flags appended to the `bun build` invocation, whitespace-separated. See [Extra build flags](#extra-build-flags). |
 | `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
+
+## Extra build flags
+
+`NBC_BUILD_ARGS` appends flags to the `bun build` call that produces the
+binary, after the adapter's own defaults. The adapter runs inside `next build`
+and has no argv of its own, so this is the only way in.
+
+```bash
+NBC_BUILD_ARGS="--bytecode" next build
+```
+
+Flags only — the value is split on whitespace, with no quoting.
+
+### Should you enable `--bytecode`?
+
+Usually not. Bun's bytecode cache covers the statically bundled entry graph,
+but almost all request-path code — Next itself, SSR chunks, your pages,
+externalised packages — is extracted to disk and loaded through computed
+requires the bundler never sees. Measured on `examples/vps-deploy` (bun 1.4.0,
+macOS arm64, 25 interleaved warm boots, median):
+
+|                                | default   | `--bytecode` | change |
+| ------------------------------ | --------- | ------------ | ------ |
+| Time to listening              | 34.8 ms   | 28.9 ms      | −17%   |
+| Time to first dynamic response | 177.3 ms  | 175.7 ms     | −0.9%  |
+| Binary size                    | 76.7 MB   | 78.2 MB      | +2.0%  |
+
+The ~6 ms saved on the entry graph disappears behind the ~145 ms spent
+requiring Next off the extracted tree. It is worth enabling only if your app is
+served entirely from Tier 1 / Tier 2 routes and never initialises Next, in
+which case you only ever pay the first row.
 
 ## `next.config.ts` options
 

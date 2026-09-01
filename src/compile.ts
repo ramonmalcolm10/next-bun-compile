@@ -11,11 +11,23 @@ export function compile(options: CompileOptions): void {
   const { serverDir, outfile, extraArgs = [] } = options;
   const entryPoint = join(serverDir, "server-entry.js");
 
-  // No --bytecode: it only covers the statically bundled entry graph, while
-  // nearly all request-path code (SSR chunks, pages, externalized packages)
-  // is extracted raw JS loaded at runtime. Measured on a demo app it added
-  // +30% binary size for zero warm-boot gain. Users can re-add it via CLI
-  // extra args, which append after these defaults.
+  // No --bytecode by default: it only covers the statically bundled entry
+  // graph, while nearly all request-path code (Next itself, SSR chunks,
+  // pages, externalized packages) is extracted raw JS that computed requires
+  // pull in at runtime, where the bundler never saw it.
+  //
+  // Measured on examples/vps-deploy, bun 1.4.0 / macOS arm64, n=25
+  // interleaved, warm boots, median: time-to-listening 34.8ms -> 28.9ms
+  // (-17%), but time-to-first-dynamic-response 177.3ms -> 175.7ms (-0.9%).
+  // The ~6ms bytecode saves on the entry graph is swamped by the ~145ms of
+  // requiring Next off the extracted tree, which bytecode cannot touch.
+  // Binary size +1.5MB (+2.0%).
+  //
+  // Worth enabling only for an app served entirely from tier-1/tier-2
+  // routes, which never initialises Next and so only pays the first number:
+  // NBC_BUILD_ARGS="--bytecode" next build. (An earlier revision of this
+  // comment claimed +30% size; that predated gzip-embedding, which grew the
+  // denominator to ~77MB.)
   const args = [
     "build",
     entryPoint,

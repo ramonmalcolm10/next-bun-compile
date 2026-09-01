@@ -10,7 +10,10 @@ export interface RunBuildOptions {
   standaloneDir: string;
   /** App dir inside that tree (nested for monorepo layouts). */
   serverDir: string;
-  /** Extra args appended to the `bun build` invocation. */
+  /**
+   * Extra args appended to the `bun build` invocation, after the defaults.
+   * Also settable via NBC_BUILD_ARGS — see resolveExtraArgs.
+   */
   extraArgs?: string[];
   /**
    * Output directory for the binary, relative to projectDir (or absolute).
@@ -35,6 +38,27 @@ function resolveOutfile(projectDir: string, options: RunBuildOptions): string {
   const binaryName = options.binaryName ?? process.env.NBC_BINARY ?? "server";
   const base = isAbsolute(outDir) ? outDir : join(projectDir, outDir);
   return join(base, binaryName);
+}
+
+/**
+ * Extra `bun build` flags, from the option or from NBC_BUILD_ARGS. The build
+ * adapter runs inside `next build` with no argv of its own, so env is the only
+ * channel an adapter-driven build has — the same contract NBC_TARGET, NBC_OUT
+ * and NBC_BINARY already use. Env args come last so they can override an
+ * explicit option (bun build takes the last occurrence of a flag).
+ *
+ * Whitespace-separated, no quoting: these are flags, not arguments with
+ * spaces. The flag most likely to appear here is --bytecode — see the
+ * measurements in compile.ts for when that is worth its cost.
+ */
+export function resolveExtraArgs(
+  options: Pick<RunBuildOptions, "extraArgs">
+): string[] {
+  const fromEnv = process.env.NBC_BUILD_ARGS?.trim();
+  return [
+    ...(options.extraArgs ?? []),
+    ...(fromEnv ? fromEnv.split(/\s+/) : []),
+  ];
 }
 
 /**
@@ -110,7 +134,7 @@ async function ensureServerRuntime(
  * the build adapter's onBuildComplete.
  */
 export async function runBuild(options: RunBuildOptions): Promise<string> {
-  const { projectDir, standaloneDir, serverDir, extraArgs = [] } = options;
+  const { projectDir, standaloneDir, serverDir } = options;
   const distDir = join(projectDir, ".next");
 
   await ensureServerRuntime(projectDir, standaloneDir);
@@ -118,6 +142,6 @@ export async function runBuild(options: RunBuildOptions): Promise<string> {
   generateEntryPoint({ standaloneDir, serverDir, distDir, projectDir });
   const outfile = resolveOutfile(projectDir, options);
   mkdirSync(dirname(outfile), { recursive: true });
-  compile({ serverDir, outfile, extraArgs });
+  compile({ serverDir, outfile, extraArgs: resolveExtraArgs(options) });
   return outfile;
 }
