@@ -1162,6 +1162,17 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // reads at ../../<pkg>/... and which never appears under serverDir.
   // `.next/` and `node_modules/` are excluded at any depth — nested stores
   // (.bun/.pnpm) put them well below the root.
+  if (appSubPath) {
+    // Deployments that pre-extract (`server --extract`) or mount into the
+    // tree need this path: the runtime tree lands under it, so a cache
+    // volume aimed at <root>/.next/cache would miss and leave the app
+    // writing to a read-only layer. Printed rather than inferred because
+    // it depends on where Next rooted the trace.
+    console.log(
+      `next-bun-compile: monorepo layout — runtime tree extracts to <NBC_RUNTIME_DIR>/${appSubPath}`
+    );
+  }
+
   const projectFiles = walkDir(standaloneDir)
     .filter((f) => {
       const rel = f.relativePath.replace(/\\/g, "/");
