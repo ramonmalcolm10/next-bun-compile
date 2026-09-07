@@ -20,7 +20,7 @@ your own repo or use the patterns as reference.
 cd examples/sharp
 bun install
 bun --bun run build
-./server
+./dist/app
 
 # Build it as a container
 docker build -t my-app .
