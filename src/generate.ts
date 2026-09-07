@@ -1121,7 +1121,6 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // baseDir — flattening puts siblings above the extraction root, and
   // extraction must never write outside it.
   const appSubPath = relative(standaloneDir, serverDir).replace(/\\/g, "/");
-  const appPrefix = appSubPath ? appSubPath + "/" : "";
 
   // The runtime's invalidation hook is in-process. A custom cacheHandler
   // is typically a shared store (Redis) where an invalidation issued on
@@ -1148,18 +1147,16 @@ export function generateEntryPoint(options: GenerateOptions): string {
     })
     .map((f) => ({
       ...f,
-      urlPath: `__runtime/${appPrefix}.next/${f.relativePath.replace(/\\/g, "/")}`,
+      urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
     }));
 
   // Traced files outside .next/ and node_modules/ (fonts, data files,
   // migrations, anything the app reads through fs at runtime) are part of
   // the assembled tree; they extract next to .next/ so cwd-relative reads
   // find them like they do under `output: "standalone"`.
-  const generated = new Set(
-    ["server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js"].map(
-      (f) => appPrefix + f
-    )
-  );
+  const generated = new Set([
+    "server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js",
+  ]);
   // Walk the whole assembled tree, not just the app dir: in a monorepo a
   // traced file can belong to a sibling workspace package, which the app
   // reads at ../../<pkg>/... and which never appears under serverDir.
@@ -1168,10 +1165,21 @@ export function generateEntryPoint(options: GenerateOptions): string {
   const projectFiles = walkDir(standaloneDir)
     .filter((f) => {
       const rel = f.relativePath.replace(/\\/g, "/");
-      if (generated.has(rel)) return false;
       return !rel.split("/").some((seg) => seg === ".next" || seg === "node_modules");
     })
-    .map((f) => ({ ...f, urlPath: `__runtime/${f.relativePath.replace(/\\/g, "/")}` }));
+    .map((f) => ({
+      f,
+      // Relative to the APP dir, not the tree root: files in the app dir keep
+      // the bare names they always had — prefixing all ~2000 runtime paths
+      // with the workspace path costs ~130KB of string in the generated
+      // tables for nothing — and a sibling package naturally comes out as
+      // ../../<pkg>/..., which is the path the app reads it by. Joined from
+      // appDir it lands back inside baseDir, because appSubPath is exactly
+      // that deep, so extraction still never writes outside its root.
+      rel: relative(serverDir, f.absolutePath).replace(/\\/g, "/"),
+    }))
+    .filter(({ rel }) => !generated.has(rel))
+    .map(({ f, rel }) => ({ ...f, urlPath: `__runtime/${rel}` }));
   runtimeFiles.push(...projectFiles);
   if (projectFiles.length > 0) {
     console.log(`next-bun-compile: Embedding ${projectFiles.length} traced project files`);
@@ -1190,7 +1198,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
     runtimeFiles.push({
       absolutePath: dest,
       relativePath: `__external/${mod}`,
-      urlPath: `__runtime/${appPrefix}.next/node_modules/${mod.replace(/\\/g, "/")}`,
+      urlPath: `__runtime/.next/node_modules/${mod.replace(/\\/g, "/")}`,
     });
   }
   if (externalModules.length > 0) {
@@ -1306,9 +1314,9 @@ export function generateEntryPoint(options: GenerateOptions): string {
     if (a.urlPath.startsWith("__runtime/")) {
       diskPath = a.urlPath.slice("__runtime/".length);
     } else if (a.urlPath.startsWith("/_next/static/")) {
-      diskPath = appPrefix + ".next/static/" + a.relativePath;
+      diskPath = ".next/static/" + a.relativePath;
     } else {
-      diskPath = appPrefix + "public/" + a.relativePath;
+      diskPath = "public/" + a.relativePath;
     }
     return [a.urlPath, diskPath];
   });
@@ -1530,7 +1538,7 @@ async function extractAssets() {
   // pre-placed tampering) shadow the embedded assets forever.
   const dirs = new Set();
   for (const [, diskPath] of extractions) {
-    dirs.add(path.dirname(path.join(baseDir, diskPath)));
+    dirs.add(path.dirname(path.join(appDir, diskPath)));
   }
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 
@@ -1542,7 +1550,7 @@ async function extractAssets() {
       const [urlPath, diskPath] = extractions[idx++];
       const embedded = assetMap.get(urlPath);
       if (!embedded) continue;
-      const fullPath = path.join(baseDir, diskPath);
+      const fullPath = path.join(appDir, diskPath);
       const gz = gzippedAssets.has(urlPath);
       if (gz || rewrittenChunks.has(diskPath)) {
         let bytes = await Bun.file(embedded).bytes();

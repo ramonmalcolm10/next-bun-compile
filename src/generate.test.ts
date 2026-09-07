@@ -167,7 +167,7 @@ describe("generateEntryPoint", () => {
     // and the binary chdirs into it. Flattening would put a sibling
     // package's traced files above the extraction root, which extraction
     // must never write to.
-    expect(assets).toContain("__runtime/apps/web/.next/BUILD_ID");
+    expect(assets).toContain("__runtime/.next/BUILD_ID");
     const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
     expect(entry).toContain('const appDir = path.join(baseDir, "apps/web")');
     expect(entry).toContain("process.chdir(appDir)");
@@ -767,15 +767,17 @@ describe("generateEntryPoint", () => {
     });
 
     const assets = readFileSync(join(serverDir, "assets.generated.js"), "utf-8");
-    expect(assets).toContain("__runtime/packages/shared/data/greeting.json");
+    expect(assets).toContain("__runtime/../../packages/shared/data/greeting.json");
 
     const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
     // Extracts at its workspace path, so cwd/../../packages/... resolves.
-    expect(entry).toContain('"packages/shared/data/greeting.json"');
+    expect(entry).toContain('"../../packages/shared/data/greeting.json"');
     // node_modules stays out, wherever it sits.
     expect(entry).not.toContain("packages/shared/node_modules");
     // The app's own runtime tree moved under the workspace path with it.
-    expect(entry).toContain('"apps/web/.next/BUILD_ID"');
+    // App-dir paths stay bare — prefixing every runtime path with the
+    // workspace path would cost ~130KB of string for no behaviour change.
+    expect(entry).toContain('".next/BUILD_ID"');
   });
 
   test("validator warns when an alias references a missing canonical package", () => {
