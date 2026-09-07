@@ -1112,6 +1112,15 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // package.json + file layout to find the exact main/subpath file to
   // point at.
   const standaloneNextDir = join(serverDir, ".next");
+  // Where the app dir sits inside the assembled tree. Empty for a plain
+  // single-app build (standaloneDir === serverDir); "apps/web" and the like
+  // for a monorepo, where Next preserves the workspace layout so that a
+  // traced file in a sibling package stays reachable at ../../<pkg>. We
+  // mirror that layout under baseDir and chdir into the app dir, exactly as
+  // `output: "standalone"` does, instead of flattening the app dir onto
+  // baseDir — flattening puts siblings above the extraction root, and
+  // extraction must never write outside it.
+  const appSubPath = relative(standaloneDir, serverDir).replace(/\\/g, "/");
 
   // The runtime's invalidation hook is in-process. A custom cacheHandler
   // is typically a shared store (Redis) where an invalidation issued on
@@ -1145,13 +1154,43 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // migrations, anything the app reads through fs at runtime) are part of
   // the assembled tree; they extract next to .next/ so cwd-relative reads
   // find them like they do under `output: "standalone"`.
-  const generated = new Set(["server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js"]);
-  const projectFiles = walkDir(serverDir)
+  const generated = new Set([
+    "server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js",
+  ]);
+  // Walk the whole assembled tree, not just the app dir: in a monorepo a
+  // traced file can belong to a sibling workspace package, which the app
+  // reads at ../../<pkg>/... and which never appears under serverDir.
+  // `.next/` and `node_modules/` are excluded at any depth — nested stores
+  // (.bun/.pnpm) put them well below the root.
+  if (appSubPath) {
+    // Deployments that pre-extract (`server --extract`) or mount into the
+    // tree need this path: the runtime tree lands under it, so a cache
+    // volume aimed at <root>/.next/cache would miss and leave the app
+    // writing to a read-only layer. Printed rather than inferred because
+    // it depends on where Next rooted the trace.
+    console.log(
+      `next-bun-compile: monorepo layout — runtime tree extracts to <NBC_RUNTIME_DIR>/${appSubPath}`
+    );
+  }
+
+  const projectFiles = walkDir(standaloneDir)
     .filter((f) => {
       const rel = f.relativePath.replace(/\\/g, "/");
-      return !rel.startsWith(".next/") && !rel.startsWith("node_modules/") && !generated.has(rel);
+      return !rel.split("/").some((seg) => seg === ".next" || seg === "node_modules");
     })
-    .map((f) => ({ ...f, urlPath: `__runtime/${f.relativePath.replace(/\\/g, "/")}` }));
+    .map((f) => ({
+      f,
+      // Relative to the APP dir, not the tree root: files in the app dir keep
+      // the bare names they always had — prefixing all ~2000 runtime paths
+      // with the workspace path costs ~130KB of string in the generated
+      // tables for nothing — and a sibling package naturally comes out as
+      // ../../<pkg>/..., which is the path the app reads it by. Joined from
+      // appDir it lands back inside baseDir, because appSubPath is exactly
+      // that deep, so extraction still never writes outside its root.
+      rel: relative(serverDir, f.absolutePath).replace(/\\/g, "/"),
+    }))
+    .filter(({ rel }) => !generated.has(rel))
+    .map(({ f, rel }) => ({ ...f, urlPath: `__runtime/${rel}` }));
   runtimeFiles.push(...projectFiles);
   if (projectFiles.length > 0) {
     console.log(`next-bun-compile: Embedding ${projectFiles.length} traced project files`);
@@ -1305,8 +1344,15 @@ const Module = require("module");
 const baseDir = process.env.NBC_RUNTIME_DIR
   ? path.resolve(process.env.NBC_RUNTIME_DIR)
   : path.dirname(process.execPath);
-fs.mkdirSync(baseDir, { recursive: true });
-process.chdir(baseDir);
+// baseDir is the extraction root and mirrors the assembled tree. appDir is
+// the app dir inside it — the same for a single-app build, "<ws>/apps/web"
+// for a monorepo — and is what Next runs in, so a traced file in a sibling
+// package resolves at ../../<pkg> just as it does under standalone.
+const appDir = ${
+  appSubPath ? `path.join(baseDir, ${JSON.stringify(appSubPath)})` : "baseDir"
+};
+fs.mkdirSync(appDir, { recursive: true });
+process.chdir(appDir);
 process.env.NODE_ENV = "production";
 
 // Install a fallback Module._resolveFilename hook. bun's compiled-binary
@@ -1489,8 +1535,8 @@ const rewrittenChunks = new Set(${JSON.stringify(rewrittenChunks)});
 // Written to the manifest after a complete extraction. Includes baseDir:
 // if the deploy directory moves, the substituted absolute paths in the
 // rewritten chunks are wrong and everything must be re-extracted.
-const buildStamp = ${JSON.stringify(buildHash)} + "\\n" + baseDir;
-const manifestPath = path.join(baseDir, ".next", ".nbc-extracted");
+const buildStamp = ${JSON.stringify(buildHash)} + "\\n" + appDir;
+const manifestPath = path.join(appDir, ".next", ".nbc-extracted");
 async function extractAssets() {
   // Fast path: a previous boot of this exact build in this exact directory
   // finished extracting — one file read, no per-asset stats.
@@ -1503,7 +1549,7 @@ async function extractAssets() {
   // pre-placed tampering) shadow the embedded assets forever.
   const dirs = new Set();
   for (const [, diskPath] of extractions) {
-    dirs.add(path.dirname(path.join(baseDir, diskPath)));
+    dirs.add(path.dirname(path.join(appDir, diskPath)));
   }
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 
@@ -1515,14 +1561,14 @@ async function extractAssets() {
       const [urlPath, diskPath] = extractions[idx++];
       const embedded = assetMap.get(urlPath);
       if (!embedded) continue;
-      const fullPath = path.join(baseDir, diskPath);
+      const fullPath = path.join(appDir, diskPath);
       const gz = gzippedAssets.has(urlPath);
       if (gz || rewrittenChunks.has(diskPath)) {
         let bytes = await Bun.file(embedded).bytes();
         if (gz) bytes = Bun.gunzipSync(bytes);
         if (rewrittenChunks.has(diskPath)) {
           const text = new TextDecoder().decode(bytes);
-          await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
+          await Bun.write(fullPath, text.split("__NBC_BASE__").join(appDir));
         } else {
           await Bun.write(fullPath, bytes);
         }
@@ -1568,7 +1614,9 @@ extractAssets().then(() => {
     tier1: __NBC_TIER1,
     staticPages: __NBC_STATIC_PAGES,
     shellGuards: __NBC_SHELL_GUARDS,
-    baseDir,
+    // serve.js resolves .next/... and Next's own dir option off this, so
+    // it is the app dir, not the extraction root (same unless monorepo).
+    baseDir: appDir,
     // Revalidation events are observed on the default filesystem cache
     // handler; with a custom handler they never fire, so response
     // caching would serve stale pages.

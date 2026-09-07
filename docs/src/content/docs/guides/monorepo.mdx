@@ -83,7 +83,26 @@ about the standalone layout Next.js produces.
    location per file so nothing is lost to hoisting.
 3. **Workspace packages survive.** Anything Next.js's trace pulled in
    (including workspace `*`-version deps) gets embedded from wherever
-   it landed.
+   it landed — including plain data files. A route reading
+   `../../packages/shared/fonts/body.ttf` through `fs` works, because
+   the binary mirrors the assembled tree and runs from the app dir
+   inside it, exactly as `output: "standalone"` does.
+
+## Where the runtime tree lands
+
+The extracted tree keeps its workspace path, so an app at `apps/web`
+extracts to `$NBC_RUNTIME_DIR/apps/web`, not `$NBC_RUNTIME_DIR`. That is
+what keeps `../../packages/...` resolvable at runtime. The build prints
+it:
+
+```
+next-bun-compile: monorepo layout — runtime tree extracts to <NBC_RUNTIME_DIR>/apps/web
+```
+
+It only matters if you pre-extract with `--extract` or mount a volume
+into the tree — see [Docker](/guides/docker/). A single-app repo is
+unaffected: there is no workspace path, so the tree extracts straight
+into `NBC_RUNTIME_DIR` as before.
 
 ## Common gotchas
 

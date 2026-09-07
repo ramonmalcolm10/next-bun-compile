@@ -98,6 +98,23 @@ Two things to keep consistent:
   shadow the baked layer. Mount writable storage only where writes
   happen, `$NBC_RUNTIME_DIR/.next/cache` (ISR/revalidation):
 
+:::caution[Monorepos: the tree is one level down]
+In a workspace repo the extracted tree keeps its workspace path, so it
+lands at `$NBC_RUNTIME_DIR/<workspace-path>/.next` — `/runtime/apps/web/.next`
+for an app at `apps/web`, not `/runtime/.next`. The binary prints the
+path at build time:
+
+```
+next-bun-compile: monorepo layout — runtime tree extracts to <NBC_RUNTIME_DIR>/apps/web
+```
+
+Both the `mkdir` in your Dockerfile and the cache `mountPath` have to use
+it. Aimed at `$NBC_RUNTIME_DIR/.next/cache` they miss the tree entirely,
+and the app writes ISR output to a read-only image layer — which only
+fails at runtime, on the first revalidation.
+:::
+
+
 ```yaml
 # k8s: tree stays a read-only image layer; only the cache is writable
 volumes:

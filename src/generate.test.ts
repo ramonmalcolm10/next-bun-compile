@@ -161,12 +161,16 @@ describe("generateEntryPoint", () => {
     const serverDir = generateEntryPoint({ standaloneDir, serverDir: join(standaloneDir, "apps/web"), distDir, projectDir });
     expect(serverDir).toBe(join(standaloneDir, "apps/web"));
 
-    // assets.generated.js should reference files relative to serverDir
     const assets = readFileSync(join(serverDir, "assets.generated.js"), "utf-8");
-    // Runtime files should use .next/ paths (relative to serverDir)
-    expect(assets).toContain(".next/BUILD_ID");
-    // Should NOT contain the monorepo nesting path in imports
-    expect(assets).not.toContain("apps/web/.next/BUILD_ID");
+    // The extracted tree mirrors the assembled one rather than flattening
+    // the app dir onto baseDir, so runtime files keep their workspace path
+    // and the binary chdirs into it. Flattening would put a sibling
+    // package's traced files above the extraction root, which extraction
+    // must never write to.
+    expect(assets).toContain("__runtime/.next/BUILD_ID");
+    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
+    expect(entry).toContain('const appDir = path.join(baseDir, "apps/web")');
+    expect(entry).toContain("process.chdir(appDir)");
   });
 
   test("monorepo layout: external modules read from standalone root node_modules", () => {
@@ -729,6 +733,53 @@ describe("generateEntryPoint", () => {
     expect(assets).not.toContain("__runtime/assets.generated.js");
   });
 
+  test("embeds a traced file from a sibling workspace package", () => {
+    // The gap #72 left: it walked serverDir, so a traced file belonging to a
+    // sibling package — which the app reads at ../../packages/... exactly as
+    // it would under `output: "standalone"` — was staged by the tracer and
+    // then dropped, and the route hit ENOENT. Walking the assembled tree and
+    // chdir-ing into the app dir keeps the relative path intact.
+    const root = join(tmpBase, "monorepo-sibling");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
+      ".next/static/app.js": "// static",
+      ".next/standalone/apps/web/server.js": MOCK_SERVER_JS,
+      ".next/standalone/apps/web/.next/BUILD_ID": "sibling-build",
+      ".next/standalone/apps/web/.next/server/chunks/ssr.js": "// chunk",
+      // Traced, and outside the app dir entirely.
+      ".next/standalone/packages/shared/data/greeting.json": '{"greeting":"hi"}',
+      // Must stay excluded at any depth, not just at the root — nested
+      // stores (.bun/.pnpm) put node_modules well below the tree root.
+      ".next/standalone/packages/shared/node_modules/dep/index.js": "module.exports={};",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      "public/favicon.ico": "icon",
+    });
+
+    const serverDir = generateEntryPoint({
+      standaloneDir, serverDir: join(standaloneDir, "apps/web"), distDir, projectDir,
+    });
+
+    const assets = readFileSync(join(serverDir, "assets.generated.js"), "utf-8");
+    expect(assets).toContain("__runtime/../../packages/shared/data/greeting.json");
+
+    const entry = readFileSync(join(serverDir, "server-entry.js"), "utf-8");
+    // Extracts at its workspace path, so cwd/../../packages/... resolves.
+    expect(entry).toContain('"../../packages/shared/data/greeting.json"');
+    // node_modules stays out, wherever it sits.
+    expect(entry).not.toContain("packages/shared/node_modules");
+    // The app's own runtime tree moved under the workspace path with it.
+    // App-dir paths stay bare — prefixing every runtime path with the
+    // workspace path would cost ~130KB of string for no behaviour change.
+    expect(entry).toContain('".next/BUILD_ID"');
+  });
+
   test("validator warns when an alias references a missing canonical package", () => {
     // Chunk references `missing-pkg-deadbeefdeadbeef` but no `missing-pkg`
     // is installed anywhere in the standalone. The build still has to run
@@ -863,8 +914,12 @@ describe("generateEntryPoint", () => {
     // Manifest skip: matching stamp on disk means extraction is bypassed
     expect(entry).toContain(".nbc-extracted");
     expect(entry).toContain("buildStamp");
-    // Stamp is a 64-hex sha256 over the embedded assets, tied to baseDir
-    expect(entry).toMatch(/const buildStamp = "[0-9a-f]{64}" \+ "\\n" \+ baseDir;/);
+    // Stamp is a 64-hex sha256 over the embedded assets, tied to appDir —
+    // the directory the substituted absolute paths were written against.
+    expect(entry).toMatch(/const buildStamp = "[0-9a-f]{64}" \+ "\\n" \+ appDir;/);
+    // Flat layout: no workspace nesting, so appDir collapses to baseDir and
+    // the on-disk layout is byte-identical to before.
+    expect(entry).toContain("const appDir = baseDir;");
   });
 
   test("build stamp changes when embedded asset content changes", () => {
