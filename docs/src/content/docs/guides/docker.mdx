@@ -21,9 +21,9 @@ FROM gcr.io/distroless/base-debian12:nonroot AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV HOSTNAME="0.0.0.0"
-COPY --from=builder --chown=nonroot:nonroot /app/server ./
+COPY --from=builder --chown=nonroot:nonroot /app/dist/app ./
 EXPOSE 3000
-CMD ["./server"]
+CMD ["./app"]
 ```
 
 ## With native deps (sharp, bcrypt, etc.)
@@ -82,11 +82,11 @@ build time, and every container boot skips straight past extraction
 FROM gcr.io/distroless/base-debian12:nonroot AS runner
 WORKDIR /app
 ENV NBC_RUNTIME_DIR=/runtime
-COPY --from=builder --chown=nonroot:nonroot /app/server ./
+COPY --from=builder --chown=nonroot:nonroot /app/dist/app ./
 # Bake the extracted tree into an image layer. Exec form — no shell
 # needed, works in distroless.
-RUN ["/app/server", "--extract"]
-CMD ["./server"]
+RUN ["/app/app", "--extract"]
+CMD ["./app"]
 ```
 
 Two things to keep consistent:

@@ -17,10 +17,10 @@ export interface RunBuildOptions {
   extraArgs?: string[];
   /**
    * Output directory for the binary, relative to projectDir (or absolute).
-   * Default: the project root. A future major moves this to "dist".
+   * Default: "dist". Was the project root before v2.
    */
   out?: string;
-  /** Binary filename. Default: "server". */
+  /** Binary filename. Default: "app". Was "server" before v2. */
   binaryName?: string;
 }
 
@@ -30,12 +30,21 @@ export interface RunBuildOptions {
  * also avoids ever naming a file `server` (Nitro treats server/ as a
  * convention dir). Precedence: explicit option → env (NBC_OUT / NBC_BINARY,
  * for the adapter and CLI flows that have no argv) → the historical default
- * <projectDir>/server. The default is preserved for backward compatibility;
- * a future major moves it to dist/app.
+ * dist/app.
+ *
+ * v2 moved this off the project root. `server` at the root collides with
+ * conventions (Nitro treats server/ as a convention dir), is easy to commit
+ * by accident, and leaves a 78MB artifact where source lives; dist/ is the
+ * conventional place for build output and matches homeport's other
+ * framework adapters. Set out/NBC_OUT to "." and binaryName/NBC_BINARY to
+ * "server" to restore the v1 location.
  */
-function resolveOutfile(projectDir: string, options: RunBuildOptions): string {
-  const outDir = options.out ?? process.env.NBC_OUT ?? projectDir;
-  const binaryName = options.binaryName ?? process.env.NBC_BINARY ?? "server";
+export function resolveOutfile(
+  projectDir: string,
+  options: Pick<RunBuildOptions, "out" | "binaryName">
+): string {
+  const outDir = options.out ?? process.env.NBC_OUT ?? "dist";
+  const binaryName = options.binaryName ?? process.env.NBC_BINARY ?? "app";
   const base = isAbsolute(outDir) ? outDir : join(projectDir, outDir);
   return join(base, binaryName);
 }

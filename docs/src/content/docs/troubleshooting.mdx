@@ -102,13 +102,13 @@ read-only root filesystems (Kubernetes `readOnlyRootFilesystem`,
 read-only containers), point extraction at writable tmpfs:
 
 ```bash
-NBC_RUNTIME_DIR=/tmp/app ./server
+NBC_RUNTIME_DIR=/tmp/app ./dist/app
 ```
 
 ## Want to see what's happening at runtime?
 
 ```bash
-NEXT_BUN_COMPILE_DEBUG=1 ./server
+NEXT_BUN_COMPILE_DEBUG=1 ./dist/app
 ```
 
 Logs every resolver-hook decision with parent-file context. See

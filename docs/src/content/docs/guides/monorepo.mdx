@@ -6,7 +6,7 @@ description: bun workspaces, pnpm workspaces, and Turborepo all work — here's 
 next-bun-compile handles monorepo layouts automatically. The adapter
 assembles its traced output tree with the app path preserved
 (e.g. `apps/web/...` relative to the repo root), and the compiled
-binary lands at `apps/web/server`.
+binary lands at `apps/web/dist/app`.
 
 One monorepo-specific requirement: Next.js resolves `adapterPath`
 from **its own package location**, so a nested workspace dependency
@@ -55,7 +55,7 @@ Standard bun workspaces setup, no special config:
 
 ```bash
 bun install                        # at the monorepo root
-cd apps/web && bun run build       # produces apps/web/server
+cd apps/web && bun run build       # produces apps/web/dist/app
 ```
 
 A full working monorepo + sharp example is in

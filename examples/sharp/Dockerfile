@@ -1,7 +1,7 @@
 # ============================================
 # Recipe: distroless + sharp
 # ============================================
-# Compiles a Next.js app that uses sharp into a single `./server` binary
+# Compiles a Next.js app that uses sharp into a single `dist/app` binary
 # and ships it on gcr.io/distroless/cc-debian12. Includes fontconfig +
 # fonts copied from the builder so libvips text rendering (watermarks,
 # captions) works.
@@ -44,7 +44,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOSTNAME="0.0.0.0"
 
 # Self-contained binary
-COPY --from=builder --chown=nonroot:nonroot /app/server ./
+COPY --from=builder --chown=nonroot:nonroot /app/dist/app ./
 
 # Fontconfig + fonts + the C libs libvips dlopens for text rendering.
 # cc-debian12 already has libstdc++ and libgcc; these complete the set.
@@ -58,4 +58,4 @@ COPY --from=builder /usr/lib/x86_64-linux-gnu/libexpat.so* /usr/lib/x86_64-linux
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libpng16.so* /usr/lib/x86_64-linux-gnu/
 
 EXPOSE 3000
-CMD ["./server"]
+CMD ["./app"]

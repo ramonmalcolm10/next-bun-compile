@@ -41,8 +41,8 @@ monorepo/
 
 ```bash
 bun install                                  # at the monorepo root
-cd apps/web && bun --bun run build           # → apps/web/server
-PORT=3000 ./server &
+cd apps/web && bun --bun run build           # → apps/web/dist/app
+PORT=3000 ./dist/app &
 curl http://localhost:3000/api/resize > out.png
 file out.png                                 # PNG image data, 32 x 32
 ```

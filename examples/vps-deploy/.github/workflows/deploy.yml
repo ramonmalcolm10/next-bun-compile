@@ -42,7 +42,7 @@ jobs:
 
       - name: Build linux-x64 binary
         run: bun --bun run build:linux-x64
-        # Produces ./server — a ~30MB single executable.
+        # Produces ./dist/app — a ~30MB single executable.
 
       - name: Configure SSH
         run: |
@@ -61,7 +61,7 @@ jobs:
           # Upload to a staging name first, then atomic-rename into place
           # on the VPS so a partial transfer can never leave the service
           # pointing at a truncated file.
-          scp -i ~/.ssh/id_ed25519 ./server \
+          scp -i ~/.ssh/id_ed25519 ./dist/app \
             "$VPS_USER@$VPS_HOST:$APP_DIR/server.new"
 
       - name: Atomic swap + restart service
