@@ -41,8 +41,12 @@ boot() { # binary-dir [env...]
   if lsof -ti :$PORT >/dev/null 2>&1; then
     echo "port $PORT still occupied before boot"; return 1
   fi
+  # The build writes dist/app; a deploy dir holds a flat copy, which is what
+  # scp'ing just the binary leaves (and what the "deploy dir untouched"
+  # assertion below counts on). Accept either.
+  BIN=./dist/app; [ -x "$1/dist/app" ] || BIN=./app
   # exec makes the subshell BECOME the server so $! is the real pid.
-  ( cd "$1"; shift; exec env "$@" PORT=$PORT ./dist/app >"$SERVER_LOG" 2>&1 ) &
+  ( cd "$1"; shift; exec env "$@" PORT=$PORT "$BIN" >"$SERVER_LOG" 2>&1 ) &
   SERVER_PID=$!; disown 2>/dev/null || true
   for _ in $(seq 1 60); do
     curl -s -o /dev/null "http://127.0.0.1:$PORT/" && return 0
