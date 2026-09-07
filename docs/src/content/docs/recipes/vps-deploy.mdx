@@ -3,8 +3,6 @@ title: Deploy to a VPS with zero runtime dependencies
 description: Build the binary in GitHub Actions, ship it to a VPS over SSH, run under systemd. The VPS needs nothing installed but ssh, systemd, and a working glibc.
 ---
 
-import { Steps } from "@astrojs/starlight/components";
-
 The single-binary deploy story: a Linux executable built in CI, `scp`'d
 to your VPS, run under systemd. The VPS needs **nothing installed but
 ssh, systemd, and a working glibc** — no node, no bun, no
