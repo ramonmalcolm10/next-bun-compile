@@ -523,6 +523,45 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain('"@libsql/client-6da938047d5fc1cd":"@libsql/client"');
   });
 
+  test("skips dangling alias symlinks under .next/node_modules", () => {
+    // `turbo prune --docker` (and any prune-after-build flow) can drop the
+    // package a turbopack alias symlink points at, leaving the link dangling.
+    // Deriving the canonical name from the link's own name would register an
+    // alias for a package the build removed on purpose, and the validator
+    // would then report it missing. Nothing references it, so skip it.
+    const root = join(tmpBase, "turbopack-alias-dangling");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "dangling-build",
+      ".next/standalone/.next/server/chunks/page.js": "module.exports = {};",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      "public/favicon.ico": "icon",
+    });
+    mkdirSync(join(standaloneDir, ".next/node_modules/@scope"), { recursive: true });
+    symlinkSync(
+      join(standaloneDir, "node_modules/__pruned__/gone"),
+      join(standaloneDir, ".next/node_modules/gone-fedcba9876543210")
+    );
+    symlinkSync(
+      join(standaloneDir, "node_modules/@scope/__pruned__"),
+      join(standaloneDir, ".next/node_modules/@scope/gone-0123456789abcdef")
+    );
+
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
+
+    const entry = readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+    expect(entry).toContain("const __nbcAliases = {}");
+  });
+
   test("validator warns when an alias references a missing canonical package", () => {
     // Chunk references `missing-pkg-deadbeefdeadbeef` but no `missing-pkg`
     // is installed anywhere in the standalone. The build still has to run

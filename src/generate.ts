@@ -275,6 +275,11 @@ function findTurbopackAliases(
       const aliasPath = join(nodeModulesDir, name);
       try {
         if (!lstatSync(aliasPath).isSymbolicLink()) continue;
+        // existsSync follows the link. A dangling alias symlink — a
+        // devDependency dropped by `turbo prune --docker`, say — has no
+        // canonical package left to name, and registering it would trip the
+        // validator over something the build removed on purpose.
+        if (!existsSync(aliasPath)) continue;
         ensure(name);
       } catch {
         continue;
