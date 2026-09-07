@@ -7,9 +7,15 @@ interface CompileOptions {
   extraArgs?: string[];
 }
 
-export function compile(options: CompileOptions): void {
-  const { serverDir, outfile, extraArgs = [] } = options;
-  const entryPoint = join(serverDir, "server-entry.js");
+/**
+ * The argv handed to `bun build`. Split out from compile() so the flag
+ * contract is testable without spawning a compiler.
+ */
+export function buildCompileArgs(
+  entryPoint: string,
+  outfile: string,
+  extraArgs: string[] = []
+): string[] {
 
   // No --bytecode by default: it only covers the statically bundled entry
   // graph, while nearly all request-path code (Next itself, SSR chunks,
@@ -28,7 +34,10 @@ export function compile(options: CompileOptions): void {
   // NBC_BUILD_ARGS="--bytecode" next build. (An earlier revision of this
   // comment claimed +30% size; that predated gzip-embedding, which grew the
   // denominator to ~77MB.)
-  const args = [
+  const autoloadOptOut = extraArgs.includes(
+    "--no-compile-autoload-package-json"
+  );
+  return [
     "build",
     entryPoint,
     "--production",
@@ -38,7 +47,12 @@ export function compile(options: CompileOptions): void {
     // node_modules layout that externalized packages resolve their own
     // dependencies through, ESM imports included, which no runtime hook
     // can intercept.
-    "--compile-autoload-package-json",
+    //
+    // Skipped when the caller opted out through NBC_BUILD_ARGS: bun rejects
+    // the pair outright ("Cannot use both --compile-autoload-package-json
+    // and --no-..."), so appending ours anyway would turn an opt-out into a
+    // failed build rather than an override.
+    ...(autoloadOptOut ? [] : ["--compile-autoload-package-json"]),
     "--minify",
     "--sourcemap",
     // Dev-only lazy requires inside Next's graph (webpack machinery is
@@ -67,6 +81,12 @@ export function compile(options: CompileOptions): void {
     ...(process.env.NBC_TARGET ? [`--target=${process.env.NBC_TARGET}`] : []),
     ...extraArgs,
   ];
+}
+
+export function compile(options: CompileOptions): void {
+  const { serverDir, outfile, extraArgs = [] } = options;
+  const entryPoint = join(serverDir, "server-entry.js");
+  const args = buildCompileArgs(entryPoint, outfile, extraArgs);
 
   console.log(`next-bun-compile: Compiling to ${outfile}...`);
   try {
