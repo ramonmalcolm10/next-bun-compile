@@ -1112,6 +1112,16 @@ export function generateEntryPoint(options: GenerateOptions): string {
   // package.json + file layout to find the exact main/subpath file to
   // point at.
   const standaloneNextDir = join(serverDir, ".next");
+  // Where the app dir sits inside the assembled tree. Empty for a plain
+  // single-app build (standaloneDir === serverDir); "apps/web" and the like
+  // for a monorepo, where Next preserves the workspace layout so that a
+  // traced file in a sibling package stays reachable at ../../<pkg>. We
+  // mirror that layout under baseDir and chdir into the app dir, exactly as
+  // `output: "standalone"` does, instead of flattening the app dir onto
+  // baseDir — flattening puts siblings above the extraction root, and
+  // extraction must never write outside it.
+  const appSubPath = relative(standaloneDir, serverDir).replace(/\\/g, "/");
+  const appPrefix = appSubPath ? appSubPath + "/" : "";
 
   // The runtime's invalidation hook is in-process. A custom cacheHandler
   // is typically a shared store (Redis) where an invalidation issued on
@@ -1138,18 +1148,28 @@ export function generateEntryPoint(options: GenerateOptions): string {
     })
     .map((f) => ({
       ...f,
-      urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
+      urlPath: `__runtime/${appPrefix}.next/${f.relativePath.replace(/\\/g, "/")}`,
     }));
 
   // Traced files outside .next/ and node_modules/ (fonts, data files,
   // migrations, anything the app reads through fs at runtime) are part of
   // the assembled tree; they extract next to .next/ so cwd-relative reads
   // find them like they do under `output: "standalone"`.
-  const generated = new Set(["server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js"]);
-  const projectFiles = walkDir(serverDir)
+  const generated = new Set(
+    ["server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js"].map(
+      (f) => appPrefix + f
+    )
+  );
+  // Walk the whole assembled tree, not just the app dir: in a monorepo a
+  // traced file can belong to a sibling workspace package, which the app
+  // reads at ../../<pkg>/... and which never appears under serverDir.
+  // `.next/` and `node_modules/` are excluded at any depth — nested stores
+  // (.bun/.pnpm) put them well below the root.
+  const projectFiles = walkDir(standaloneDir)
     .filter((f) => {
       const rel = f.relativePath.replace(/\\/g, "/");
-      return !rel.startsWith(".next/") && !rel.startsWith("node_modules/") && !generated.has(rel);
+      if (generated.has(rel)) return false;
+      return !rel.split("/").some((seg) => seg === ".next" || seg === "node_modules");
     })
     .map((f) => ({ ...f, urlPath: `__runtime/${f.relativePath.replace(/\\/g, "/")}` }));
   runtimeFiles.push(...projectFiles);
@@ -1170,7 +1190,7 @@ export function generateEntryPoint(options: GenerateOptions): string {
     runtimeFiles.push({
       absolutePath: dest,
       relativePath: `__external/${mod}`,
-      urlPath: `__runtime/.next/node_modules/${mod.replace(/\\/g, "/")}`,
+      urlPath: `__runtime/${appPrefix}.next/node_modules/${mod.replace(/\\/g, "/")}`,
     });
   }
   if (externalModules.length > 0) {
@@ -1286,9 +1306,9 @@ export function generateEntryPoint(options: GenerateOptions): string {
     if (a.urlPath.startsWith("__runtime/")) {
       diskPath = a.urlPath.slice("__runtime/".length);
     } else if (a.urlPath.startsWith("/_next/static/")) {
-      diskPath = ".next/static/" + a.relativePath;
+      diskPath = appPrefix + ".next/static/" + a.relativePath;
     } else {
-      diskPath = "public/" + a.relativePath;
+      diskPath = appPrefix + "public/" + a.relativePath;
     }
     return [a.urlPath, diskPath];
   });
@@ -1305,8 +1325,15 @@ const Module = require("module");
 const baseDir = process.env.NBC_RUNTIME_DIR
   ? path.resolve(process.env.NBC_RUNTIME_DIR)
   : path.dirname(process.execPath);
-fs.mkdirSync(baseDir, { recursive: true });
-process.chdir(baseDir);
+// baseDir is the extraction root and mirrors the assembled tree. appDir is
+// the app dir inside it — the same for a single-app build, "<ws>/apps/web"
+// for a monorepo — and is what Next runs in, so a traced file in a sibling
+// package resolves at ../../<pkg> just as it does under standalone.
+const appDir = ${
+  appSubPath ? `path.join(baseDir, ${JSON.stringify(appSubPath)})` : "baseDir"
+};
+fs.mkdirSync(appDir, { recursive: true });
+process.chdir(appDir);
 process.env.NODE_ENV = "production";
 
 // Install a fallback Module._resolveFilename hook. bun's compiled-binary
@@ -1489,8 +1516,8 @@ const rewrittenChunks = new Set(${JSON.stringify(rewrittenChunks)});
 // Written to the manifest after a complete extraction. Includes baseDir:
 // if the deploy directory moves, the substituted absolute paths in the
 // rewritten chunks are wrong and everything must be re-extracted.
-const buildStamp = ${JSON.stringify(buildHash)} + "\\n" + baseDir;
-const manifestPath = path.join(baseDir, ".next", ".nbc-extracted");
+const buildStamp = ${JSON.stringify(buildHash)} + "\\n" + appDir;
+const manifestPath = path.join(appDir, ".next", ".nbc-extracted");
 async function extractAssets() {
   // Fast path: a previous boot of this exact build in this exact directory
   // finished extracting — one file read, no per-asset stats.
@@ -1522,7 +1549,7 @@ async function extractAssets() {
         if (gz) bytes = Bun.gunzipSync(bytes);
         if (rewrittenChunks.has(diskPath)) {
           const text = new TextDecoder().decode(bytes);
-          await Bun.write(fullPath, text.split("__NBC_BASE__").join(baseDir));
+          await Bun.write(fullPath, text.split("__NBC_BASE__").join(appDir));
         } else {
           await Bun.write(fullPath, bytes);
         }
@@ -1568,7 +1595,9 @@ extractAssets().then(() => {
     tier1: __NBC_TIER1,
     staticPages: __NBC_STATIC_PAGES,
     shellGuards: __NBC_SHELL_GUARDS,
-    baseDir,
+    // serve.js resolves .next/... and Next's own dir option off this, so
+    // it is the app dir, not the extraction root (same unless monorepo).
+    baseDir: appDir,
     // Revalidation events are observed on the default filesystem cache
     // handler; with a custom handler they never fire, so response
     // caching would serve stale pages.
