@@ -1141,6 +1141,22 @@ export function generateEntryPoint(options: GenerateOptions): string {
       urlPath: `__runtime/.next/${f.relativePath.replace(/\\/g, "/")}`,
     }));
 
+  // Traced files outside .next/ and node_modules/ (fonts, data files,
+  // migrations, anything the app reads through fs at runtime) are part of
+  // the assembled tree; they extract next to .next/ so cwd-relative reads
+  // find them like they do under `output: "standalone"`.
+  const generated = new Set(["server.js", "server-entry.js", "assets.generated.js", "nbc-serve.js"]);
+  const projectFiles = walkDir(serverDir)
+    .filter((f) => {
+      const rel = f.relativePath.replace(/\\/g, "/");
+      return !rel.startsWith(".next/") && !rel.startsWith("node_modules/") && !generated.has(rel);
+    })
+    .map((f) => ({ ...f, urlPath: `__runtime/${f.relativePath.replace(/\\/g, "/")}` }));
+  runtimeFiles.push(...projectFiles);
+  if (projectFiles.length > 0) {
+    console.log(`next-bun-compile: Embedding ${projectFiles.length} traced project files`);
+  }
+
   // Copy external modules into .next/__external/ so they get embedded as
   // regular file assets (JS files in node_modules/ conflict with bun's bundler).
   // At runtime these are extracted to .next/node_modules/ for SSR chunk resolution.

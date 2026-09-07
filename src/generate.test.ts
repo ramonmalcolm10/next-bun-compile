@@ -697,6 +697,38 @@ describe("generateEntryPoint", () => {
     expect(chunk).toContain("dual/dist/index.mjs");
   });
 
+  test("embeds traced project files outside .next and node_modules", () => {
+    // A route that reads fonts or data files through fs gets them traced
+    // into the assembled tree; the binary has to carry them too.
+    const root = join(tmpBase, "traced-project-files");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const projectDir = root;
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": mockSnapshot(),
+      ".next/static/app.js": "// static",
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "project-files-build",
+      ".next/standalone/.next/server/chunks/page.js": "module.exports = {};",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      ".next/standalone/src/fonts/body.ttf": "font bytes",
+      ".next/standalone/drizzle/meta/_journal.json": "{}",
+      "public/favicon.ico": "icon",
+    });
+
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir });
+
+    const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+    expect(assets).toContain("__runtime/src/fonts/body.ttf");
+    expect(assets).toContain("__runtime/drizzle/meta/_journal.json");
+    expect(assets).not.toContain("__runtime/server-entry.js");
+    expect(assets).not.toContain("__runtime/assets.generated.js");
+  });
+
   test("validator warns when an alias references a missing canonical package", () => {
     // Chunk references `missing-pkg-deadbeefdeadbeef` but no `missing-pkg`
     // is installed anywhere in the standalone. The build still has to run
