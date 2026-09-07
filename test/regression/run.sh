@@ -42,7 +42,7 @@ boot() { # binary-dir [env...]
     echo "port $PORT still occupied before boot"; return 1
   fi
   # exec makes the subshell BECOME the server so $! is the real pid.
-  ( cd "$1"; shift; exec env "$@" PORT=$PORT ./server >"$SERVER_LOG" 2>&1 ) &
+  ( cd "$1"; shift; exec env "$@" PORT=$PORT ./dist/app >"$SERVER_LOG" 2>&1 ) &
   SERVER_PID=$!; disown 2>/dev/null || true
   for _ in $(seq 1 60); do
     curl -s -o /dev/null "http://127.0.0.1:$PORT/" && return 0
@@ -85,7 +85,7 @@ echo "== build (adapter, single command) =="
 BUILD_LOG="$WORK/build.log"
 NEXT_DEPLOYMENT_ID=testdpl bunx next build >"$BUILD_LOG" 2>&1 || { tail -10 "$BUILD_LOG"; exit 1; }
 expect "tier eligibility: 11 assets + 4 pages frozen (deploymentId set)" grep -q "Serving 11 assets + 4 prerendered pages" "$BUILD_LOG"
-expect "binary produced by next build alone" test -f server
+expect "binary produced by next build alone" test -f dist/app
 
 echo "== behavior =="
 boot "$APP"
@@ -297,7 +297,7 @@ shutdown_server
 echo "== NBC_RUNTIME_DIR isolation =="
 DEPLOY="$WORK/deploy"; RUNTIME="$WORK/runtime"
 mkdir -p "$DEPLOY"
-cp "$APP/server" "$DEPLOY/server"
+cp "$APP/dist/app" "$DEPLOY/app"
 boot "$DEPLOY" NBC_RUNTIME_DIR="$RUNTIME"
 expect_sh "serves with relocated runtime dir" "test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/) = 200 && test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/ssr) = 200"
 # Hermetic: no project .next to mask a tree missing seeds or route modules.
@@ -471,7 +471,7 @@ echo "== extract mode (bake the tree at image build) =="
 # serving. Run it in a Dockerfile RUN step so pod boot hits the manifest
 # fast path — the CPU-throttled extraction phase disappears from startup.
 EXTRACT_RT="$WORK/extract-runtime"
-( cd "$DEPLOY"; exec env NBC_RUNTIME_DIR="$EXTRACT_RT" PORT=$PORT ./server --extract >"$WORK/extract.log" 2>&1 ) &
+( cd "$DEPLOY"; exec env NBC_RUNTIME_DIR="$EXTRACT_RT" PORT=$PORT ./app --extract >"$WORK/extract.log" 2>&1 ) &
 EX_PID=$!
 EX_CODE=124
 for _ in $(seq 1 60); do

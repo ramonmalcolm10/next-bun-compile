@@ -31,7 +31,7 @@ RUN apt-get update \
  && fc-cache -f \
  && rm -rf /var/lib/apt/lists/*
 
-# Build the web app — produces apps/web/server (single binary)
+# Build the web app — produces apps/web/dist/app (single binary)
 RUN cd apps/web && bun --bun run build
 
 # ============================================
@@ -45,7 +45,7 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOSTNAME="0.0.0.0"
 
-COPY --from=builder --chown=nonroot:nonroot /app/apps/web/server ./
+COPY --from=builder --chown=nonroot:nonroot /app/apps/web/dist/app ./
 
 COPY --from=builder /etc/fonts /etc/fonts
 COPY --from=builder /usr/share/fontconfig /usr/share/fontconfig
@@ -57,4 +57,4 @@ COPY --from=builder /usr/lib/x86_64-linux-gnu/libexpat.so* /usr/lib/x86_64-linux
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libpng16.so* /usr/lib/x86_64-linux-gnu/
 
 EXPOSE 3000
-CMD ["./server"]
+CMD ["./app"]

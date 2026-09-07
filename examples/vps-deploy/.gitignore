@@ -1,6 +1,6 @@
 node_modules
 .next
-server
+dist
 server-entry.js*
 assets.generated.js
 .*.bun-build

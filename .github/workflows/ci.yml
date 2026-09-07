@@ -73,7 +73,7 @@ jobs:
       - name: Boot binary and verify /api/healthz
         working-directory: examples/vps-deploy
         run: |
-          PORT=3003 ./server > /tmp/server.log 2>&1 &
+          PORT=3003 ./dist/app > /tmp/server.log 2>&1 &
           SERVER_PID=$!
           trap "kill $SERVER_PID 2>/dev/null || true" EXIT
 
@@ -135,7 +135,7 @@ jobs:
       - name: Boot binary and verify sharp serves a PNG
         working-directory: examples/sharp
         run: |
-          PORT=3001 ./server > /tmp/server.log 2>&1 &
+          PORT=3001 ./dist/app > /tmp/server.log 2>&1 &
           SERVER_PID=$!
 
           for i in $(seq 1 30); do
@@ -189,7 +189,7 @@ jobs:
       - name: Boot binary and verify nested layout + workspace dep + sharp
         working-directory: examples/monorepo/apps/web
         run: |
-          PORT=3002 ./server > /tmp/server.log 2>&1 &
+          PORT=3002 ./dist/app > /tmp/server.log 2>&1 &
           SERVER_PID=$!
 
           for i in $(seq 1 30); do
