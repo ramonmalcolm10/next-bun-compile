@@ -25,8 +25,8 @@ time so container boots skip extraction. See
 | -------------------------- | -------------- | ----------------------------------------------------------------- |
 | `NEXT_ADAPTER_PATH`        | —              | Enable the adapter without touching `next.config`: `NEXT_ADAPTER_PATH=next-bun-compile next build` |
 | `NBC_TARGET`               | host platform  | Cross-compile target, e.g. `bun-linux-x64`. See [Cross-compilation](/next-bun-compile/guides/cross-compilation/). |
-| `NBC_OUT`                  | project root   | Directory for the compiled binary (created if missing), relative to the project or absolute. See [Where the binary appears](#where-the-binary-appears). |
-| `NBC_BINARY`               | `server`       | Filename of the compiled binary.                                  |
+| `NBC_OUT`                  | `dist`         | Directory for the compiled binary (created if missing), relative to the project or absolute. See [Where the binary appears](#where-the-binary-appears). |
+| `NBC_BINARY`               | `app`          | Filename of the compiled binary.                                  |
 | `NBC_BUILD_ARGS`           | —              | Extra flags appended to the `bun build` invocation, whitespace-separated. See [Extra build flags](#extra-build-flags). |
 | `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
 
@@ -133,22 +133,30 @@ the invalidation.
 
 ## Where the binary appears
 
-By default, `./server` next to the `package.json` of the project being
-built. In a monorepo, this is `apps/<your-app>/server`. Monorepo layouts
+By default, `./dist/app` next to the `package.json` of the project being
+built. In a monorepo, this is `apps/<your-app>/dist/app`. Monorepo layouts
 are detected automatically.
 
 Override the location with `NBC_OUT` (directory) and `NBC_BINARY` (filename):
 
 ```bash
-NBC_OUT=dist NBC_BINARY=app next build   # → ./dist/app
+NBC_OUT=build NBC_BINARY=server next build   # → ./build/server
 ```
 
-The directory is created if it doesn't exist. Writing the binary to a
-sub-directory like `dist/` keeps it out of the project root — it's a build
-artifact, not source — and lets you match a deploy tool's expected artifact
-path (e.g. homeport's `dist/app`).
+The directory is created if it doesn't exist.
 
-:::note
-A future major version will make `dist/app` the default. If you rely on the
-current `./server` location, set `NBC_OUT` / `NBC_BINARY` explicitly.
+:::caution[Changed in v2]
+The binary is written to **`dist/app`**. Before v2 it was `./server` in the
+project root.
+
+A 78MB executable named `server` lands where source lives, is easy to commit
+by accident, and collides with framework conventions (Nitro treats `server/`
+as a convention dir). `dist/` is the conventional place for build output.
+
+Deploy scripts, Dockerfiles and `.gitignore` entries that name `./server`
+need updating. To keep the old location instead:
+
+```bash
+NBC_OUT=. NBC_BINARY=server next build   # → ./server, as in v1
+```
 :::

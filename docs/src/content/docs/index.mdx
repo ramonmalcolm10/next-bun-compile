@@ -24,7 +24,7 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 
 <CardGrid>
   <Card title="One binary, ship anywhere" icon="rocket">
-    `next build` produces a single `./server` executable with every
+    `next build` produces a single `./dist/app` executable with every
     static asset, public file, and runtime chunk embedded. Copy it to
     a distroless image, scp it to a VM, attach it to a release —
     that's the deploy.
@@ -76,8 +76,8 @@ export default nextConfig;
 ```
 
 ```bash
-next build    # → ./server, one command
-./server      # serves on port 3000
+next build    # → ./dist/app, one command
+./dist/app    # serves on port 3000
 ```
 
 Full walkthrough in [Getting Started](/next-bun-compile/getting-started/).

@@ -68,13 +68,13 @@ import { Steps, Tabs, TabItem } from "@astrojs/starlight/components";
    next build
    ```
 
-   One command. Produces a single `./server` executable next to your
+   One command. Produces a single `./dist/app` executable next to your
    `package.json`.
 
 4. ### Run it
 
    ```bash
-   ./server
+   ./dist/app
    ```
 
    Listens on port 3000 by default. Configurable via the `PORT` env var.
@@ -111,7 +111,7 @@ skips extraction on subsequent runs of the same build.
 ## Verify it works
 
 ```bash
-PORT=3000 ./server &
+PORT=3000 ./dist/app &
 curl http://localhost:3000/
 ```
 
