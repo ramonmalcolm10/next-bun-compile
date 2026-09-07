@@ -2,3 +2,4 @@ node_modules
 dist
 .astro
 bun.lock
+.nimbus

@@ -1,0 +1,126 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import Header from "../components/Header.astro";
+import { Card } from "../components/ui/card";
+import { CardGrid } from "../components/ui/card-grid";
+import { LinkButton } from "../components/ui/link-button";
+import { Code } from "../components/ui/code";
+import { config } from "virtual:nimbus/config";
+import { withBase } from "@cloudflare/nimbus-docs/runtime";
+
+// Hand-built because Nimbus has no `template: splash`. Starlight rendered
+// this page from a `hero:` frontmatter block; the tagline, both CTAs and the
+// card grid below are carried over from it verbatim.
+export const prerender = true;
+
+const base = import.meta.env.BASE_URL;
+
+const install = `bun add -D next-bun-compile`;
+
+const configExample = `// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  adapterPath: "next-bun-compile",
+};
+
+export default nextConfig;`;
+
+const run = `next build    # → ./dist/app, one command
+./dist/app    # serves on port 3000`;
+---
+
+<BaseLayout title={config.title} description={config.description}>
+  <div class="flex flex-col min-h-screen">
+    <Header />
+    <main
+      id="main-content"
+      tabindex="-1"
+      class="flex-1 mx-auto max-w-4xl w-full px-6 py-20"
+    >
+      <h1
+        class="text-foreground leading-tight"
+        style="font-size: var(--nb-h1-size); font-weight: var(--nb-h1-weight); letter-spacing: var(--nb-h1-tracking);"
+      >
+        {config.title}
+      </h1>
+      <p class="mt-3 text-[1.0625rem] text-muted-foreground leading-relaxed">
+        A Next.js Build Adapter that compiles your app into a single-file Bun
+        executable. One command, one binary, no runtime dependencies.
+      </p>
+
+      <div class="mt-8 flex flex-wrap gap-3">
+        <LinkButton href={withBase("/getting-started", base)} variant="primary">
+          Get started
+        </LinkButton>
+        {
+          config.github && (
+            <LinkButton
+              href={config.github}
+              variant="secondary"
+              target="_blank"
+              rel="noopener"
+            >
+              View on GitHub
+            </LinkButton>
+          )
+        }
+      </div>
+
+      <h2 class="mt-16 mb-6 text-xl font-semibold text-foreground">
+        Why next-bun-compile?
+      </h2>
+
+      <CardGrid>
+        <Card title="One binary, ship anywhere" icon="ph:rocket-launch">
+          <code>next build</code> produces a single <code>./dist/app</code> executable
+          with every static asset, public file, and runtime chunk embedded. Copy
+          it to a distroless image, scp it to a VM, attach it to a release — that's
+          the deploy.
+        </Card>
+        <Card title="Memory-served hot paths" icon="ph:lightning">
+          Static assets and fully-static prerendered pages are served straight
+          from memory; ISR pages get an invalidation-aware in-memory cache. First
+          byte in ~60ms — Next.js boots lazily on the first dynamic request.
+        </Card>
+        <Card title="Smaller image footprint" icon="ph:package">
+          ~30MB binary on distroless beats ~150MB for <code>bun + standalone</code>
+          setups. For native deps like sharp, the runner adds the C runtime libs
+          and you're at ~80MB total.
+        </Card>
+        <Card title="Native deps just work" icon="ph:puzzle-piece">
+          sharp, bcrypt, better-sqlite3 — handled. A runtime resolver hook plus a
+          build-time chunk rewrite makes externalized packages resolve cleanly
+          from inside the compiled binary, with no per-package configuration.
+        </Card>
+        <Card title="Monorepo aware" icon="ph:folders">
+          Bun workspaces, pnpm workspaces, Turborepo all work. The traced tree's
+          nested layout (<code>apps/web</code>) is handled correctly out of the
+          box, extraction included.
+        </Card>
+        <Card title="Works with what you already use" icon="ph:check-circle">
+          One line in your <code>next.config.ts</code> (<code
+            >adapterPath: "next-bun-compile"</code
+          >). No changes to your app code, no opinions about your routing or data
+          layer.
+        </Card>
+      </CardGrid>
+
+      <h2 class="mt-16 mb-6 text-xl font-semibold text-foreground">
+        Quick start
+      </h2>
+
+      <div class="flex flex-col gap-4">
+        <Code code={install} lang="bash" />
+        <Code code={configExample} lang="ts" />
+        <Code code={run} lang="bash" />
+      </div>
+
+      <p class="mt-8 text-muted-foreground">
+        Full walkthrough in <a href={withBase("/getting-started", base)}
+          >Getting started</a
+        >.
+      </p>
+    </main>
+  </div>
+</BaseLayout>
