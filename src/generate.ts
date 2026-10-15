@@ -1536,6 +1536,10 @@ const rewrittenChunks = new Set(${JSON.stringify(rewrittenChunks)});
 // if the deploy directory moves, the substituted absolute paths in the
 // rewritten chunks are wrong and everything must be re-extracted.
 const buildStamp = ${JSON.stringify(buildHash)} + "\\n" + appDir;
+// The placeholder sits inside a quoted string literal in JS source, so
+// appDir must be escaped for that context: a raw Windows path like
+// G:\\test would otherwise turn its \\t into a tab.
+const appDirLiteral = JSON.stringify(appDir).slice(1, -1).replace(/'/g, "\\\\'");
 const manifestPath = path.join(appDir, ".next", ".nbc-extracted");
 async function extractAssets() {
   // Fast path: a previous boot of this exact build in this exact directory
@@ -1568,7 +1572,7 @@ async function extractAssets() {
         if (gz) bytes = Bun.gunzipSync(bytes);
         if (rewrittenChunks.has(diskPath)) {
           const text = new TextDecoder().decode(bytes);
-          await Bun.write(fullPath, text.split("__NBC_BASE__").join(appDir));
+          await Bun.write(fullPath, text.split("__NBC_BASE__").join(appDirLiteral));
         } else {
           await Bun.write(fullPath, bytes);
         }
