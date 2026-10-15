@@ -407,6 +407,18 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain("Module._resolveFilename");
     // Runtime placeholder substitution must be in extractAssets
     expect(entry).toContain("__NBC_BASE__");
+    // The substituted baseDir must survive being parsed as a string literal:
+    // a raw Windows path like G:\test would turn \t into a tab.
+    const escapeLine = entry.match(/const appDirLiteral = .*;/)?.[0];
+    expect(escapeLine).toBeDefined();
+    const toLiteral = new Function("appDir", `${escapeLine} return appDirLiteral;`);
+    for (const appDir of ["G:\\test", "C:\\new\\un'quoted", "/srv/app"]) {
+      for (const q of ['"', "'"]) {
+        const src = `${q}__NBC_BASE__/.next/node_modules/sharp/index.js${q}`;
+        const parsed = new Function(`return ${src.split("__NBC_BASE__").join(toLiteral(appDir))};`)();
+        expect(parsed).toBe(`${appDir}/.next/node_modules/sharp/index.js`);
+      }
+    }
     // Rewritten chunks are listed so extraction only text-substitutes those
     expect(entry).toContain(
       '".next/server/chunks/ssr/[root-of-the-server].js"'
