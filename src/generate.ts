@@ -12,6 +12,7 @@ import {
 import { join, relative, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
+import { createRequire } from "node:module";
 
 interface GenerateOptions {
   standaloneDir: string;
@@ -861,6 +862,18 @@ function readAdapterSnapshot(distDir: string): AdapterSnapshot | null {
   }
 }
 
+/**
+ * The coverage rules the PPR shell endpoint enforces: proxy/middleware
+ * matchers plus response-altering routing rules. These matchers are
+ * written against the request path; with a basePath or i18n prefix in
+ * play we can't say which space a shell route's path is in, so we can't
+ * prove a route is uncovered. Refuse them all.
+ */
+function shellGuardsFor(snapshot: AdapterSnapshot): string[] {
+  if (snapshot.basePath || snapshot.i18n) return [".*"];
+  return [...snapshot.middlewareMatchers, ...snapshot.routingRules];
+}
+
 function computeStaticTiersFromSnapshot(
   snapshot: AdapterSnapshot,
   args: {
@@ -870,19 +883,13 @@ function computeStaticTiersFromSnapshot(
     assetPrefix: string;
   }
 ): TierResult {
-  const guardSources = [
-    ...snapshot.middlewareMatchers,
-    ...snapshot.routingRules,
-  ];
+  const guardSources = shellGuardsFor(snapshot);
   const none = (why: string): TierResult => ({
     tier1: [],
     staticPages: [],
     disabled: why,
     customCacheHandler: snapshot.hasCustomCacheHandler,
-    // These matchers are written against the request path; with a basePath
-    // or i18n prefix in play we can't say which space a shell route's path
-    // is in, so we can't prove a route is uncovered. Refuse them all.
-    shellGuards: [".*"],
+    shellGuards: guardSources,
   });
   if (snapshot.basePath) return none("basePath is set");
   if (snapshot.i18n) return none("i18n is configured");
@@ -1634,4 +1641,81 @@ extractAssets().then(() => {
   writeFileSync(join(serverDir, "server-entry.js"), serverEntry);
 
   return serverDir;
+}
+
+
+/** File the build writes next to the binary, describing the deploy. */
+export const DEPLOY_MARKER_FILE = "next-bun-compile.json";
+// Bounds the marker's consumer enforces: it rejects the deploy past them.
+const MARKER_MAX_SHELLS = 200;
+const MARKER_MAX_PATH_BYTES = 200;
+
+export type DeployMarker = {
+  version: string;
+  /** The endpoint's buildId and the resume's x-nbc-build-id, so an edge
+   *  can drop shells from another build as soon as this deploy goes live. */
+  buildId: string;
+  ppr: { shells: string[] };
+};
+
+/**
+ * The deploy marker: which paths `GET /_nbc/ppr-shell/<route>` will serve,
+ * so a platform edge can route exactly those. Computed by the endpoint's
+ * own selection (listShellRoutes, in the nbc-serve.js that
+ * generateEntryPoint copies into serverDir) over the tree being embedded,
+ * so the marker never
+ * lists a path the endpoint refuses.
+ *
+ * Concrete prerendered paths only: fallback shells are withheld (see
+ * isFallbackShell in src/runtime/serve.js). Paths are in wire form, as a
+ * client sends them. Leaving a path out only costs that path its edge
+ * shell; listing too many fails the deploy, so the list is capped rather
+ * than passed through.
+ */
+export function buildDeployMarker(serverDir: string, distDir: string): DeployMarker {
+  const version = (
+    JSON.parse(
+      readFileSync(join(import.meta.dirname, "..", "package.json"), "utf-8")
+    ) as { version: string }
+  ).version;
+  const { listShellRoutes, readBuildId, wirePath } = createRequire(
+    import.meta.url
+  )(join(serverDir, "nbc-serve.js")) as {
+    listShellRoutes: (
+      baseDir: string,
+      guards: string[]
+    ) => { routes: Array<{ routePath: string }> };
+    readBuildId: (baseDir: string) => string;
+    wirePath: (p: string) => string;
+  };
+  const buildId = readBuildId(serverDir);
+  const snapshot = readAdapterSnapshot(distDir);
+  if (!snapshot) return { version, buildId, ppr: { shells: [] } };
+  const { routes } = listShellRoutes(serverDir, shellGuardsFor(snapshot));
+
+  const tooLong: string[] = [];
+  const unique = new Set<string>();
+  for (const { routePath } of routes) {
+    const p = wirePath(routePath);
+    if (Buffer.byteLength(p) > MARKER_MAX_PATH_BYTES) tooLong.push(p);
+    else unique.add(p);
+  }
+  if (tooLong.length > 0) {
+    console.warn(
+      `next-bun-compile: ⚠ ${tooLong.length} PPR shell path(s) over ${MARKER_MAX_PATH_BYTES} bytes left out of ${DEPLOY_MARKER_FILE} — they render at the origin`
+    );
+  }
+  // Past the cap, keep the shallowest paths: listing pages and section
+  // roots ahead of the long tail a generateStaticParams fans out into.
+  const depth = (p: string) => p.split("/").length;
+  const sorted = [...unique].sort(
+    (a, b) => depth(a) - depth(b) || a.length - b.length || (a < b ? -1 : 1)
+  );
+  const shells = sorted.slice(0, MARKER_MAX_SHELLS);
+  if (sorted.length > shells.length) {
+    console.warn(
+      `next-bun-compile: ⚠ ${sorted.length} PPR shell paths, ${DEPLOY_MARKER_FILE} lists the first ${MARKER_MAX_SHELLS} — the rest render at the origin`
+    );
+  }
+  return { version, buildId, ppr: { shells } };
 }

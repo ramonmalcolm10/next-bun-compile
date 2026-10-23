@@ -658,39 +658,47 @@ function shellGuard(sources) {
   return (p) => res.some((re) => re.test(p));
 }
 
-/**
- * Publish the PPR shell/postponed pairs a CDN may serve.
- *
- * `guards` is what keeps this honest. Handing a shell to a CDN moves the
- * response head to the edge, where it is committed before the origin has
- * rendered anything — so a Set-Cookie, a redirect, or a non-200 that the
- * request would have earned at the origin can no longer reach the client.
- * The CDN has already sent 200 + headers and can only append body bytes.
- *
- * The invariant: a route that can emit a Set-Cookie, a redirect, or a
- * non-200 status before or during its dynamic render must not have an
- * edge-served shell. Middleware coverage is the part of that we can see
- * from a build, and it is the part that bites hardest — an auth gate that
- * silently stops running is indistinguishable from no auth gate. It is
- * not the whole invariant: a `redirect()` or `notFound()` from inside a
- * dynamic hole fails the same way on a route no matcher covers. Those
- * routes must be kept off the CDN by hand (drop them from the worker's
- * route list); this only guarantees the statically-provable half.
- */
-function buildShellRoutes(baseDir, guards = []) {
-  const raw = process.env.NBC_PPR_SHELL;
-  if (!raw) return {};
-  const covered = shellGuard(guards);
-  const token = raw === "1" || raw === "true" ? null : raw;
-  const appDir = path.join(baseDir, ".next", "server", "app");
-  let buildId = "";
+function readBuildId(baseDir) {
   try {
-    buildId = fs
+    return fs
       .readFileSync(path.join(baseDir, ".next", "BUILD_ID"), "utf-8")
       .trim();
-  } catch {}
-  const routes = {};
+  } catch {
+    return "";
+  }
+}
+
+// A fallback shell (`docs/[slug]`, `blog/[...slug]`) can't be resumed by
+// this origin. Outside Next's minimal mode, a request for a path that
+// wasn't prerendered takes Next's fallback branch, which renders the
+// whole document itself and ignores the postponed state it was sent. An
+// edge that streamed the cached shell and then appended that response
+// would deliver two documents in one. Only concrete prerendered paths
+// resume holes-only.
+const isFallbackShell = (rel) =>
+  rel.split("/").some((seg) => seg.startsWith("[") && seg.endsWith("]"));
+
+// The pathname as a client sends it on the wire. Bun matches route keys
+// against the raw request path, so a prerendered path with characters a
+// URL must escape needs this form registered, or the endpoint 404s it.
+function wirePath(p) {
+  const u = new URL("http://x");
+  u.pathname = p;
+  return u.pathname;
+}
+
+/**
+ * Every route the shell endpoint may serve, with its build-time pair.
+ * The build calls this on the assembled tree to write the deploy marker
+ * (src/generate.ts), and boot calls it on the extracted copy of the same
+ * tree, so the two lists can't disagree.
+ */
+function listShellRoutes(baseDir, guards = []) {
+  const covered = shellGuard(guards);
+  const appDir = path.join(baseDir, ".next", "server", "app");
+  const routes = [];
   let excluded = 0;
+  let fallbacks = 0;
   const walk = (dir) => {
     let entries;
     try {
@@ -713,6 +721,10 @@ function buildShellRoutes(baseDir, guards = []) {
         .slice(0, -".meta".length)
         .split(path.sep)
         .join("/");
+      if (isFallbackShell(rel)) {
+        fallbacks++;
+        continue;
+      }
       const routePath = rel === "index" ? "/" : "/" + rel;
       // No route, so the endpoint 404s and the CDN passes through
       // permanently — the origin keeps owning this response head.
@@ -720,18 +732,46 @@ function buildShellRoutes(baseDir, guards = []) {
         excluded++;
         continue;
       }
-      routes[SHELL_PREFIX + rel] = shellRoute(
-        full,
-        htmlPath,
-        routePath,
-        buildId,
-        token,
-        pair
-      );
+      routes.push({ rel, routePath, metaPath: full, htmlPath, pair });
     }
   };
   walk(appDir);
-  const count = Object.keys(routes).length;
+  routes.sort((a, b) => (a.routePath < b.routePath ? -1 : 1));
+  return { routes, excluded, fallbacks };
+}
+
+/**
+ * Publish the PPR shell/postponed pairs a CDN may serve.
+ *
+ * `guards` is what keeps this honest. Handing a shell to a CDN moves the
+ * response head to the edge, where it is committed before the origin has
+ * rendered anything — so a Set-Cookie, a redirect, or a non-200 that the
+ * request would have earned at the origin can no longer reach the client.
+ * The CDN has already sent 200 + headers and can only append body bytes.
+ *
+ * The invariant: a route that can emit a Set-Cookie, a redirect, or a
+ * non-200 status before or during its dynamic render must not have an
+ * edge-served shell. Middleware coverage is the part of that we can see
+ * from a build, and it is the part that bites hardest — an auth gate that
+ * silently stops running is indistinguishable from no auth gate. It is
+ * not the whole invariant: a `redirect()` or `notFound()` from inside a
+ * dynamic hole fails the same way on a route no matcher covers. Those
+ * routes must be kept off the CDN by hand (drop them from the worker's
+ * route list); this only guarantees the statically-provable half.
+ */
+function buildShellRoutes(baseDir, guards = [], buildId = readBuildId(baseDir)) {
+  const raw = process.env.NBC_PPR_SHELL;
+  if (!raw) return {};
+  const token = raw === "1" || raw === "true" ? null : raw;
+  const { routes: list, excluded, fallbacks } = listShellRoutes(baseDir, guards);
+  const routes = {};
+  for (const { rel, routePath, metaPath, htmlPath, pair } of list) {
+    const handler = shellRoute(metaPath, htmlPath, routePath, buildId, token, pair);
+    routes[SHELL_PREFIX + rel] = handler;
+    const wire = wirePath("/" + rel).slice(1);
+    if (wire !== rel) routes[SHELL_PREFIX + wire] = handler;
+  }
+  const count = list.length;
   if (count > 0) {
     console.log(
       `next-bun-compile: PPR shell endpoint serving ${count} route(s) from memory`
@@ -742,6 +782,11 @@ function buildShellRoutes(baseDir, guards = []) {
   if (excluded > 0) {
     console.log(
       `next-bun-compile: PPR shell endpoint withholding ${excluded} route(s) covered by proxy/routing rules — their response head belongs to the origin`
+    );
+  }
+  if (fallbacks > 0) {
+    console.log(
+      `next-bun-compile: PPR shell endpoint withholding ${fallbacks} fallback shell(s) — only prerendered paths resume holes-only`
     );
   }
   return routes;
@@ -978,9 +1023,22 @@ async function start(opts) {
   };
   let handler = null;
   const bridge = createBridge(() => handler);
+  // Stamped on every resume response so an edge holding a shell from an
+  // earlier deploy can tell before it streams any hole: a mismatch with
+  // the shell's buildId means drop the shell, not splice two builds.
+  // The same value the shell endpoint reports, read once from one file.
+  const buildId = readBuildId(baseDir);
   const bridgeLazy = async (req, server) => {
     if (!handler) handler = await getHandlerOnce();
-    return bridge(req, server);
+    const res = await bridge(req, server);
+    if (
+      buildId &&
+      req.method === "POST" &&
+      req.headers.get("next-resume") === "1"
+    ) {
+      res.headers.set("x-nbc-build-id", buildId);
+    }
+    return res;
   };
 
   /* ------------------------------------------------------------ *
@@ -1128,7 +1186,7 @@ async function start(opts) {
   const routes = {
     ...tier1Routes,
     ...tier2Routes,
-    ...buildShellRoutes(baseDir, shellGuards),
+    ...buildShellRoutes(baseDir, shellGuards, buildId),
   };
   const tier2Paths = new Set(Object.keys(tier2Routes));
 
@@ -1283,7 +1341,9 @@ async function start(opts) {
   return server;
 }
 
-module.exports = { start };
+// listShellRoutes is also called at build time (src/generate.ts), on the
+// copy of this file that ships in the binary.
+module.exports = { start, listShellRoutes, readBuildId, wirePath };
 // Test-only escape hatch for unit-testing the fetch→node bridge. Not a public
 // API — may change or disappear in any release without notice.
 module.exports._internal = {

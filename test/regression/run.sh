@@ -328,6 +328,29 @@ assert e['buildId'], 'buildId missing'
 python3 -c "import json; print(json.load(open('$WORK/shell.json'))['postponed'], end='')" >"$WORK/endpoint-postponed.txt" 2>/dev/null || true
 RESUMED=$(curl -s -X POST -H 'next-resume: 1' --data-binary @"$WORK/endpoint-postponed.txt" http://127.0.0.1:$PORT/ppr)
 expect_sh "endpoint postponed state resumes cleanly" "grep -q 'hole rendered at' <<<'$RESUMED'"
+# An edge holding a shell from an earlier deploy compares the resume's
+# build header with the shell's buildId before streaming any hole, so the
+# two must be the same value.
+RESUME_BUILD=$(curl -s -D- -o /dev/null -X POST -H 'next-resume: 1' --data-binary @"$WORK/endpoint-postponed.txt" http://127.0.0.1:$PORT/ppr | tr -d '\r' | sed -n 's/^x-nbc-build-id: //Ip')
+SHELL_BUILD=$(python3 -c "import json; print(json.load(open('$WORK/shell.json'))['buildId'])" 2>/dev/null || true)
+expect_sh "resume response names the shell's build" "test -n '$RESUME_BUILD' && test '$RESUME_BUILD' = '$SHELL_BUILD'"
+expect_sh "plain document GET carries no build header" "! curl -s -D- -o /dev/null http://127.0.0.1:$PORT/ppr | grep -qi '^x-nbc-build-id'"
+# The deploy marker lists what this endpoint serves: /ppr, never the
+# proxy-covered /ppr-guarded (404 below).
+expect "deploy marker lists the served shells" python3 -c "
+import json
+m = json.load(open('$APP/dist/next-bun-compile.json'))
+s = m['ppr']['shells']
+assert m['version'], 'version missing'
+assert m['buildId'] == json.load(open('$WORK/shell.json'))['buildId'], 'marker buildId differs from the endpoint'
+assert '/ppr' in s and '/ppr-guarded' not in s, s
+"
+expect "every marker path is served by the shell endpoint" python3 -c "
+import json, urllib.request
+for p in json.load(open('$APP/dist/next-bun-compile.json'))['ppr']['shells']:
+    r = urllib.request.urlopen('http://127.0.0.1:$PORT/_nbc/ppr-shell' + ('/index' if p == '/' else p))
+    assert r.status == 200, p
+"
 # /cached is ISR without a postponed state — no PPR pair to serve.
 # (Note /ssr DOES have one under cacheComponents: its shell is the
 # loading fallback, and serving it is correct protocol behavior.)

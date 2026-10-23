@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import {
+  buildDeployMarker,
   generateEntryPoint,
   isPrunableModuleFile,
   shouldCompressEmbeddedAsset,
@@ -1163,4 +1164,74 @@ describe("isPrunableModuleFile", () => {
       expect(isPrunableModuleFile(mod)).toBe(want);
     });
   }
+});
+
+describe("buildDeployMarker", () => {
+  const pprPair = (postponed: string | null) => ({
+    meta: JSON.stringify(postponed ? { postponed } : { status: 200 }),
+    html: "<html>shell</html>",
+  });
+
+  /** A built tree whose server/app holds the given page pairs. */
+  function build(name: string, pages: Record<string, string | null>, snapshot = {}) {
+    const root = join(tmpBase, name);
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const files: Record<string, string> = {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/nbc-adapter-outputs.json": JSON.stringify({
+        ...JSON.parse(mockSnapshot()),
+        ...snapshot,
+      }),
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": "test-build-id",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+    };
+    for (const [rel, postponed] of Object.entries(pages)) {
+      const pair = pprPair(postponed);
+      files[`.next/standalone/.next/server/app/${rel}.meta`] = pair.meta;
+      files[`.next/standalone/.next/server/app/${rel}.html`] = pair.html;
+    }
+    scaffold(root, files);
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
+    return buildDeployMarker(standaloneDir, distDir);
+  }
+
+  test("lists exactly the shells the endpoint serves", () => {
+    const marker = build(
+      "marker-select",
+      {
+        ppr: "state",
+        "blog/hello/world": "state",
+        "has space": "state",
+        static: null, // no postponed state: no shell
+        guarded: "state", // covered by the proxy matcher below
+        "docs/[slug]": "state", // fallback shells can't be resumed here
+        "opt/[[...slug]]": "state",
+      },
+      { middlewareMatchers: ["^\\/guarded$"] }
+    );
+    const pkg = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8"));
+    expect(marker.version).toBe(pkg.version);
+    expect(marker.buildId).toBe("test-build-id");
+    // Wire form, so it compares with request paths as they arrive.
+    expect(marker.ppr.shells).toEqual(["/ppr", "/has%20space", "/blog/hello/world"]);
+  });
+
+  test("refuses every shell under basePath (matchers can't be placed)", () => {
+    const marker = build("marker-basepath", { ppr: "state" }, { basePath: "/app" });
+    expect(marker.ppr.shells).toEqual([]);
+  });
+
+  test("caps at 200 paths, shallowest first, and drops paths over 200 bytes", () => {
+    const pages: Record<string, string> = { top: "state", ["deep/" + "x".repeat(200)]: "state" };
+    for (let i = 0; i < 210; i++) pages[`posts/p${String(i).padStart(3, "0")}`] = "state";
+    const { ppr } = build("marker-cap", pages);
+    expect(ppr.shells.length).toBe(200);
+    expect(ppr.shells[0]).toBe("/top");
+    expect(new Set(ppr.shells).size).toBe(200);
+    expect(ppr.shells.every((p) => Buffer.byteLength(p) <= 200)).toBe(true);
+  });
 });

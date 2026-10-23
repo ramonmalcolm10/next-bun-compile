@@ -44,6 +44,23 @@ and `Location` have nowhere to go, and the visitor is left holding the
 shell's Suspense fallbacks. Route only pages whose response head is a
 foregone conclusion.
 
+## Building a platform integration?
+
+This Worker needs no input from the build: it discovers shells by asking
+the endpoint and remembering 404s. A platform that runs the build can
+skip discovery. Every build writes `next-bun-compile.json` next to the
+binary:
+
+```json
+{ "version": "…", "buildId": "…", "ppr": { "shells": ["/pricing", "/blog/hello-world"] } }
+```
+
+`shells` is exactly the set the endpoint serves, so an edge can route
+only those paths with no tombstones. `buildId` lets it drop shells from
+another build the moment a deploy goes live. Resume responses carry the
+same value in `x-nbc-build-id` as a backstop. See
+[Edge PPR → Platform integration](https://ramonmalcolm10.github.io/next-bun-compile/guides/edge-ppr/#platform-integration).
+
 ## Setup (once, ever)
 
 1. **Origin**: set `NBC_PPR_SHELL=1` (or `NBC_PPR_SHELL=<token>` to

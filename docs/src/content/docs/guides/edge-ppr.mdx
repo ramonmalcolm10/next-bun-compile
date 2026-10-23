@@ -62,6 +62,47 @@ NBC_PPR_SHELL=some-shared-token ./dist/app   # token mode
   cached once and served to anyone, silently defeating the token.
 - Routes without a PPR pair (fully static, or fully dynamic) return
   404. Unset the variable and the endpoint doesn't exist.
+- Fallback shells (`/docs/[slug]` with no prerendered match) return
+  404 too. Outside Next's minimal mode, a resume for a path that wasn't
+  prerendered renders the whole document and ignores the postponed
+  state, so an edge would append a second document to the shell. Only
+  concrete prerendered paths, including a dynamic route's
+  `generateStaticParams` output, have shells.
+
+## Platform integration
+
+Two pieces let a platform route edge shells without a per-app list.
+
+**The deploy marker.** Every build writes `next-bun-compile.json` next
+to the binary (`dist/` by default, or `NBC_OUT`):
+
+```json
+{
+  "version": "2.1.0",
+  "buildId": "Q6p5InH-AoAKW6ZLAyNXg",
+  "ppr": { "shells": ["/pricing", "/blog/hello-world"] }
+}
+```
+
+`shells` is exactly what `GET /_nbc/ppr-shell/<route>` serves, computed
+by the same selection the endpoint runs at boot. It applies the same
+proxy and routing-rule exclusions, uses wire-form paths
+(percent-encoded as a client sends them), and is empty when no route
+qualifies. The endpoint addresses `/` as `/_nbc/ppr-shell/index`. The
+list holds at most 200 paths of at most 200 bytes. Past that, the
+shallowest paths win and the build warns. A path left out still
+renders, just at the origin. The marker assumes the binary runs with
+`NBC_PPR_SHELL` set.
+
+`buildId` is the endpoint's `buildId` for this build. Once a deploy is
+live, an edge can drop every cached shell whose `buildId` differs
+before it sends a byte, rather than discovering the skew on the
+resume.
+
+**The resume build header.** A `next-resume: 1` POST response carries
+`x-nbc-build-id`, the same value as the endpoint's `buildId`. It is the
+backstop for a shell that predates the marker check: compare the two
+before streaming any hole, and drop the shell on a mismatch.
 
 ## The Cloudflare worker
 
