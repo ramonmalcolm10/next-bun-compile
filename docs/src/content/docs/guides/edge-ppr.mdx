@@ -28,8 +28,8 @@ The plan:
 - **v2.1:** the contract ships alongside the old endpoint. Both read
   the same shells and both are off by default. Setting
   `NBC_PPR_SHELL` logs a deprecation warning at boot.
-- **Later in v2:** the example Cloudflare worker moves to the
-  contract's endpoints.
+- **Now:** the example Cloudflare worker speaks the contract and no
+  longer needs `NBC_PPR_SHELL`.
 - **v3:** `NBC_PPR_SHELL`, `/_nbc/ppr-shell` and the
   `x-nbc-shell-token` header are removed.
 
@@ -42,51 +42,24 @@ body, instead of a `next-resume` POST to the page.
 
 ## How it fits together
 
-1. **The resume protocol (built in, always on).** A `POST` to a PPR
-   route with the `next-resume: 1` header and the route's
-   `postponedState` as the body renders only the deferred holes. The
-   regression suite pins this.
-2. **The shell endpoint (opt-in, `NBC_PPR_SHELL`).** The binary serves
-   each PPR route's build-frozen artifacts:
+1. **The PPR contract (opt-in, `PPR_TOKEN`).** The binary serves each
+   PPR page's build-frozen shell and its postponed state, and renders
+   only the holes when handed that state back:
 
    ```
-   GET /_nbc/ppr-shell/<route>  →  { shell, postponed, buildId, tags }
+   GET  /_ppr/shell?path=<path>        →  { v, build, html, state }
+   POST /_ppr/resume?url=<path+query>  →  the holes only
    ```
 
-   Pairs are discovered at boot from the extracted tree and served from
-   memory as exact routes — request data never touches the filesystem.
-   All three artifacts come from a prerender — at build time, or a later
-   regeneration — never from the context of a visitor's request, so they
-   cannot contain per-user data.
-3. **An edge worker (yours, ~100 lines).** Caches the shell, streams it
-   instantly, resumes the holes from your origin, stitches one
+   Shells are discovered at boot from the extracted tree and served from
+   memory — request data never touches the filesystem. Both come from a
+   prerender — at build time, or a later regeneration — never from the
+   context of a visitor's request, so they cannot contain per-user data.
+2. **An edge worker (yours, or the example).** Caches the shell, streams
+   it instantly, resumes the holes from your origin, stitches one
    response. A complete self-populating Cloudflare implementation ships
    in
    [`examples/cloudflare-ppr-worker`](https://github.com/ramonmalcolm10/next-bun-compile/tree/main/examples/cloudflare-ppr-worker).
-
-## Enabling the endpoint
-
-```bash
-NBC_PPR_SHELL=1 ./dist/app            # open mode
-NBC_PPR_SHELL=some-shared-token ./dist/app   # token mode
-```
-
-- **Open mode** responses are `Cache-Control: public, max-age=3600` —
-  build-time content that shared caches may hold.
-- **Token mode** requires the value in an `x-nbc-shell-token` header
-  (401 otherwise) and responds `private, no-store`. Use token mode for
-  auth-gated routes so their skeletons aren't publicly enumerable —
-  and note the header is load-bearing: behind a zone-wide "cache
-  everything" CDN rule, a publicly-cacheable tokened response would be
-  cached once and served to anyone, silently defeating the token.
-- Routes without a PPR pair (fully static, or fully dynamic) return
-  404. Unset the variable and the endpoint doesn't exist.
-- Fallback shells (`/docs/[slug]` with no prerendered match) return
-  404 too. Outside Next's minimal mode, a resume for a path that wasn't
-  prerendered renders the whole document and ignores the postponed
-  state, so an edge would append a second document to the shell. Only
-  concrete prerendered paths, including a dynamic route's
-  `generateStaticParams` output, have shells.
 
 ## The PPR contract
 
@@ -161,6 +134,35 @@ suite (`test/regression/ppr-conformance.mjs`). Run it against your own
 deployment with
 `PPR_TOKEN=… bun test/regression/ppr-conformance.mjs <dir with ppr.json> <base url>`.
 
+## The deprecated endpoint
+
+`NBC_PPR_SHELL` serves the same shells in the older shape,
+`GET /_nbc/ppr-shell/<route>` → `{ shell, postponed, buildId, tags }`,
+resumed with a `next-resume` POST to the page itself. It stays through
+v2 and is removed in v3.
+
+```bash
+NBC_PPR_SHELL=1 ./dist/app            # open mode
+NBC_PPR_SHELL=some-shared-token ./dist/app   # token mode
+```
+
+- **Open mode** responses are `Cache-Control: public, max-age=3600` —
+  build-time content that shared caches may hold.
+- **Token mode** requires the value in an `x-nbc-shell-token` header
+  (401 otherwise) and responds `private, no-store`. Use token mode for
+  auth-gated routes so their skeletons aren't publicly enumerable —
+  and note the header is load-bearing: behind a zone-wide "cache
+  everything" CDN rule, a publicly-cacheable tokened response would be
+  cached once and served to anyone, silently defeating the token.
+- Routes without a PPR pair (fully static, or fully dynamic) return
+  404. Unset the variable and the endpoint doesn't exist.
+- Fallback shells (`/docs/[slug]` with no prerendered match) return
+  404 too. Outside Next's minimal mode, a resume for a path that wasn't
+  prerendered renders the whole document and ignores the postponed
+  state, so an edge would append a second document to the shell. Only
+  concrete prerendered paths, including a dynamic route's
+  `generateStaticParams` output, have shells.
+
 ## The Cloudflare worker
 
 The example worker needs **no KV, no build-time push pipeline, and no
@@ -172,16 +174,17 @@ CI changes**:
 - **Cache hit** → the shell streams from the edge; in parallel a
   resume `POST` renders the holes at the origin and pipes onto the
   same response.
-- **Resume failure** (origin down, build skew) → the cached shell is
-  evicted and that visitor keeps the shell's Suspense fallbacks —
-  degraded, never mixed builds.
+- **Build skew or resume failure** → the holes are appended only when
+  the resume's `PPR-Build` matches the cached shell's build. Otherwise
+  the cached shell is evicted and that visitor keeps the shell's
+  Suspense fallbacks — degraded, never mixed builds.
 
 Deploy once, ever:
 
 ```bash
 cd examples/cloudflare-ppr-worker
 # set your route pattern(s) in wrangler.toml
-wrangler secret put SHELL_TOKEN     # token mode only
+wrangler secret put PPR_TOKEN       # the value the origin runs with
 wrangler deploy
 ```
 
@@ -192,9 +195,11 @@ the worker.
 
 ### Staleness
 
-- **Deploys:** a purge-on-deploy job (zone `purge_everything`) clears
-  cached shells with everything else; the endpoint's `max-age` is the
-  backstop.
+- **Deploys:** the build check above carries the edge across a deploy
+  on its own: a shell from the old build is evicted on its first hit and
+  re-warmed from the new one. A purge-on-deploy job (zone
+  `purge_everything`) spares that one degraded load, but nothing depends
+  on it.
 - **Runtime revalidation:** the endpoint entry is never dropped. It reads
   the route's pair back through Next's own incremental cache — the same
   source Next serves from — and falls back to the prerender on disk. A
@@ -211,15 +216,12 @@ the worker.
   output; it self-corrects as soon as the process handles a request.
 - **The edge copy converges on its own.** An origin cannot evict a CDN's
   copy, so the example worker revalidates instead: on a warm hit older
-  than a minute it re-checks the endpoint in the background with
+  than a minute it re-checks `/_ppr/shell` in the background with
   `If-None-Match`. An unchanged shell answers `304` with no body; a
   regenerated one replaces the cached copy. The edge therefore follows a
   regeneration within about a minute instead of sitting stale for the
   rest of its hour, at the cost of one bodiless request per PoP per
-  minute. The endpoint also emits `Cache-Tag` — Next's own tag set for
-  the route — so a tag-aware CDN (Fastly surrogate keys, Cloudflare
-  Enterprise cache tags) can purge the shell outright rather than wait
-  for the next check.
+  minute.
 
 ## Hard-won details
 
@@ -236,38 +238,46 @@ don't rediscover them in an integration of your own:
   document load on that route returns raw RSC until the zone is
   purged. The symptom is a page rendering as `text/x-component`
   protocol text right after a deploy (the purge empties the cache and
-  the refill race begins). (or
-  `application/octet-stream`). Workers' `fetch()` stamps string bodies
-  `text/plain`, and Next rejects that with 405 *before* its resume
-  branch — the symptom is an intermittent stuck-on-fallbacks page as
-  the worker's cache self-evicts and re-warms. The example sends
-  `application/x-www-form-urlencoded`, the no-JS form-post path where
-  `next-resume` is honored.
+  the refill race begins).
+- **Resuming against the page needs a form content type.** This only
+  matters if you skip `/_ppr/resume`, which handles it for you. A
+  `next-resume` POST to the page must be
+  `application/x-www-form-urlencoded`: Workers' `fetch()` stamps string
+  bodies `text/plain` (or `application/octet-stream`), and Next rejects
+  those with 405 *before* its resume branch. The symptom is an
+  intermittent stuck-on-fallbacks page as the cache self-evicts and
+  re-warms.
+- **Ask for the resume uncompressed.** The worker's response is
+  compressed whole by Cloudflare, so the holes must arrive as plain
+  bytes to append to the shell. The example drops the visitor's
+  `Accept-Encoding` from the resume, and `/_ppr/resume` never
+  compresses anyway.
 - **Never key the cache on a URL you also fetch.** A cache key is an
   identifier, not a fetch target, and `caches.default` *is* the zone
-  cache — so keying on `/_nbc/ppr-shell/<route>` inherits whatever
+  cache — so keying on `/_ppr/shell?path=<path>` inherits whatever
   cacheability that URL has picked up, including from the worker's own
   `cache: "no-store"` shell fetch. Telling Cloudflare never to cache a
   URL and then asking it to cache that URL loses: `put()` resolves
   normally and stores nothing, so the shell re-warms on every request
   and is never served, with no error raised anywhere. The example keys
-  on a synthetic `/__nbc-shell/<route>` instead, judged only on the
+  on a synthetic `/__ppr-shell/<path>` instead, judged only on the
   response it is handed. A declined `put()` does not throw, so reading
   the key straight back is the only way to tell a real write from a
   discarded one — worth doing once when bringing up an integration.
-- **A freshness check must bypass the zone cache too.** In open mode the
-  endpoint's own response is `public, max-age=3600`, so a worker
+- **A freshness check must bypass the zone cache too.** A worker
   subrequest that transits the zone can be answered with the very copy
   you are trying to replace — the check validates against itself and
-  never sees the new shell. The example fetches the endpoint with
-  `cache: "no-store"` for exactly this reason.
-- **Forward the original request headers on the resume POST** — the
+  never sees the new shell. `/_ppr/shell` answers `private, no-store`,
+  but a zone-wide "cache everything" rule can override that, so the
+  example fetches it with `cache: "no-store"` regardless.
+- **Forward the original request headers on the resume** — the
   holes are per-user and the origin needs cookies to render them. They
   flow only worker → origin (the path they already travel); nothing
   user-specific is ever cached, and the combined response is
   `private, no-store`.
-- **Only document GETs take the shell path.** RSC/prefetch requests,
-  draft mode, POSTs, and non-HTML `Accept` headers pass through — the
+- **Only document GETs take the shell path.** The marker's `bypass`
+  list (RSC, prefetches, server actions, draft mode), other methods, and
+  non-HTML `Accept` headers pass through — the
   client router's own requests never hit the worker's logic.
 - **Auth-gated routes change redirect UX.** The worker serves the
   (public, build-time) shell before your auth can 302, so logged-out
@@ -281,8 +291,8 @@ don't rediscover them in an integration of your own:
 ## Verifying
 
 ```bash
-# token gate
-curl -s -o /dev/null -w '%{http_code}\n' https://your-app.com/_nbc/ppr-shell/route   # 401
+# the contract is invisible without the token
+curl -s -o /dev/null -w '%{http_code}\n' 'https://your-app.com/_ppr/shell?path=/route'   # 404
 # warm document: edge shell + streamed holes
 curl -s -D- -o /dev/null -H 'Accept: text/html' https://your-app.com/route \
   | grep x-ppr-shell-build
@@ -291,5 +301,5 @@ curl -s -D- -o /dev/null -H 'Accept: text/html' https://your-app.com/route \
 In the browser: hard-reload the route twice with DevTools open. The
 warm load's document shows `x-ppr-shell-build`, first byte in tens of
 milliseconds, and the full response streaming in behind it. For live
-worker telemetry, `wrangler tail` — the example logs only failed
-resumes.
+worker telemetry, `wrangler tail` — the example logs failed warms and
+resumes it didn't append.

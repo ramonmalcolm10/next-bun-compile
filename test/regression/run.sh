@@ -320,6 +320,7 @@ assert '/ppr' in m['shells'] and '/ppr-guarded' not in m['shells'], m['shells']
 expect "marker also at .output/ppr.json, where the contract has builders look" cmp "$APP/dist/ppr.json" "$APP/.output/ppr.json"
 expect "build carries a digest of the shells" grep -q '"build": "[A-Za-z0-9_-]*\.[0-9a-f]\{12\}"' "$APP/dist/ppr.json"
 expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded --query '/search?utm_source=ppr-check'
+expect "the example Cloudflare worker serves shells and appends holes" bun "$PKG_DIR/test/regression/cloudflare-worker.mjs" "$PKG_DIR/examples/cloudflare-ppr-worker/worker.js" "http://127.0.0.1:$PORT" "$TOKEN"
 # Beyond the script: an empty state, and the rest of the reserved prefix.
 expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "400"
 expect "an unknown /_ppr/ path is a 404 even with the token" test "$(code_of -H "PPR-Token: $TOKEN" http://127.0.0.1:$PORT/_ppr/x)" = "404"
