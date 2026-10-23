@@ -1,5 +1,10 @@
 # Cloudflare PPR shell Worker (self-populating)
 
+> **Deprecation:** this Worker uses `/_nbc/ppr-shell`, which v3 removes
+> in favour of the PPR contract's `/_ppr/*` endpoints. The Worker will
+> move to the contract before then. See the plan in
+> [Edge PPR](https://ramonmalcolm10.github.io/next-bun-compile/guides/edge-ppr/).
+
 Serves the static shell of PPR pages from Cloudflare's edge while a
 compiled next-bun-compile origin renders only the dynamic holes — the
 CDN side of Next's [PPR platform protocol](https://nextjs.org/docs/app/guides/ppr-platform-guide).

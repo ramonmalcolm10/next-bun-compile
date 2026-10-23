@@ -21,6 +21,25 @@ per-request content *and* whose first paint matters. Fully static pages
 get the same edge TTFB from a plain CDN cache rule with zero moving
 parts. The holes render at origin speed either way.
 
+:::caution[Deprecated: the /_nbc/ppr-shell endpoint]
+The PPR contract (below) replaces `NBC_PPR_SHELL` and `/_nbc/ppr-shell`.
+The plan:
+
+- **v2.1:** the contract ships alongside the old endpoint. Both read
+  the same shells and both are off by default. Setting
+  `NBC_PPR_SHELL` logs a deprecation warning at boot.
+- **Later in v2:** the example Cloudflare worker moves to the
+  contract's endpoints.
+- **v3:** `NBC_PPR_SHELL`, `/_nbc/ppr-shell` and the
+  `x-nbc-shell-token` header are removed.
+
+To migrate, set `PPR_TOKEN` instead of `NBC_PPR_SHELL` and send it as
+`PPR-Token`. Fetch shells from `/_ppr/shell?path=<path>` (`html` and
+`state` replace `shell` and `postponed`). Resume with
+`POST /_ppr/resume?url=<path and query>` and the raw `state` as the
+body, instead of a `next-resume` POST to the page.
+:::
+
 ## How it fits together
 
 1. **The resume protocol (built in, always on).** A `POST` to a PPR
