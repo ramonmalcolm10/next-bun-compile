@@ -298,6 +298,37 @@ expect "custom header applied via Next" test "$HDR" = "1"
 expect "uncovered page still tier-served" test "$(code_of http://127.0.0.1:$PORT/)" = "200"
 shutdown_server
 
+echo "== PPR contract (/_ppr, ppr.json) =="
+# The framework-neutral conformance script: it reads only the marker and
+# speaks only the contract's endpoints, so passing here is passing for any
+# edge that runs it.
+TOKEN=$(openssl rand -hex 32)
+boot "$APP" PPR_TOKEN="$TOKEN"
+expect "marker lists /ppr, never the proxy-covered /ppr-guarded" python3 -c "
+import json
+m = json.load(open('$APP/dist/ppr.json'))
+assert m['v'] == 1 and m['build'], m
+assert '/ppr' in m['shells'] and '/ppr-guarded' not in m['shells'], m['shells']
+"
+expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded
+# What the script leaves to each framework: the holes see the visitor's
+# query, the resume is never compressed, and the whole prefix is reserved.
+expect "resume renders the visitor's query, uncompressed" bun -e "
+const [base, t] = ['http://127.0.0.1:$PORT', '$TOKEN']
+const s = await (await fetch(base + '/_ppr/shell?path=%2Fsearch', { headers: { 'PPR-Token': t } })).json()
+const r = await fetch(base + '/_ppr/resume?url=' + encodeURIComponent('/search?utm_source=news'), {
+  method: 'POST', body: s.state,
+  headers: { 'PPR-Token': t, 'Content-Type': 'application/octet-stream', 'Accept-Encoding': 'gzip, br' },
+})
+const holes = await r.text()
+if (!holes.includes('utm=<!-- -->news')) throw new Error(holes.slice(0, 300))
+if (r.headers.get('content-encoding')) throw new Error('compressed resume')
+"
+expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "400"
+expect "an unknown /_ppr/ path is a 404 even with the token" test "$(code_of -H "PPR-Token: $TOKEN" http://127.0.0.1:$PORT/_ppr/x)" = "404"
+expect "a GET to the resume endpoint is a 404" test "$(code_of -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "404"
+shutdown_server
+
 echo "== NBC_RUNTIME_DIR isolation =="
 DEPLOY="$WORK/deploy"; RUNTIME="$WORK/runtime"
 mkdir -p "$DEPLOY"
@@ -309,6 +340,7 @@ expect "static metadata seeds+module present in tree" test "$(code_of http://127
 expect "deploy dir untouched (read-only-fs safe)" test "$(ls -A "$DEPLOY" | wc -l | tr -d ' ')" = "1"
 expect "runtime files extracted to NBC_RUNTIME_DIR" test -d "$RUNTIME/.next"
 expect "shell endpoint off by default → 404" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "404"
+expect "PPR contract off without PPR_TOKEN → 404" test "$(code_of -H 'PPR-Token: x' "http://127.0.0.1:$PORT/_ppr/shell?path=%2Fppr")" = "404"
 shutdown_server
 
 echo "== PPR shell endpoint (edge-shell protocol) =="
@@ -328,29 +360,6 @@ assert e['buildId'], 'buildId missing'
 python3 -c "import json; print(json.load(open('$WORK/shell.json'))['postponed'], end='')" >"$WORK/endpoint-postponed.txt" 2>/dev/null || true
 RESUMED=$(curl -s -X POST -H 'next-resume: 1' --data-binary @"$WORK/endpoint-postponed.txt" http://127.0.0.1:$PORT/ppr)
 expect_sh "endpoint postponed state resumes cleanly" "grep -q 'hole rendered at' <<<'$RESUMED'"
-# An edge holding a shell from an earlier deploy compares the resume's
-# build header with the shell's buildId before streaming any hole, so the
-# two must be the same value.
-RESUME_BUILD=$(curl -s -D- -o /dev/null -X POST -H 'next-resume: 1' --data-binary @"$WORK/endpoint-postponed.txt" http://127.0.0.1:$PORT/ppr | tr -d '\r' | sed -n 's/^x-nbc-build-id: //Ip')
-SHELL_BUILD=$(python3 -c "import json; print(json.load(open('$WORK/shell.json'))['buildId'])" 2>/dev/null || true)
-expect_sh "resume response names the shell's build" "test -n '$RESUME_BUILD' && test '$RESUME_BUILD' = '$SHELL_BUILD'"
-expect_sh "plain document GET carries no build header" "! curl -s -D- -o /dev/null http://127.0.0.1:$PORT/ppr | grep -qi '^x-nbc-build-id'"
-# The deploy marker lists what this endpoint serves: /ppr, never the
-# proxy-covered /ppr-guarded (404 below).
-expect "deploy marker lists the served shells" python3 -c "
-import json
-m = json.load(open('$APP/dist/next-bun-compile.json'))
-s = m['ppr']['shells']
-assert m['version'], 'version missing'
-assert m['buildId'] == json.load(open('$WORK/shell.json'))['buildId'], 'marker buildId differs from the endpoint'
-assert '/ppr' in s and '/ppr-guarded' not in s, s
-"
-expect "every marker path is served by the shell endpoint" python3 -c "
-import json, urllib.request
-for p in json.load(open('$APP/dist/next-bun-compile.json'))['ppr']['shells']:
-    r = urllib.request.urlopen('http://127.0.0.1:$PORT/_nbc/ppr-shell' + ('/index' if p == '/' else p))
-    assert r.status == 200, p
-"
 # /cached is ISR without a postponed state — no PPR pair to serve.
 # (Note /ssr DOES have one under cacheComponents: its shell is the
 # loading fallback, and serving it is correct protocol behavior.)

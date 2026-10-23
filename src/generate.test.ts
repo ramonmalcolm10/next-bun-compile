@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import {
-  buildDeployMarker,
+  buildPprMarker,
   generateEntryPoint,
   isPrunableModuleFile,
   shouldCompressEmbeddedAsset,
@@ -1166,26 +1166,33 @@ describe("isPrunableModuleFile", () => {
   }
 });
 
-describe("buildDeployMarker", () => {
+describe("buildPprMarker", () => {
   const pprPair = (postponed: string | null) => ({
     meta: JSON.stringify(postponed ? { postponed } : { status: 200 }),
     html: "<html>shell</html>",
   });
 
   /** A built tree whose server/app holds the given page pairs. */
-  function build(name: string, pages: Record<string, string | null>, snapshot = {}) {
+  function build(
+    name: string,
+    pages: Record<string, string | null>,
+    snapshot = {},
+    { buildId = "test-build-id", config = {} } = {}
+  ) {
     const root = join(tmpBase, name);
     const distDir = join(root, ".next");
     const standaloneDir = join(distDir, "standalone");
     const files: Record<string, string> = {
-      ".next/required-server-files.json": MOCK_RSF,
-      ".next/BUILD_ID": "test-build-id",
+      ".next/required-server-files.json": JSON.stringify({
+        config: { assetPrefix: "", ...config },
+      }),
+      ".next/BUILD_ID": buildId,
       ".next/nbc-adapter-outputs.json": JSON.stringify({
         ...JSON.parse(mockSnapshot()),
         ...snapshot,
       }),
       ".next/standalone/server.js": MOCK_SERVER_JS,
-      ".next/standalone/.next/BUILD_ID": "test-build-id",
+      ".next/standalone/.next/BUILD_ID": buildId,
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
       ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
     };
@@ -1196,7 +1203,7 @@ describe("buildDeployMarker", () => {
     }
     scaffold(root, files);
     generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
-    return buildDeployMarker(standaloneDir, distDir);
+    return buildPprMarker(standaloneDir, distDir);
   }
 
   test("lists exactly the shells the endpoint serves", () => {
@@ -1210,28 +1217,57 @@ describe("buildDeployMarker", () => {
         guarded: "state", // covered by the proxy matcher below
         "docs/[slug]": "state", // fallback shells can't be resumed here
         "opt/[[...slug]]": "state",
+        "q?x": "state", // a client can't send this path unchanged
       },
       { middlewareMatchers: ["^\\/guarded$"] }
     );
-    const pkg = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8"));
-    expect(marker.version).toBe(pkg.version);
-    expect(marker.buildId).toBe("test-build-id");
-    // Wire form, so it compares with request paths as they arrive.
-    expect(marker.ppr.shells).toEqual(["/ppr", "/has%20space", "/blog/hello/world"]);
+    expect(marker.v).toBe(1);
+    expect(marker.build).toBe("test-build-id");
+    // Decoded, as the contract matches them.
+    expect(marker.shells).toEqual(["/ppr", "/has space", "/blog/hello/world"]);
+    expect(marker.bypass.headers).toContain("RSC");
+    expect(marker.bypass.query).toEqual(["_rsc"]);
+    expect(marker.bypass.cookies).toEqual(["__prerender_bypass"]);
+  });
+
+  test("follows trailingSlash, leaving / alone", () => {
+    const marker = build(
+      "marker-slash",
+      { index: "state", ppr: "state" },
+      {},
+      { config: { trailingSlash: true } }
+    );
+    expect(marker.shells).toEqual(["/", "/ppr/"]);
+  });
+
+  test("an empty list, still written, when no page has a shell", () => {
+    const marker = build("marker-none", { static: null });
+    expect(marker.shells).toEqual([]);
+    expect(marker.build).toBe("test-build-id");
+  });
+
+  test("a build id outside the contract's alphabet becomes its digest", () => {
+    const marker = build(
+      "marker-oddid",
+      { ppr: "state" },
+      { buildId: "release 1/2" },
+      { buildId: "release 1/2" }
+    );
+    expect(marker.build).toMatch(/^[0-9a-f]{32}$/);
   });
 
   test("refuses every shell under basePath (matchers can't be placed)", () => {
     const marker = build("marker-basepath", { ppr: "state" }, { basePath: "/app" });
-    expect(marker.ppr.shells).toEqual([]);
+    expect(marker.shells).toEqual([]);
   });
 
   test("caps at 200 paths, shallowest first, and drops paths over 200 bytes", () => {
     const pages: Record<string, string> = { top: "state", ["deep/" + "x".repeat(200)]: "state" };
     for (let i = 0; i < 210; i++) pages[`posts/p${String(i).padStart(3, "0")}`] = "state";
-    const { ppr } = build("marker-cap", pages);
-    expect(ppr.shells.length).toBe(200);
-    expect(ppr.shells[0]).toBe("/top");
-    expect(new Set(ppr.shells).size).toBe(200);
-    expect(ppr.shells.every((p) => Buffer.byteLength(p) <= 200)).toBe(true);
+    const { shells } = build("marker-cap", pages);
+    expect(shells.length).toBe(200);
+    expect(shells[0]).toBe("/top");
+    expect(new Set(shells).size).toBe(200);
+    expect(shells.every((p) => Buffer.byteLength(p) <= 200)).toBe(true);
   });
 });

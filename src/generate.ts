@@ -1644,78 +1644,76 @@ extractAssets().then(() => {
 }
 
 
-/** File the build writes next to the binary, describing the deploy. */
-export const DEPLOY_MARKER_FILE = "next-bun-compile.json";
-// Bounds the marker's consumer enforces: it rejects the deploy past them.
-const MARKER_MAX_SHELLS = 200;
-const MARKER_MAX_PATH_BYTES = 200;
+/** The PPR contract's marker, written next to the binary. */
+export const PPR_MARKER_FILE = "ppr.json";
 
-export type DeployMarker = {
-  version: string;
-  /** The endpoint's buildId and the resume's x-nbc-build-id, so an edge
-   *  can drop shells from another build as soon as this deploy goes live. */
-  buildId: string;
-  ppr: { shells: string[] };
+export type PprMarker = {
+  v: 1;
+  /** What both /_ppr endpoints send as PPR-Build. */
+  build: string;
+  /** Decoded paths the edge may answer from a shell. */
+  shells: string[];
+  /** Next's own requests on a page's path, which the edge leaves alone. */
+  bypass: { headers: string[]; query: string[]; cookies: string[] };
 };
 
 /**
- * The deploy marker: which paths `GET /_nbc/ppr-shell/<route>` will serve,
- * so a platform edge can route exactly those. Computed by the endpoint's
- * own selection (listShellRoutes, in the nbc-serve.js that
+ * The PPR contract's marker: which paths /_ppr/shell serves, computed by
+ * the endpoint's own selection (selectPprShells, in the nbc-serve.js that
  * generateEntryPoint copies into serverDir) over the tree being embedded,
- * so the marker never
- * lists a path the endpoint refuses.
+ * so the marker and the endpoint can't disagree. Written for every build,
+ * with no shells when no page qualifies.
  *
  * Concrete prerendered paths only: fallback shells are withheld (see
- * isFallbackShell in src/runtime/serve.js). Paths are in wire form, as a
- * client sends them. Leaving a path out only costs that path its edge
- * shell; listing too many fails the deploy, so the list is capped rather
- * than passed through.
+ * isFallbackShell in src/runtime/serve.js).
  */
-export function buildDeployMarker(serverDir: string, distDir: string): DeployMarker {
-  const version = (
-    JSON.parse(
-      readFileSync(join(import.meta.dirname, "..", "package.json"), "utf-8")
-    ) as { version: string }
-  ).version;
-  const { listShellRoutes, readBuildId, wirePath } = createRequire(
+export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
+  const { selectPprShells, pprBuild, PPR_BYPASS } = createRequire(
     import.meta.url
   )(join(serverDir, "nbc-serve.js")) as {
-    listShellRoutes: (
+    selectPprShells: (
       baseDir: string,
-      guards: string[]
-    ) => { routes: Array<{ routePath: string }> };
-    readBuildId: (baseDir: string) => string;
-    wirePath: (p: string) => string;
+      guards: string[],
+      opts: { trailingSlash: boolean }
+    ) => {
+      shells: Array<{ path: string }>;
+      overCap: string[];
+      invalid: string[];
+      tooLong: string[];
+    };
+    pprBuild: (baseDir: string) => string;
+    PPR_BYPASS: PprMarker["bypass"];
   };
-  const buildId = readBuildId(serverDir);
+  const build = pprBuild(serverDir);
+  const marker = (shells: string[]): PprMarker => ({
+    v: 1,
+    build,
+    shells,
+    bypass: PPR_BYPASS,
+  });
   const snapshot = readAdapterSnapshot(distDir);
-  if (!snapshot) return { version, buildId, ppr: { shells: [] } };
-  const { routes } = listShellRoutes(serverDir, shellGuardsFor(snapshot));
-
-  const tooLong: string[] = [];
-  const unique = new Set<string>();
-  for (const { routePath } of routes) {
-    const p = wirePath(routePath);
-    if (Buffer.byteLength(p) > MARKER_MAX_PATH_BYTES) tooLong.push(p);
-    else unique.add(p);
-  }
-  if (tooLong.length > 0) {
-    console.warn(
-      `next-bun-compile: ⚠ ${tooLong.length} PPR shell path(s) over ${MARKER_MAX_PATH_BYTES} bytes left out of ${DEPLOY_MARKER_FILE} — they render at the origin`
-    );
-  }
-  // Past the cap, keep the shallowest paths: listing pages and section
-  // roots ahead of the long tail a generateStaticParams fans out into.
-  const depth = (p: string) => p.split("/").length;
-  const sorted = [...unique].sort(
-    (a, b) => depth(a) - depth(b) || a.length - b.length || (a < b ? -1 : 1)
+  if (!snapshot) return marker([]);
+  const config =
+    (
+      JSON.parse(
+        readFileSync(join(distDir, "required-server-files.json"), "utf-8")
+      ) as { config?: { trailingSlash?: boolean } }
+    ).config ?? {};
+  const { shells, overCap, invalid, tooLong } = selectPprShells(
+    serverDir,
+    shellGuardsFor(snapshot),
+    { trailingSlash: !!config.trailingSlash }
   );
-  const shells = sorted.slice(0, MARKER_MAX_SHELLS);
-  if (sorted.length > shells.length) {
+  const report = (paths: string[], why: string) => {
+    if (paths.length === 0) return;
+    const shown = paths.slice(0, 10).join(", ");
+    const more = paths.length > 10 ? ` and ${paths.length - 10} more` : "";
     console.warn(
-      `next-bun-compile: ⚠ ${sorted.length} PPR shell paths, ${DEPLOY_MARKER_FILE} lists the first ${MARKER_MAX_SHELLS} — the rest render at the origin`
+      `next-bun-compile: ⚠ ${PPR_MARKER_FILE} leaves out ${paths.length} PPR path(s) ${why}, so they render at the origin: ${shown}${more}`
     );
-  }
-  return { version, buildId, ppr: { shells } };
+  };
+  report(overCap, "past its 200-path limit");
+  report(tooLong, "over 200 bytes");
+  report(invalid, "that a client can't send unchanged");
+  return marker(shells.map((s) => s.path));
 }

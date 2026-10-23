@@ -69,40 +69,67 @@ NBC_PPR_SHELL=some-shared-token ./dist/app   # token mode
   concrete prerendered paths, including a dynamic route's
   `generateStaticParams` output, have shells.
 
-## Platform integration
+## The PPR contract
 
-Two pieces let a platform route edge shells without a per-app list.
+A platform that runs the build can skip discovery entirely. Every build
+also speaks the PPR contract (v1), a framework-neutral protocol between
+a framework and an edge: one marker, one shell endpoint, one resume
+endpoint, one build header. An edge that implements it serves any
+framework that does, with no per-framework code.
 
-**The deploy marker.** Every build writes `next-bun-compile.json` next
-to the binary (`dist/` by default, or `NBC_OUT`):
+**The marker.** Every build writes `ppr.json` next to the binary
+(`dist/` by default, so `NBC_OUT=.output` puts it at
+`.output/ppr.json`), with `"shells": []` when no page qualifies:
 
 ```json
 {
-  "version": "2.1.0",
-  "buildId": "Q6p5InH-AoAKW6ZLAyNXg",
-  "ppr": { "shells": ["/pricing", "/blog/hello-world"] }
+  "v": 1,
+  "build": "Q6p5InH-AoAKW6ZLAyNXg",
+  "shells": ["/pricing", "/blog/hello-world"],
+  "bypass": {
+    "headers": ["RSC", "Next-Router-Prefetch", "Next-Router-Segment-Prefetch", "Next-Router-State-Tree", "Next-Action"],
+    "query": ["_rsc"],
+    "cookies": ["__prerender_bypass"]
+  }
 }
 ```
 
-`shells` is exactly what `GET /_nbc/ppr-shell/<route>` serves, computed
-by the same selection the endpoint runs at boot. It applies the same
-proxy and routing-rule exclusions, uses wire-form paths
-(percent-encoded as a client sends them), and is empty when no route
-qualifies. The endpoint addresses `/` as `/_nbc/ppr-shell/index`. The
-list holds at most 200 paths of at most 200 bytes. Past that, the
-shallowest paths win and the build warns. A path left out still
-renders, just at the origin. The marker assumes the binary runs with
-`NBC_PPR_SHELL` set.
+- `shells` lists decoded paths (`/über`, not `/%C3%BCber`) in the form
+  the app serves them, following `trailingSlash`. It is computed by the
+  same selection the endpoint runs at boot, so the endpoint refuses
+  exactly what the list leaves out: proxy- and routing-rule-covered
+  pages, fallback shells, paths a client can't send unchanged, and
+  anything past the limits (200 paths of at most 200 bytes, shallowest
+  kept, with a build warning naming the rest).
+- `build` is `BUILD_ID`, or a digest of it when a custom
+  `generateBuildId` uses characters outside `[A-Za-z0-9._-]`.
+- `bypass` names Next's own requests on a page's path (client
+  navigations, prefetches, actions, draft mode), which an edge passes to
+  the origin untouched.
 
-`buildId` is the endpoint's `buildId` for this build. Once a deploy is
-live, an edge can drop every cached shell whose `buildId` differs
-before it sends a byte, rather than discovering the skew on the
-resume.
+**The endpoints.** With `PPR_TOKEN` set, and the same value in a
+`PPR-Token` header:
 
-**The resume build header.** A `next-resume: 1` POST response carries
-`x-nbc-build-id`, the same value as the endpoint's `buildId`. It is the
-backstop for a shell that predates the marker check: compare the two
-before streaming any hole, and drop the shell on a mismatch.
+```
+GET  /_ppr/shell?path=<decoded path>        →  { v, build, html, state }  + PPR-Build, ETag
+POST /_ppr/resume?url=<path and query>      →  the holes only (text/html)  + PPR-Build
+```
+
+- The resume's body is the shell's `state`, raw. The binary re-sends it
+  to Next as its own form-encoded `next-resume` POST with the visitor's
+  headers, cookies and query, so a hole that reads `searchParams` sees
+  the visitor's. The response is never compressed, and never starts a
+  second document: one that would is refused with a 502.
+- The shell answers `If-None-Match` with a 304, since ISR or a
+  revalidated tag can change a shell within a build.
+- Without `PPR_TOKEN`, or with a missing or wrong header, everything
+  under `/_ppr/` is a 404, so the endpoints are invisible wherever the
+  binary runs.
+
+The binary runs the contract's conformance script in its regression
+suite (`test/regression/ppr-conformance.mjs`). Run it against your own
+deployment with
+`PPR_TOKEN=… bun test/regression/ppr-conformance.mjs <dir with ppr.json> <base url>`.
 
 ## The Cloudflare worker
 
