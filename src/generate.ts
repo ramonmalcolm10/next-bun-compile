@@ -834,6 +834,14 @@ type AdapterSnapshot = {
   hasCustomCacheHandler: boolean;
   middlewareMatchers: string[];
   routingRules: string[];
+  /** headers() rules with what they add, and the rest of routingRules.
+   *  Optional: snapshots from older adapter versions lack them. */
+  headerRules?: Array<{
+    sourceRegex: string;
+    headers: Record<string, string>;
+    conditional: boolean;
+  }>;
+  otherRules?: string[];
   prerenders: Array<{
     pathname: string;
     file: string | null;
@@ -1339,13 +1347,15 @@ export function generateEntryPoint(options: GenerateOptions): string {
     return [a.urlPath, diskPath];
   });
 
-  // The PPR contract's build, fixed now so the binary always matches the
-  // ppr.json written beside it (see pprBuild in runtime/serve.js).
-  const pprBuildId = pprBuildFor(serverDir, distDir);
+  // The edge contract's build, fixed now so the binary always matches the
+  // edge.json written beside it (see edgeBuild in runtime/serve.js), and
+  // the selection's input, so boot lists the pages the marker does.
+  const edgeBuildId = edgeBuildFor(serverDir, distDir);
+  const edgeInput = edgeInputForBinary(serverDir, distDir);
 
   // Generate server-entry.js
   const serverEntry = `import { assetMap, gzippedAssets } from "./assets.generated.js";
-globalThis.__nbcPprBuild = ${JSON.stringify(pprBuildId)};
+globalThis.__nbcEdgeBuild = ${JSON.stringify(edgeBuildId)};
 const path = require("path");
 const fs = require("fs");
 const Module = require("module");
@@ -1606,6 +1616,9 @@ const __NBC_STATIC_PAGES = ${JSON.stringify(staticPages)};
 // Routes the PPR shell endpoint must refuse: their response head is
 // decided upstream of the render, so it can't be committed at a CDN.
 const __NBC_SHELL_GUARDS = ${JSON.stringify(shellGuards)};
+// The edge contract's input: its guards, the headers() rules that travel
+// with a page, and the static pages it may list.
+const __NBC_EDGE = ${JSON.stringify(edgeInput)};
 
 // Image-build hook: \`server --extract\` materializes the runtime tree and
 // exits. A later boot with the same NBC_RUNTIME_DIR hits the manifest
@@ -1630,6 +1643,7 @@ extractAssets().then(() => {
     tier1: __NBC_TIER1,
     staticPages: __NBC_STATIC_PAGES,
     shellGuards: __NBC_SHELL_GUARDS,
+    edge: __NBC_EDGE,
     // serve.js resolves .next/... and Next's own dir option off this, so
     // it is the app dir, not the extraction root (same unless monorepo).
     baseDir: appDir,
@@ -1649,59 +1663,161 @@ extractAssets().then(() => {
 }
 
 
-/** The PPR contract's marker, written next to the binary. */
-export const PPR_MARKER_FILE = "ppr.json";
+/** The edge contract's marker, written next to the binary. */
+export const EDGE_MARKER_FILE = "edge.json";
+/** v1's marker. A build removes any it finds, so an edge never reads a
+ *  list for endpoints this binary no longer serves. */
+export const LEGACY_MARKER_FILE = "ppr.json";
 
-export type PprMarker = {
-  v: 1;
-  /** What both /_ppr endpoints send as PPR-Build. */
+export type EdgeMarker = {
+  v: 2;
+  /** What both /_edge endpoints send as Edge-Build. */
   build: string;
   /** Decoded paths the edge may answer from a shell. */
   shells: string[];
+  /** Decoded paths the edge may answer whole. */
+  static: string[];
   /** Next's own requests on a page's path, which the edge leaves alone. */
   bypass: { headers: string[]; query: string[]; cookies: string[] };
 };
 
-/**
- * The PPR contract's marker: which paths /_ppr/shell serves, computed by
- * the endpoint's own selection (selectPprShells, in the nbc-serve.js that
- * generateEntryPoint copies into serverDir) over the tree being embedded,
- * so the marker and the endpoint can't disagree. Written for every build,
- * with no shells when no page qualifies.
- *
- * Concrete prerendered paths only: fallback shells are withheld (see
- * isFallbackShell in src/runtime/serve.js).
- */
-type PprApi = {
+type HeaderRule = NonNullable<AdapterSnapshot["headerRules"]>[number];
+
+/** What the build hands the edge selection (selectEdgePages in
+ *  src/runtime/serve.js): the same input at build and at boot. */
+type EdgeInput = {
+  guards: string[];
+  headerRules: HeaderRule[];
+  statics: Array<{
+    path: string;
+    file: string;
+    status: number;
+    headers: Record<string, string>;
+    tags: string[];
+  }>;
+};
+
+type EdgePage = { path: string; headers: Record<string, string> };
+type EdgeSelection = {
+  shells: Array<EdgePage & { pair: { shell: string; postponed: string } }>;
+  static: Array<EdgePage & { html: string }>;
+  overCap: string[];
+  invalid: string[];
+  tooLong: string[];
+  otherHeaders: string[];
+  guarded: number;
+  candidates: number;
+};
+
+type EdgeApi = {
   listShellRoutes: (
     baseDir: string,
     guards: string[]
   ) => { routes: Array<{ routePath: string }> };
-  selectPprShells: (
+  selectEdgePages: (
     baseDir: string,
-    guards: string[],
+    input: EdgeInput,
     opts: { trailingSlash: boolean }
-  ) => {
-    shells: Array<{ path: string; pair: { shell: string; postponed: string } }>;
-    overCap: string[];
-    invalid: string[];
-    tooLong: string[];
-  };
-  pprBuild: (
+  ) => EdgeSelection;
+  edgeBuild: (
     baseDir: string,
-    shells: Array<{ path: string; pair: { shell: string; postponed: string } }>
+    shells: EdgeSelection["shells"],
+    statics: EdgeSelection["static"]
   ) => string;
-  PPR_BYPASS: PprMarker["bypass"];
+  edgeHeaderRuleOk: (rule: HeaderRule) => boolean;
+  EDGE_BYPASS: EdgeMarker["bypass"];
 };
+
+const cacheTags = (headers: Record<string, string> | undefined) =>
+  (headers?.["x-next-cache-tags"] ?? "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+/**
+ * The edge selection's input, from the adapter snapshot.
+ *
+ * Guards: proxy/middleware matchers, redirects and rewrites, and the
+ * headers() rules that can't travel with a page (a header off the
+ * contract's list, or a has/missing condition). A headers() rule the
+ * contract allows doesn't guard: its headers go out with the page.
+ *
+ * Statics: every prerendered HTML document Next froze for the build (no
+ * revalidate timer, no postponed state), error pages aside. The selection
+ * then drops the guarded ones and any that aren't a plain 200.
+ */
+function edgeInputFor(
+  snapshot: AdapterSnapshot,
+  distDir: string,
+  api: EdgeApi
+): EdgeInput {
+  if (snapshot.basePath || snapshot.i18n) {
+    return { guards: [".*"], headerRules: [], statics: [] };
+  }
+  let guards: string[];
+  let headerRules: HeaderRule[] = [];
+  if (snapshot.headerRules && snapshot.otherRules) {
+    headerRules = snapshot.headerRules.filter((r) => api.edgeHeaderRuleOk(r));
+    guards = [
+      ...snapshot.middlewareMatchers,
+      ...snapshot.otherRules,
+      ...snapshot.headerRules
+        .filter((r) => !api.edgeHeaderRuleOk(r))
+        .map((r) => r.sourceRegex),
+    ];
+  } else {
+    // A snapshot that doesn't say which rules only add headers: all guard.
+    guards = shellGuardsFor(snapshot);
+  }
+
+  const isError = (p: string) => p.startsWith("/_") || p === "/404" || p === "/500";
+  const statics: EdgeInput["statics"] = [];
+  const seen = new Set<string>();
+  for (const p of snapshot.prerenders) {
+    if (!p.file || !p.file.endsWith(".html")) continue;
+    if (isError(p.pathname) || p.revalidate !== false || p.postponed) continue;
+    if (p.pathname.split("/").some((seg) => seg.startsWith("[") && seg.endsWith("]"))) continue;
+    seen.add(p.pathname);
+    statics.push({
+      path: p.pathname,
+      file: p.file.replace(/\\/g, "/"),
+      status: p.status,
+      headers: p.headers,
+      tags: cacheTags(p.headers),
+    });
+  }
+  // Auto-static pages-router HTML, which Next reports as static files.
+  for (const f of snapshot.staticFiles ?? []) {
+    const file = f.file.replace(/\\/g, "/");
+    if (!file.endsWith(".html") || isError(f.pathname) || seen.has(f.pathname)) continue;
+    let meta: { status?: number; headers?: Record<string, string> } = {};
+    try {
+      meta = JSON.parse(
+        readFileSync(join(distDir, file.slice(0, -".html".length) + ".meta"), "utf-8")
+      );
+    } catch {
+      // .html seeds may have no .meta (auto-static pages): defaults ok
+    }
+    seen.add(f.pathname);
+    statics.push({
+      path: f.pathname,
+      file,
+      status: meta.status ?? 200,
+      headers: meta.headers ?? {},
+      tags: cacheTags(meta.headers),
+    });
+  }
+  return { guards, headerRules, statics };
+}
 
 /** The marker's selection, run by the nbc-serve.js in the tree, exactly
  *  as the binary runs it at boot. Null without an adapter snapshot. */
 function selectForMarker(serverDir: string, distDir: string) {
   const api = createRequire(import.meta.url)(
     join(serverDir, "nbc-serve.js")
-  ) as PprApi;
+  ) as EdgeApi;
   const snapshot = readAdapterSnapshot(distDir);
-  if (!snapshot) return { api, snapshot, selection: null };
+  if (!snapshot) return { api, snapshot, input: null, selection: null };
   let config: { trailingSlash?: boolean } = {};
   try {
     config =
@@ -1711,40 +1827,84 @@ function selectForMarker(serverDir: string, distDir: string) {
         ) as { config?: { trailingSlash?: boolean } }
       ).config ?? {};
   } catch {}
-  const selection = api.selectPprShells(serverDir, shellGuardsFor(snapshot), {
+  const input = edgeInputFor(snapshot, distDir, api);
+  const selection = api.selectEdgePages(serverDir, input, {
     trailingSlash: !!config.trailingSlash,
   });
-  return { api, snapshot, selection };
+  return { api, snapshot, input, selection };
+}
+
+/** The edge selection's input for the binary, so boot selects what the
+ *  marker lists. */
+export function edgeInputForBinary(serverDir: string, distDir: string): EdgeInput {
+  return selectForMarker(serverDir, distDir).input ?? {
+    guards: [],
+    headerRules: [],
+    statics: [],
+  };
 }
 
 /** The contract's `build` for this tree; generateEntryPoint stamps it into
  *  the binary so boot never recomputes it from files ISR can rewrite. */
-export function pprBuildFor(serverDir: string, distDir: string): string {
+export function edgeBuildFor(serverDir: string, distDir: string): string {
   const { api, selection } = selectForMarker(serverDir, distDir);
-  return api.pprBuild(serverDir, selection?.shells ?? []);
+  return api.edgeBuild(serverDir, selection?.shells ?? [], selection?.static ?? []);
 }
 
-export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
+// The proxy or middleware file a project has, for saying why its lists
+// came out empty.
+function proxyFile(projectDir: string): string | null {
+  for (const dir of ["", "src/"]) {
+    for (const name of ["proxy", "middleware"]) {
+      for (const ext of [".ts", ".js", ".mjs", ".mts"]) {
+        if (existsSync(join(projectDir, dir + name + ext))) return dir + name + ext;
+      }
+    }
+  }
+  return null;
+}
+
+export function buildEdgeMarker(serverDir: string, distDir: string): EdgeMarker {
   const { api, snapshot, selection } = selectForMarker(serverDir, distDir);
-  const marker = (shells: string[]): PprMarker => ({
-    v: 1,
-    build: api.pprBuild(serverDir, selection?.shells ?? []),
+  const marker = (shells: string[], statics: string[]): EdgeMarker => ({
+    v: 2,
+    build: api.edgeBuild(serverDir, selection?.shells ?? [], selection?.static ?? []),
     shells,
-    bypass: api.PPR_BYPASS,
+    static: statics,
+    bypass: api.EDGE_BYPASS,
   });
-  if (!snapshot || !selection) return marker([]);
-  const { shells, overCap, invalid, tooLong } = selection;
+  if (!snapshot || !selection) return marker([], []);
+  const { overCap, invalid, tooLong, otherHeaders } = selection;
   const report = (paths: string[], why: string) => {
     if (paths.length === 0) return;
     const shown = paths.slice(0, 10).join(", ");
     const more = paths.length > 10 ? ` and ${paths.length - 10} more` : "";
     console.warn(
-      `next-bun-compile: ⚠ ${PPR_MARKER_FILE} leaves out ${paths.length} PPR path(s) ${why}, so they render at the origin: ${shown}${more}`
+      `next-bun-compile: ⚠ ${EDGE_MARKER_FILE} leaves out ${paths.length} page(s) ${why}, so they render at the origin: ${shown}${more}`
     );
   };
   report(overCap, "past its 200-path limit");
   report(tooLong, "over 200 bytes");
   report(invalid, "that a client can't send unchanged");
+  report(otherHeaders, "whose response headers an edge may not send");
+
+  // An empty marker must never read as a bug: say what emptied it.
+  const listed = selection.shells.length + selection.static.length;
+  if (listed === 0 && (snapshot.basePath || snapshot.i18n)) {
+    console.log(
+      `next-bun-compile: ${EDGE_MARKER_FILE} lists no pages: ${snapshot.basePath ? "basePath" : "i18n"} is set, and the edge can't place its routing`
+    );
+  } else if (
+    listed === 0 &&
+    selection.candidates > 0 &&
+    selection.guarded === selection.candidates &&
+    snapshot.middlewareMatchers.length > 0
+  ) {
+    const file = proxyFile(join(distDir, ".."));
+    console.log(
+      `next-bun-compile: ${EDGE_MARKER_FILE} lists no pages: ${file ?? "proxy/middleware"} runs on every one of them, so their response belongs to the origin`
+    );
+  }
 
   // Every page Next prerendered with postponed state should turn up in
   // discovery, unguarded. One that doesn't means Next stored it somewhere
@@ -1770,8 +1930,11 @@ export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
     const shown = unread.slice(0, 10).join(", ");
     const more = unread.length > 10 ? ` and ${unread.length - 10} more` : "";
     console.warn(
-      `next-bun-compile: ⚠ ${unread.length} PPR page(s) have no shell next-bun-compile can read, so ${PPR_MARKER_FILE} leaves them out and they render at the origin: ${shown}${more}. This Next.js version may store prerenders somewhere next-bun-compile doesn't look yet; please report it.`
+      `next-bun-compile: ⚠ ${unread.length} PPR page(s) have no shell next-bun-compile can read, so ${EDGE_MARKER_FILE} leaves them out and they render at the origin: ${shown}${more}. This Next.js version may store prerenders somewhere next-bun-compile doesn't look yet; please report it.`
     );
   }
-  return marker(shells.map((s) => s.path));
+  return marker(
+    selection.shells.map((s) => s.path),
+    selection.static.map((s) => s.path)
+  );
 }

@@ -11,7 +11,7 @@ import {
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
-  buildPprMarker,
+  buildEdgeMarker,
   generateEntryPoint,
   isPrunableModuleFile,
   shouldCompressEmbeddedAsset,
@@ -1167,7 +1167,14 @@ describe("isPrunableModuleFile", () => {
   }
 });
 
-describe("buildPprMarker", () => {
+type StaticPage = {
+  html?: string;
+  status?: number;
+  revalidate?: number | false;
+  headers?: Record<string, string>;
+};
+
+describe("buildEdgeMarker", () => {
   const pprPair = (postponed: string | null) => ({
     meta: JSON.stringify(postponed ? { postponed } : { status: 200 }),
     html: "<html>shell</html>",
@@ -1184,6 +1191,7 @@ describe("buildPprMarker", () => {
       config = {},
       layout = "app" as "app" | "route-cache",
       fallbacks = [] as string[],
+      statics = {} as Record<string, StaticPage>,
     } = {}
   ) {
     const root = join(tmpBase, name);
@@ -1203,6 +1211,26 @@ describe("buildPprMarker", () => {
       ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
       ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
     };
+    // Fully static prerenders, as the adapter reports them, with the
+    // document Next wrote for each.
+    const prerenders: object[] = [];
+    for (const [rel, page] of Object.entries(statics)) {
+      const file = `server/app/${rel}.html`;
+      files[`.next/standalone/.next/${file}`] = page.html ?? `<!DOCTYPE html><html>${rel}</html>`;
+      prerenders.push({
+        pathname: rel === "index" ? "/" : `/${rel}`,
+        file,
+        status: page.status ?? 200,
+        revalidate: page.revalidate ?? false,
+        postponed: false,
+        headers: page.headers ?? {},
+      });
+    }
+    if (prerenders.length) {
+      const snap = JSON.parse(files[".next/nbc-adapter-outputs.json"]);
+      snap.prerenders = [...snap.prerenders, ...prerenders];
+      files[".next/nbc-adapter-outputs.json"] = JSON.stringify(snap);
+    }
     for (const [rel, postponed] of Object.entries(pages)) {
       const pair = pprPair(postponed);
       let dir = ".next/standalone/.next/server/app";
@@ -1224,7 +1252,7 @@ describe("buildPprMarker", () => {
     }
     scaffold(root, files);
     generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
-    return buildPprMarker(standaloneDir, distDir);
+    return buildEdgeMarker(standaloneDir, distDir);
   }
 
   test("lists exactly the shells the endpoint serves", () => {
@@ -1242,7 +1270,7 @@ describe("buildPprMarker", () => {
       },
       { middlewareMatchers: ["^\\/guarded$"] }
     );
-    expect(marker.v).toBe(1);
+    expect(marker.v).toBe(2);
     expect(marker.build).toMatch(/^test-build-id\.[0-9a-f]{12}$/);
     // Decoded, as the contract matches them.
     expect(marker.shells).toEqual(["/ppr", "/has space", "/blog/hello/world"]);
@@ -1261,9 +1289,10 @@ describe("buildPprMarker", () => {
     expect(marker.shells).toEqual(["/", "/ppr/"]);
   });
 
-  test("an empty list, still written, when no page has a shell", () => {
+  test("empty lists, still written, when no page qualifies", () => {
     const marker = build("marker-none", { static: null });
     expect(marker.shells).toEqual([]);
+    expect(marker.static).toEqual([]);
     expect(marker.build).toMatch(/^test-build-id\.[0-9a-f]{12}$/);
   });
 
@@ -1283,7 +1312,7 @@ describe("buildPprMarker", () => {
       join(tmpBase, "marker-stamp", ".next/standalone/server-entry.js"),
       "utf-8"
     );
-    expect(entry).toContain(`globalThis.__nbcPprBuild = ${JSON.stringify(marker.build)};`);
+    expect(entry).toContain(`globalThis.__nbcEdgeBuild = ${JSON.stringify(marker.build)};`);
   });
 
   test("a build id outside the contract's alphabet becomes its digest", () => {
@@ -1315,7 +1344,7 @@ describe("buildPprMarker", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const page = (pathname: string, file: string | null) => ({
-        pathname, file, status: 200, revalidate: false, postponed: true, headers: {},
+        pathname, file, status: 200, revalidate: false as const, postponed: true, headers: {},
       });
       build("marker-unread", { ppr: "state" }, {
         prerenders: [
@@ -1342,5 +1371,129 @@ describe("buildPprMarker", () => {
     expect(shells[0]).toBe("/top");
     expect(new Set(shells).size).toBe(200);
     expect(shells.every((p) => Buffer.byteLength(p) <= 200)).toBe(true);
+  });
+
+  test("lists the frozen pages in static: no timer, a 200, not guarded, not an error page", () => {
+    const marker = build(
+      "marker-static",
+      { ppr: "state" },
+      { middlewareMatchers: ["^\\/account$"] },
+      {
+        statics: {
+          index: {},
+          pricing: {},
+          isr: { revalidate: 60 }, // changes while the app sleeps
+          gone: { status: 404 },
+          _not_found: {},
+          account: {}, // under the proxy
+          ppr: {}, // a shell already: never in both
+        },
+      }
+    );
+    expect(marker.static).toEqual(["/", "/pricing"]);
+    expect(marker.shells).toEqual(["/ppr"]);
+  });
+
+  test("static follows trailingSlash, as the app answers it", () => {
+    const marker = build(
+      "marker-static-slash",
+      {},
+      {},
+      { config: { trailingSlash: true }, statics: { index: {}, pricing: {} } }
+    );
+    expect(marker.static).toEqual(["/", "/pricing/"]);
+  });
+
+  test("a page that sets a cookie or another header isn't static", () => {
+    const marker = build(
+      "marker-static-headers",
+      {},
+      {},
+      {
+        statics: {
+          plain: { headers: { "x-next-cache-tags": "_N_T_/plain", "x-nextjs-stale-time": "300" } },
+          robots: { headers: { "x-robots-tag": "noindex" } },
+          cookie: { headers: { "set-cookie": "a=1" } },
+          custom: { headers: { "x-powered-by-me": "1" } },
+        },
+      }
+    );
+    expect(marker.static.sort()).toEqual(["/plain", "/robots"]);
+  });
+
+  test("a security-header rule travels with the page; any other rule guards it", () => {
+    const rule = (sourceRegex: string, headers: Record<string, string>, conditional = false) => ({
+      sourceRegex,
+      headers,
+      conditional,
+    });
+    const marker = build(
+      "marker-header-rules",
+      { ppr: "state" },
+      {
+        routingRules: ["^(?:\\/(.*))$", "^\\/odd$", "^\\/when$", "^\\/moved$"],
+        headerRules: [
+          rule("^(?:\\/(.*))$", {
+            "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'self'; img-src https: data:",
+          }),
+          rule("^\\/odd$", { "X-Custom": "1" }),
+          rule("^\\/when$", { "X-Frame-Options": "DENY" }, true),
+        ],
+        otherRules: ["^\\/moved$"],
+      },
+      { statics: { index: {}, odd: {}, when: {}, moved: {} } }
+    );
+    expect(marker.static).toEqual(["/"]);
+    expect(marker.shells).toEqual(["/ppr"]);
+  });
+
+  test("without the rules' detail, every routing rule still guards", () => {
+    const marker = build(
+      "marker-old-snapshot",
+      { ppr: "state" },
+      { routingRules: ["^(?:\\/(.*))$"] },
+      { statics: { index: {} } }
+    );
+    expect(marker.static).toEqual([]);
+    expect(marker.shells).toEqual([]);
+  });
+
+  test("the build changes when only a static page does", () => {
+    const a = build("marker-static-digest-a", {}, {}, { statics: { index: { html: "<html>a</html>" } } });
+    const b = build("marker-static-digest-b", {}, {}, { statics: { index: { html: "<html>b</html>" } } });
+    const c = build("marker-static-digest-c", {}, {}, { statics: { index: { html: "<html>a</html>" } } });
+    expect(a.build).not.toBe(b.build);
+    expect(a.build).toBe(c.build);
+  });
+
+  test("caps static at 200 too, shallowest first", () => {
+    const statics: Record<string, StaticPage> = { top: {} };
+    for (let i = 0; i < 210; i++) statics[`posts/p${String(i).padStart(3, "0")}`] = {};
+    const marker = build("marker-static-cap", {}, {}, { statics });
+    expect(marker.static.length).toBe(200);
+    expect(marker.static[0]).toBe("/top");
+  });
+
+  test("an empty marker says a catch-all proxy emptied it", () => {
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const root = join(tmpBase, "marker-proxy-all");
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, "proxy.ts"), "export function proxy() {}");
+      const marker = build(
+        "marker-proxy-all",
+        { ppr: "state" },
+        { middlewareMatchers: ["^.*$"] },
+        { statics: { index: {} } }
+      );
+      expect(marker.shells).toEqual([]);
+      expect(marker.static).toEqual([]);
+      const said = log.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(said).toContain("edge.json lists no pages: proxy.ts runs on every one of them");
+    } finally {
+      log.mockRestore();
+    }
   });
 });
