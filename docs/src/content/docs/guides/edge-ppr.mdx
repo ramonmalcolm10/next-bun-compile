@@ -122,6 +122,9 @@ POST /_ppr/resume?url=<path and query>      →  the holes only (text/html)  + P
   second document: one that would is refused with a 502.
 - The shell answers `If-None-Match` with a 304, since ISR or a
   revalidated tag can change a shell within a build.
+- Every answer under `/_ppr/`, a 404 included, is
+  `Cache-Control: private, no-store`. They are answered only for the
+  token, so no cache between the edge and the origin may keep one.
 - Without `PPR_TOKEN`, or with a missing or wrong header, everything
   under `/_ppr/` is a 404, so the endpoints are invisible wherever the
   binary runs.

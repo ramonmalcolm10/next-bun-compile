@@ -310,20 +310,8 @@ m = json.load(open('$APP/dist/ppr.json'))
 assert m['v'] == 1 and m['build'], m
 assert '/ppr' in m['shells'] and '/ppr-guarded' not in m['shells'], m['shells']
 "
-expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded
-# What the script leaves to each framework: the holes see the visitor's
-# query, the resume is never compressed, and the whole prefix is reserved.
-expect "resume renders the visitor's query, uncompressed" bun -e "
-const [base, t] = ['http://127.0.0.1:$PORT', '$TOKEN']
-const s = await (await fetch(base + '/_ppr/shell?path=%2Fsearch', { headers: { 'PPR-Token': t } })).json()
-const r = await fetch(base + '/_ppr/resume?url=' + encodeURIComponent('/search?utm_source=news'), {
-  method: 'POST', body: s.state,
-  headers: { 'PPR-Token': t, 'Content-Type': 'application/octet-stream', 'Accept-Encoding': 'gzip, br' },
-})
-const holes = await r.text()
-if (!holes.includes('utm=<!-- -->news')) throw new Error(holes.slice(0, 300))
-if (r.headers.get('content-encoding')) throw new Error('compressed resume')
-"
+expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded --query '/search?utm_source=ppr-check'
+# Beyond the script: an empty state, and the rest of the reserved prefix.
 expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "400"
 expect "an unknown /_ppr/ path is a 404 even with the token" test "$(code_of -H "PPR-Token: $TOKEN" http://127.0.0.1:$PORT/_ppr/x)" = "404"
 expect "a GET to the resume endpoint is a 404" test "$(code_of -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "404"
