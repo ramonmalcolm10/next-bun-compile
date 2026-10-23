@@ -1339,8 +1339,13 @@ export function generateEntryPoint(options: GenerateOptions): string {
     return [a.urlPath, diskPath];
   });
 
+  // The PPR contract's build, fixed now so the binary always matches the
+  // ppr.json written beside it (see pprBuild in runtime/serve.js).
+  const pprBuildId = pprBuildFor(serverDir, distDir);
+
   // Generate server-entry.js
   const serverEntry = `import { assetMap, gzippedAssets } from "./assets.generated.js";
+globalThis.__nbcPprBuild = ${JSON.stringify(pprBuildId)};
 const path = require("path");
 const fs = require("fs");
 const Module = require("module");
@@ -1667,43 +1672,68 @@ export type PprMarker = {
  * Concrete prerendered paths only: fallback shells are withheld (see
  * isFallbackShell in src/runtime/serve.js).
  */
-export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
-  const { selectPprShells, pprBuild, PPR_BYPASS } = createRequire(
-    import.meta.url
-  )(join(serverDir, "nbc-serve.js")) as {
-    selectPprShells: (
-      baseDir: string,
-      guards: string[],
-      opts: { trailingSlash: boolean }
-    ) => {
-      shells: Array<{ path: string }>;
-      overCap: string[];
-      invalid: string[];
-      tooLong: string[];
-    };
-    pprBuild: (baseDir: string) => string;
-    PPR_BYPASS: PprMarker["bypass"];
+type PprApi = {
+  listShellRoutes: (
+    baseDir: string,
+    guards: string[]
+  ) => { routes: Array<{ routePath: string }> };
+  selectPprShells: (
+    baseDir: string,
+    guards: string[],
+    opts: { trailingSlash: boolean }
+  ) => {
+    shells: Array<{ path: string; pair: { shell: string; postponed: string } }>;
+    overCap: string[];
+    invalid: string[];
+    tooLong: string[];
   };
-  const build = pprBuild(serverDir);
+  pprBuild: (
+    baseDir: string,
+    shells: Array<{ path: string; pair: { shell: string; postponed: string } }>
+  ) => string;
+  PPR_BYPASS: PprMarker["bypass"];
+};
+
+/** The marker's selection, run by the nbc-serve.js in the tree, exactly
+ *  as the binary runs it at boot. Null without an adapter snapshot. */
+function selectForMarker(serverDir: string, distDir: string) {
+  const api = createRequire(import.meta.url)(
+    join(serverDir, "nbc-serve.js")
+  ) as PprApi;
+  const snapshot = readAdapterSnapshot(distDir);
+  if (!snapshot) return { api, snapshot, selection: null };
+  let config: { trailingSlash?: boolean } = {};
+  try {
+    config =
+      (
+        JSON.parse(
+          readFileSync(join(distDir, "required-server-files.json"), "utf-8")
+        ) as { config?: { trailingSlash?: boolean } }
+      ).config ?? {};
+  } catch {}
+  const selection = api.selectPprShells(serverDir, shellGuardsFor(snapshot), {
+    trailingSlash: !!config.trailingSlash,
+  });
+  return { api, snapshot, selection };
+}
+
+/** The contract's `build` for this tree; generateEntryPoint stamps it into
+ *  the binary so boot never recomputes it from files ISR can rewrite. */
+export function pprBuildFor(serverDir: string, distDir: string): string {
+  const { api, selection } = selectForMarker(serverDir, distDir);
+  return api.pprBuild(serverDir, selection?.shells ?? []);
+}
+
+export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
+  const { api, snapshot, selection } = selectForMarker(serverDir, distDir);
   const marker = (shells: string[]): PprMarker => ({
     v: 1,
-    build,
+    build: api.pprBuild(serverDir, selection?.shells ?? []),
     shells,
-    bypass: PPR_BYPASS,
+    bypass: api.PPR_BYPASS,
   });
-  const snapshot = readAdapterSnapshot(distDir);
-  if (!snapshot) return marker([]);
-  const config =
-    (
-      JSON.parse(
-        readFileSync(join(distDir, "required-server-files.json"), "utf-8")
-      ) as { config?: { trailingSlash?: boolean } }
-    ).config ?? {};
-  const { shells, overCap, invalid, tooLong } = selectPprShells(
-    serverDir,
-    shellGuardsFor(snapshot),
-    { trailingSlash: !!config.trailingSlash }
-  );
+  if (!snapshot || !selection) return marker([]);
+  const { shells, overCap, invalid, tooLong } = selection;
   const report = (paths: string[], why: string) => {
     if (paths.length === 0) return;
     const shown = paths.slice(0, 10).join(", ");
@@ -1715,5 +1745,33 @@ export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
   report(overCap, "past its 200-path limit");
   report(tooLong, "over 200 bytes");
   report(invalid, "that a client can't send unchanged");
+
+  // Every page Next prerendered with postponed state should turn up in
+  // discovery, unguarded. One that doesn't means Next stored it somewhere
+  // the binary doesn't read, as 16.4's route cache once did. Say so
+  // rather than write a list that is silently short.
+  const found = new Set(
+    api.listShellRoutes(serverDir, []).routes.map((r) => r.routePath)
+  );
+  // Files on disk never carry basePath; the adapter's pathnames may.
+  const bp = snapshot.basePath || "";
+  const onDisk = (p: string) =>
+    bp && (p === bp || p.startsWith(bp + "/")) ? p.slice(bp.length) || "/" : p;
+  const unread = snapshot.prerenders
+    .filter(
+      (p) =>
+        p.postponed &&
+        p.file?.endsWith(".html") &&
+        !p.pathname.split("/").some((seg) => seg.startsWith("[") && seg.endsWith("]")) &&
+        !found.has(onDisk(p.pathname))
+    )
+    .map((p) => p.pathname);
+  if (unread.length > 0) {
+    const shown = unread.slice(0, 10).join(", ");
+    const more = unread.length > 10 ? ` and ${unread.length - 10} more` : "";
+    console.warn(
+      `next-bun-compile: ⚠ ${unread.length} PPR page(s) have no shell next-bun-compile can read, so ${PPR_MARKER_FILE} leaves them out and they render at the origin: ${shown}${more}. This Next.js version may store prerenders somewhere next-bun-compile doesn't look yet; please report it.`
+    );
+  }
   return marker(shells.map((s) => s.path));
 }

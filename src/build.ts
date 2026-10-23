@@ -163,13 +163,22 @@ export async function runBuild(options: RunBuildOptions): Promise<string> {
   mkdirSync(dirname(outfile), { recursive: true });
   compile({ serverDir, outfile, extraArgs: resolveExtraArgs(options) });
   // Next to the binary, so a platform that ships the output dir gets it
-  // with the binary (NBC_OUT=.output → .output/ppr.json). Written last:
-  // a marker only ever describes a binary that exists.
+  // with the binary, and at .output/ppr.json, where the PPR contract has
+  // every framework write it for a builder to find. The same file when
+  // NBC_OUT=.output. Written last: a marker only ever describes a binary
+  // that exists.
   const marker = buildPprMarker(serverDir, distDir);
-  writeFileSync(
-    join(dirname(outfile), PPR_MARKER_FILE),
-    JSON.stringify(marker, null, 2) + "\n"
-  );
+  const json = JSON.stringify(marker, null, 2) + "\n";
+  const markerPaths = [
+    ...new Set([
+      join(dirname(outfile), PPR_MARKER_FILE),
+      join(projectDir, ".output", PPR_MARKER_FILE),
+    ]),
+  ];
+  for (const p of markerPaths) {
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, json);
+  }
   console.log(
     `next-bun-compile: ${PPR_MARKER_FILE} lists ${marker.shells.length} PPR shell path(s)`
   );
