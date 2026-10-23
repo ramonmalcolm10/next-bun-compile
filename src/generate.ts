@@ -12,6 +12,7 @@ import {
 import { join, relative, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
+import { createRequire } from "node:module";
 
 interface GenerateOptions {
   standaloneDir: string;
@@ -861,6 +862,18 @@ function readAdapterSnapshot(distDir: string): AdapterSnapshot | null {
   }
 }
 
+/**
+ * The coverage rules the PPR shell endpoint enforces: proxy/middleware
+ * matchers plus response-altering routing rules. These matchers are
+ * written against the request path; with a basePath or i18n prefix in
+ * play we can't say which space a shell route's path is in, so we can't
+ * prove a route is uncovered. Refuse them all.
+ */
+function shellGuardsFor(snapshot: AdapterSnapshot): string[] {
+  if (snapshot.basePath || snapshot.i18n) return [".*"];
+  return [...snapshot.middlewareMatchers, ...snapshot.routingRules];
+}
+
 function computeStaticTiersFromSnapshot(
   snapshot: AdapterSnapshot,
   args: {
@@ -870,19 +883,13 @@ function computeStaticTiersFromSnapshot(
     assetPrefix: string;
   }
 ): TierResult {
-  const guardSources = [
-    ...snapshot.middlewareMatchers,
-    ...snapshot.routingRules,
-  ];
+  const guardSources = shellGuardsFor(snapshot);
   const none = (why: string): TierResult => ({
     tier1: [],
     staticPages: [],
     disabled: why,
     customCacheHandler: snapshot.hasCustomCacheHandler,
-    // These matchers are written against the request path; with a basePath
-    // or i18n prefix in play we can't say which space a shell route's path
-    // is in, so we can't prove a route is uncovered. Refuse them all.
-    shellGuards: [".*"],
+    shellGuards: guardSources,
   });
   if (snapshot.basePath) return none("basePath is set");
   if (snapshot.i18n) return none("i18n is configured");
@@ -1634,4 +1641,79 @@ extractAssets().then(() => {
   writeFileSync(join(serverDir, "server-entry.js"), serverEntry);
 
   return serverDir;
+}
+
+
+/** The PPR contract's marker, written next to the binary. */
+export const PPR_MARKER_FILE = "ppr.json";
+
+export type PprMarker = {
+  v: 1;
+  /** What both /_ppr endpoints send as PPR-Build. */
+  build: string;
+  /** Decoded paths the edge may answer from a shell. */
+  shells: string[];
+  /** Next's own requests on a page's path, which the edge leaves alone. */
+  bypass: { headers: string[]; query: string[]; cookies: string[] };
+};
+
+/**
+ * The PPR contract's marker: which paths /_ppr/shell serves, computed by
+ * the endpoint's own selection (selectPprShells, in the nbc-serve.js that
+ * generateEntryPoint copies into serverDir) over the tree being embedded,
+ * so the marker and the endpoint can't disagree. Written for every build,
+ * with no shells when no page qualifies.
+ *
+ * Concrete prerendered paths only: fallback shells are withheld (see
+ * isFallbackShell in src/runtime/serve.js).
+ */
+export function buildPprMarker(serverDir: string, distDir: string): PprMarker {
+  const { selectPprShells, pprBuild, PPR_BYPASS } = createRequire(
+    import.meta.url
+  )(join(serverDir, "nbc-serve.js")) as {
+    selectPprShells: (
+      baseDir: string,
+      guards: string[],
+      opts: { trailingSlash: boolean }
+    ) => {
+      shells: Array<{ path: string }>;
+      overCap: string[];
+      invalid: string[];
+      tooLong: string[];
+    };
+    pprBuild: (baseDir: string) => string;
+    PPR_BYPASS: PprMarker["bypass"];
+  };
+  const build = pprBuild(serverDir);
+  const marker = (shells: string[]): PprMarker => ({
+    v: 1,
+    build,
+    shells,
+    bypass: PPR_BYPASS,
+  });
+  const snapshot = readAdapterSnapshot(distDir);
+  if (!snapshot) return marker([]);
+  const config =
+    (
+      JSON.parse(
+        readFileSync(join(distDir, "required-server-files.json"), "utf-8")
+      ) as { config?: { trailingSlash?: boolean } }
+    ).config ?? {};
+  const { shells, overCap, invalid, tooLong } = selectPprShells(
+    serverDir,
+    shellGuardsFor(snapshot),
+    { trailingSlash: !!config.trailingSlash }
+  );
+  const report = (paths: string[], why: string) => {
+    if (paths.length === 0) return;
+    const shown = paths.slice(0, 10).join(", ");
+    const more = paths.length > 10 ? ` and ${paths.length - 10} more` : "";
+    console.warn(
+      `next-bun-compile: ⚠ ${PPR_MARKER_FILE} leaves out ${paths.length} PPR path(s) ${why}, so they render at the origin: ${shown}${more}`
+    );
+  };
+  report(overCap, "past its 200-path limit");
+  report(tooLong, "over 200 bytes");
+  report(invalid, "that a client can't send unchanged");
+  return marker(shells.map((s) => s.path));
 }

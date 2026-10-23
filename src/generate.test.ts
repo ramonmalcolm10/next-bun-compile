@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import {
+  buildPprMarker,
   generateEntryPoint,
   isPrunableModuleFile,
   shouldCompressEmbeddedAsset,
@@ -1163,4 +1164,110 @@ describe("isPrunableModuleFile", () => {
       expect(isPrunableModuleFile(mod)).toBe(want);
     });
   }
+});
+
+describe("buildPprMarker", () => {
+  const pprPair = (postponed: string | null) => ({
+    meta: JSON.stringify(postponed ? { postponed } : { status: 200 }),
+    html: "<html>shell</html>",
+  });
+
+  /** A built tree whose server/app holds the given page pairs. */
+  function build(
+    name: string,
+    pages: Record<string, string | null>,
+    snapshot = {},
+    { buildId = "test-build-id", config = {} } = {}
+  ) {
+    const root = join(tmpBase, name);
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+    const files: Record<string, string> = {
+      ".next/required-server-files.json": JSON.stringify({
+        config: { assetPrefix: "", ...config },
+      }),
+      ".next/BUILD_ID": buildId,
+      ".next/nbc-adapter-outputs.json": JSON.stringify({
+        ...JSON.parse(mockSnapshot()),
+        ...snapshot,
+      }),
+      ".next/standalone/server.js": MOCK_SERVER_JS,
+      ".next/standalone/.next/BUILD_ID": buildId,
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+      ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+    };
+    for (const [rel, postponed] of Object.entries(pages)) {
+      const pair = pprPair(postponed);
+      files[`.next/standalone/.next/server/app/${rel}.meta`] = pair.meta;
+      files[`.next/standalone/.next/server/app/${rel}.html`] = pair.html;
+    }
+    scaffold(root, files);
+    generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
+    return buildPprMarker(standaloneDir, distDir);
+  }
+
+  test("lists exactly the shells the endpoint serves", () => {
+    const marker = build(
+      "marker-select",
+      {
+        ppr: "state",
+        "blog/hello/world": "state",
+        "has space": "state",
+        static: null, // no postponed state: no shell
+        guarded: "state", // covered by the proxy matcher below
+        "docs/[slug]": "state", // fallback shells can't be resumed here
+        "opt/[[...slug]]": "state",
+        "q?x": "state", // a client can't send this path unchanged
+      },
+      { middlewareMatchers: ["^\\/guarded$"] }
+    );
+    expect(marker.v).toBe(1);
+    expect(marker.build).toBe("test-build-id");
+    // Decoded, as the contract matches them.
+    expect(marker.shells).toEqual(["/ppr", "/has space", "/blog/hello/world"]);
+    expect(marker.bypass.headers).toContain("RSC");
+    expect(marker.bypass.query).toEqual(["_rsc"]);
+    expect(marker.bypass.cookies).toEqual(["__prerender_bypass"]);
+  });
+
+  test("follows trailingSlash, leaving / alone", () => {
+    const marker = build(
+      "marker-slash",
+      { index: "state", ppr: "state" },
+      {},
+      { config: { trailingSlash: true } }
+    );
+    expect(marker.shells).toEqual(["/", "/ppr/"]);
+  });
+
+  test("an empty list, still written, when no page has a shell", () => {
+    const marker = build("marker-none", { static: null });
+    expect(marker.shells).toEqual([]);
+    expect(marker.build).toBe("test-build-id");
+  });
+
+  test("a build id outside the contract's alphabet becomes its digest", () => {
+    const marker = build(
+      "marker-oddid",
+      { ppr: "state" },
+      { buildId: "release 1/2" },
+      { buildId: "release 1/2" }
+    );
+    expect(marker.build).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  test("refuses every shell under basePath (matchers can't be placed)", () => {
+    const marker = build("marker-basepath", { ppr: "state" }, { basePath: "/app" });
+    expect(marker.shells).toEqual([]);
+  });
+
+  test("caps at 200 paths, shallowest first, and drops paths over 200 bytes", () => {
+    const pages: Record<string, string> = { top: "state", ["deep/" + "x".repeat(200)]: "state" };
+    for (let i = 0; i < 210; i++) pages[`posts/p${String(i).padStart(3, "0")}`] = "state";
+    const { shells } = build("marker-cap", pages);
+    expect(shells.length).toBe(200);
+    expect(shells[0]).toBe("/top");
+    expect(new Set(shells).size).toBe(200);
+    expect(shells.every((p) => Buffer.byteLength(p) <= 200)).toBe(true);
+  });
 });

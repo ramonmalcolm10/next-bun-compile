@@ -298,6 +298,25 @@ expect "custom header applied via Next" test "$HDR" = "1"
 expect "uncovered page still tier-served" test "$(code_of http://127.0.0.1:$PORT/)" = "200"
 shutdown_server
 
+echo "== PPR contract (/_ppr, ppr.json) =="
+# The framework-neutral conformance script: it reads only the marker and
+# speaks only the contract's endpoints, so passing here is passing for any
+# edge that runs it.
+TOKEN=$(openssl rand -hex 32)
+boot "$APP" PPR_TOKEN="$TOKEN"
+expect "marker lists /ppr, never the proxy-covered /ppr-guarded" python3 -c "
+import json
+m = json.load(open('$APP/dist/ppr.json'))
+assert m['v'] == 1 and m['build'], m
+assert '/ppr' in m['shells'] and '/ppr-guarded' not in m['shells'], m['shells']
+"
+expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded --query '/search?utm_source=ppr-check'
+# Beyond the script: an empty state, and the rest of the reserved prefix.
+expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "400"
+expect "an unknown /_ppr/ path is a 404 even with the token" test "$(code_of -H "PPR-Token: $TOKEN" http://127.0.0.1:$PORT/_ppr/x)" = "404"
+expect "a GET to the resume endpoint is a 404" test "$(code_of -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "404"
+shutdown_server
+
 echo "== NBC_RUNTIME_DIR isolation =="
 DEPLOY="$WORK/deploy"; RUNTIME="$WORK/runtime"
 mkdir -p "$DEPLOY"
@@ -309,6 +328,7 @@ expect "static metadata seeds+module present in tree" test "$(code_of http://127
 expect "deploy dir untouched (read-only-fs safe)" test "$(ls -A "$DEPLOY" | wc -l | tr -d ' ')" = "1"
 expect "runtime files extracted to NBC_RUNTIME_DIR" test -d "$RUNTIME/.next"
 expect "shell endpoint off by default → 404" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "404"
+expect "PPR contract off without PPR_TOKEN → 404" test "$(code_of -H 'PPR-Token: x' "http://127.0.0.1:$PORT/_ppr/shell?path=%2Fppr")" = "404"
 shutdown_server
 
 echo "== PPR shell endpoint (edge-shell protocol) =="

@@ -17,6 +17,7 @@
  */
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { Readable, Writable } = require("stream");
 
 /* ---------------------------------------------------------------- *
@@ -578,65 +579,88 @@ async function shellPairFromCache(route, fallbackTags) {
   }
 }
 
-function shellRoute(metaPath, htmlPath, route, buildId, token, pair) {
+function shellSource(metaPath, htmlPath, route, pair) {
   let stamp = pairStamp(metaPath, htmlPath);
-  let payload = "";
-  let etag = "";
-  let headers = null;
-  // Bun's automatic ETag covers static `Response` routes only; this one
-  // must be a handler (token check, and the pair can change under it), so
-  // the tag is computed the same way tiers 1 and 2 do it.
-  const adopt = (p) => {
-    payload = JSON.stringify({ ...p, buildId });
-    etag = `"${Bun.hash(payload).toString(36)}"`;
-    headers = {
-      "Content-Type": "application/json",
-      // Open mode: prerendered content, shared caches may hold it (a zone
-      // purge on deploy or this max-age refreshes it). Token mode: must
-      // be unstorable by shared caches — a zone-wide CDN cache rule would
-      // otherwise cache the tokened 200 and serve it to anyone, defeating
-      // the token. The edge worker re-wraps the response for its own
-      // private cache.
-      "Cache-Control": token ? "private, no-store" : "public, max-age=3600",
-      // A CDN's copy outlives the regeneration that replaced it, so it
-      // needs to ask "is mine still current?" for the price of a 304
-      // rather than a full body on every check.
-      ETag: etag,
-      // Next's tag set for the route, so a tag-aware CDN (Fastly
-      // surrogate keys, Cloudflare Enterprise cache tags) can purge this
-      // shell on revalidation instead of waiting out its TTL.
-      ...(p.tags.length && { "Cache-Tag": p.tags.join(",") }),
-    };
-  };
-  adopt(pair);
-  const current = async () => {
-    const viaCache = await shellPairFromCache(route, pair.tags);
+  let current = pair;
+  const same = (a, b) =>
+    a.shell === b.shell &&
+    a.postponed === b.postponed &&
+    a.tags.join(",") === b.tags.join(",");
+  return async () => {
+    const viaCache = await shellPairFromCache(route, current.tags);
     if (viaCache) {
-      // Adopt only on a real change: the payload is what the ETag is
-      // computed from, and a stable ETag is what lets an edge worker
-      // revalidate for the price of a 304.
-      const next = JSON.stringify({ ...viaCache, buildId });
-      if (next !== payload) adopt(viaCache);
-      return;
+      // Adopt only on a real change: the ETag is computed from the pair,
+      // and a stable ETag is what lets an edge revalidate for the price
+      // of a 304.
+      if (!same(viaCache, current)) current = viaCache;
+      return current;
     }
     const now = pairStamp(metaPath, htmlPath);
     if (now && now !== stamp) {
       const fresh = readShellPair(metaPath, htmlPath);
       if (fresh) {
-        adopt(fresh);
+        current = fresh;
         stamp = now;
       }
     }
+    return current;
   };
+}
+
+// Serves a shell source in one endpoint's format. Bun's automatic ETag
+// covers static `Response` routes only; these must be handlers (token
+// check, and the pair can change under them), so the tag is computed the
+// same way tiers 1 and 2 do it.
+function shellResponder(source, render) {
+  let seen = null;
+  let payload = "";
+  let etag = "";
+  let headers = null;
   return async (req) => {
-    if (token && req.headers.get("x-nbc-shell-token") !== token) {
-      return new Response(null, { status: 401 });
+    const pair = await source();
+    if (pair !== seen) {
+      seen = pair;
+      const out = render(pair);
+      payload = out.payload;
+      etag = `"${Bun.hash(payload).toString(36)}"`;
+      // A CDN's copy outlives the regeneration that replaced it, so it
+      // needs to ask "is mine still current?" for the price of a 304
+      // rather than a full body on every check.
+      headers = { ...out.headers, ETag: etag };
     }
-    await current();
     if (req.headers.get("if-none-match") === etag) {
       return new Response(null, { status: 304, headers });
     }
     return new Response(payload, { headers });
+  };
+}
+
+function shellRoute(metaPath, htmlPath, route, buildId, token, pair) {
+  const respond = shellResponder(
+    shellSource(metaPath, htmlPath, route, pair),
+    (p) => ({
+      payload: JSON.stringify({ ...p, buildId }),
+      headers: {
+        "Content-Type": "application/json",
+        // Open mode: prerendered content, shared caches may hold it (a
+        // zone purge on deploy or this max-age refreshes it). Token mode:
+        // must be unstorable by shared caches — a zone-wide CDN cache rule
+        // would otherwise cache the tokened 200 and serve it to anyone,
+        // defeating the token. The edge worker re-wraps the response for
+        // its own private cache.
+        "Cache-Control": token ? "private, no-store" : "public, max-age=3600",
+        // Next's tag set for the route, so a tag-aware CDN (Fastly
+        // surrogate keys, Cloudflare Enterprise cache tags) can purge this
+        // shell on revalidation instead of waiting out its TTL.
+        ...(p.tags.length && { "Cache-Tag": p.tags.join(",") }),
+      },
+    })
+  );
+  return async (req) => {
+    if (token && req.headers.get("x-nbc-shell-token") !== token) {
+      return new Response(null, { status: 401 });
+    }
+    return respond(req);
   };
 }
 
@@ -658,39 +682,47 @@ function shellGuard(sources) {
   return (p) => res.some((re) => re.test(p));
 }
 
-/**
- * Publish the PPR shell/postponed pairs a CDN may serve.
- *
- * `guards` is what keeps this honest. Handing a shell to a CDN moves the
- * response head to the edge, where it is committed before the origin has
- * rendered anything — so a Set-Cookie, a redirect, or a non-200 that the
- * request would have earned at the origin can no longer reach the client.
- * The CDN has already sent 200 + headers and can only append body bytes.
- *
- * The invariant: a route that can emit a Set-Cookie, a redirect, or a
- * non-200 status before or during its dynamic render must not have an
- * edge-served shell. Middleware coverage is the part of that we can see
- * from a build, and it is the part that bites hardest — an auth gate that
- * silently stops running is indistinguishable from no auth gate. It is
- * not the whole invariant: a `redirect()` or `notFound()` from inside a
- * dynamic hole fails the same way on a route no matcher covers. Those
- * routes must be kept off the CDN by hand (drop them from the worker's
- * route list); this only guarantees the statically-provable half.
- */
-function buildShellRoutes(baseDir, guards = []) {
-  const raw = process.env.NBC_PPR_SHELL;
-  if (!raw) return {};
-  const covered = shellGuard(guards);
-  const token = raw === "1" || raw === "true" ? null : raw;
-  const appDir = path.join(baseDir, ".next", "server", "app");
-  let buildId = "";
+function readBuildId(baseDir) {
   try {
-    buildId = fs
+    return fs
       .readFileSync(path.join(baseDir, ".next", "BUILD_ID"), "utf-8")
       .trim();
-  } catch {}
-  const routes = {};
+  } catch {
+    return "";
+  }
+}
+
+// A fallback shell (`docs/[slug]`, `blog/[...slug]`) can't be resumed by
+// this origin. Outside Next's minimal mode, a request for a path that
+// wasn't prerendered takes Next's fallback branch, which renders the
+// whole document itself and ignores the postponed state it was sent. An
+// edge that streamed the cached shell and then appended that response
+// would deliver two documents in one. Only concrete prerendered paths
+// resume holes-only.
+const isFallbackShell = (rel) =>
+  rel.split("/").some((seg) => seg.startsWith("[") && seg.endsWith("]"));
+
+// The pathname as a client sends it on the wire. Bun matches route keys
+// against the raw request path, so a prerendered path with characters a
+// URL must escape needs this form registered, or the endpoint 404s it.
+function wirePath(p) {
+  const u = new URL("http://x");
+  u.pathname = p;
+  return u.pathname;
+}
+
+/**
+ * Every route the shell endpoint may serve, with its build-time pair.
+ * The build calls this on the assembled tree to write the deploy marker
+ * (src/generate.ts), and boot calls it on the extracted copy of the same
+ * tree, so the two lists can't disagree.
+ */
+function listShellRoutes(baseDir, guards = []) {
+  const covered = shellGuard(guards);
+  const appDir = path.join(baseDir, ".next", "server", "app");
+  const routes = [];
   let excluded = 0;
+  let fallbacks = 0;
   const walk = (dir) => {
     let entries;
     try {
@@ -713,6 +745,10 @@ function buildShellRoutes(baseDir, guards = []) {
         .slice(0, -".meta".length)
         .split(path.sep)
         .join("/");
+      if (isFallbackShell(rel)) {
+        fallbacks++;
+        continue;
+      }
       const routePath = rel === "index" ? "/" : "/" + rel;
       // No route, so the endpoint 404s and the CDN passes through
       // permanently — the origin keeps owning this response head.
@@ -720,18 +756,46 @@ function buildShellRoutes(baseDir, guards = []) {
         excluded++;
         continue;
       }
-      routes[SHELL_PREFIX + rel] = shellRoute(
-        full,
-        htmlPath,
-        routePath,
-        buildId,
-        token,
-        pair
-      );
+      routes.push({ rel, routePath, metaPath: full, htmlPath, pair });
     }
   };
   walk(appDir);
-  const count = Object.keys(routes).length;
+  routes.sort((a, b) => (a.routePath < b.routePath ? -1 : 1));
+  return { routes, excluded, fallbacks };
+}
+
+/**
+ * Publish the PPR shell/postponed pairs a CDN may serve.
+ *
+ * `guards` is what keeps this honest. Handing a shell to a CDN moves the
+ * response head to the edge, where it is committed before the origin has
+ * rendered anything — so a Set-Cookie, a redirect, or a non-200 that the
+ * request would have earned at the origin can no longer reach the client.
+ * The CDN has already sent 200 + headers and can only append body bytes.
+ *
+ * The invariant: a route that can emit a Set-Cookie, a redirect, or a
+ * non-200 status before or during its dynamic render must not have an
+ * edge-served shell. Middleware coverage is the part of that we can see
+ * from a build, and it is the part that bites hardest — an auth gate that
+ * silently stops running is indistinguishable from no auth gate. It is
+ * not the whole invariant: a `redirect()` or `notFound()` from inside a
+ * dynamic hole fails the same way on a route no matcher covers. Those
+ * routes must be kept off the CDN by hand (drop them from the worker's
+ * route list); this only guarantees the statically-provable half.
+ */
+function buildShellRoutes(baseDir, guards = [], buildId = readBuildId(baseDir)) {
+  const raw = process.env.NBC_PPR_SHELL;
+  if (!raw) return {};
+  const token = raw === "1" || raw === "true" ? null : raw;
+  const { routes: list, excluded, fallbacks } = listShellRoutes(baseDir, guards);
+  const routes = {};
+  for (const { rel, routePath, metaPath, htmlPath, pair } of list) {
+    const handler = shellRoute(metaPath, htmlPath, routePath, buildId, token, pair);
+    routes[SHELL_PREFIX + rel] = handler;
+    const wire = wirePath("/" + rel).slice(1);
+    if (wire !== rel) routes[SHELL_PREFIX + wire] = handler;
+  }
+  const count = list.length;
   if (count > 0) {
     console.log(
       `next-bun-compile: PPR shell endpoint serving ${count} route(s) from memory`
@@ -744,7 +808,240 @@ function buildShellRoutes(baseDir, guards = []) {
       `next-bun-compile: PPR shell endpoint withholding ${excluded} route(s) covered by proxy/routing rules — their response head belongs to the origin`
     );
   }
+  if (fallbacks > 0) {
+    console.log(
+      `next-bun-compile: PPR shell endpoint withholding ${fallbacks} fallback shell(s) — only prerendered paths resume holes-only`
+    );
+  }
   return routes;
+}
+
+/* ---------------------------------------------------------------- *
+ * The PPR contract (v1): /_ppr/shell and /_ppr/resume behind PPR_TOKEN
+ *
+ * One protocol between a framework and any edge: the build writes
+ * ppr.json (which decoded paths have shells, this build's id, which
+ * requests to leave alone), the shell endpoint serves { v, build, html,
+ * state } as JSON, and the resume endpoint renders only the holes. Next's
+ * own resume protocol (a form-encoded POST to the page with
+ * next-resume: 1) stays behind the resume endpoint.
+ *
+ * The endpoints exist only with PPR_TOKEN set and a matching PPR-Token
+ * header; every other request under /_ppr/ is a 404, so Next never sees
+ * the prefix and the endpoints are invisible wherever the binary runs.
+ * ---------------------------------------------------------------- */
+const PPR_MAX_SHELLS = 200;
+const PPR_MAX_PATH_BYTES = 200;
+const PPR_BUILD_RE = /^[A-Za-z0-9._-]{1,128}$/;
+// Next's own requests on a page's path that aren't a visitor's document
+// load: client navigations, prefetches, server actions, draft mode.
+const PPR_BYPASS = {
+  headers: [
+    "RSC",
+    "Next-Router-Prefetch",
+    "Next-Router-Segment-Prefetch",
+    "Next-Router-State-Tree",
+    "Next-Action",
+  ],
+  query: ["_rsc"],
+  cookies: ["__prerender_bypass"],
+};
+
+/** The build id as the contract carries it, in the marker and on both
+ *  endpoints. A custom generateBuildId outside the contract's alphabet
+ *  becomes a stable digest of itself, computed here for both sides. */
+function pprBuild(baseDir) {
+  const id = readBuildId(baseDir);
+  if (!id || PPR_BUILD_RE.test(id)) return id;
+  return crypto.createHash("sha256").update(id).digest("hex").slice(0, 32);
+}
+
+// Decoded, absolute, and unchanged by normalisation: no query or
+// fragment, no empty, `.` or `..` segment, nothing a client would send
+// differently. The trailing slash is the app's own setting.
+function validPprPath(p) {
+  if (!p.startsWith("/") || /[?#\\\x00-\x1f\x7f]/.test(p)) return false;
+  if (p === "/") return true;
+  const body = p.endsWith("/") ? p.slice(1, -1) : p.slice(1);
+  return body.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+
+/**
+ * The contract's shell list: listShellRoutes' selection (same guards,
+ * no fallback shells), as decoded paths in the form the app serves them,
+ * within the contract's limits. Past the cap the shallowest paths win:
+ * listing pages and section roots ahead of the long tail a
+ * generateStaticParams fans out into. The build writes the marker from
+ * this and boot serves exactly this, so the endpoint refuses precisely
+ * what the marker leaves out.
+ */
+function selectPprShells(baseDir, guards = [], { trailingSlash = false } = {}) {
+  const { routes } = listShellRoutes(baseDir, guards);
+  const byPath = new Map();
+  const invalid = [];
+  const tooLong = [];
+  for (const r of routes) {
+    const p = trailingSlash && r.routePath !== "/" ? r.routePath + "/" : r.routePath;
+    if (!validPprPath(p)) invalid.push(p);
+    else if (Buffer.byteLength(p) > PPR_MAX_PATH_BYTES) tooLong.push(p);
+    else if (!byPath.has(p)) byPath.set(p, r);
+  }
+  const depth = (p) => p.split("/").length;
+  const sorted = [...byPath.keys()].sort(
+    (a, b) => depth(a) - depth(b) || a.length - b.length || (a < b ? -1 : 1)
+  );
+  return {
+    shells: sorted.slice(0, PPR_MAX_SHELLS).map((p) => ({ path: p, ...byPath.get(p) })),
+    overCap: sorted.slice(PPR_MAX_SHELLS),
+    invalid,
+    tooLong,
+  };
+}
+
+const sha256 = (s) => crypto.createHash("sha256").update(s).digest();
+
+/** A constant-time PPR-Token check. An unset or empty PPR_TOKEN matches
+ *  nothing, so the endpoints never exist by accident. */
+function pprTokenCheck(expected) {
+  if (!expected) return () => false;
+  const want = sha256(expected);
+  return (req) => {
+    const got = req.headers.get("ppr-token");
+    return !!got && crypto.timingSafeEqual(want, sha256(got));
+  };
+}
+
+// Is this resume body the start of a document? Outside minimal mode Next
+// renders a page that wasn't prerendered from scratch and ignores the
+// state, and appended to a shell that is a second document. The shell
+// list keeps those paths out; this keeps the contract's promise anyway.
+const STARTS_DOCUMENT = /^\s*<(!doctype|html[\s>])/i;
+
+async function holesOnly(body) {
+  const reader = body.getReader();
+  let first = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength) {
+      first = value;
+      break;
+    }
+  }
+  if (first && STARTS_DOCUMENT.test(new TextDecoder().decode(first.subarray(0, 256)))) {
+    reader.cancel().catch(() => {});
+    return null;
+  }
+  return new ReadableStream({
+    start(controller) {
+      if (first) controller.enqueue(first);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+// Request headers that belong to the edge's hop, not the visitor's page.
+// Accept-Encoding goes because the edge compresses the whole page once:
+// a compressed resume would be gzip appended to plain HTML.
+const RESUME_DROP = [
+  "ppr-token",
+  "ppr-build",
+  "accept-encoding",
+  "content-type",
+  "content-length",
+  "transfer-encoding",
+];
+
+function buildPprRoutes({ baseDir, guards, trailingSlash, bridge }) {
+  const authorized = pprTokenCheck(process.env.PPR_TOKEN);
+  const build = pprBuild(baseDir);
+  const notFound = () =>
+    new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
+  // Registered unconditionally: the prefix is reserved, so a catch-all
+  // page or a rewrite can never claim it.
+  const routes = { "/_ppr/*": notFound };
+  const control = { shellsOn: true, count: 0 };
+  if (!process.env.PPR_TOKEN || !build) return { routes, control };
+
+  const shells = new Map();
+  for (const s of selectPprShells(baseDir, guards, { trailingSlash }).shells) {
+    shells.set(
+      s.path,
+      shellResponder(shellSource(s.metaPath, s.htmlPath, s.routePath, s.pair), (pair) => ({
+        payload: JSON.stringify({ v: 1, build, html: pair.shell, state: pair.postponed }),
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "private, no-store",
+          "PPR-Build": build,
+        },
+      }))
+    );
+  }
+  control.count = shells.size;
+
+  routes["/_ppr/shell"] = async (req) => {
+    if (!authorized(req) || (req.method !== "GET" && req.method !== "HEAD")) {
+      return notFound();
+    }
+    const respond = control.shellsOn && shells.get(new URL(req.url).searchParams.get("path"));
+    return respond ? respond(req) : notFound();
+  };
+
+  routes["/_ppr/resume"] = async (req, server) => {
+    if (!authorized(req) || req.method !== "POST") return notFound();
+    const self = new URL(req.url);
+    const target = self.searchParams.get("url") || "";
+    const q = target.indexOf("?");
+    const pathname = q === -1 ? target : target.slice(0, q);
+    // Only a listed path: any other resume is either not a PPR page here
+    // or one Next would answer with a whole document.
+    if (!shells.has(pathname)) return notFound();
+    const stamp = { "Cache-Control": "private, no-store", "PPR-Build": build };
+    const state = await req.text();
+    if (!state) return new Response(null, { status: 400, headers: stamp });
+
+    // Next's resume: the visitor's own request, as a form-encoded POST to
+    // the page (Next 405s other body types before its resume branch), so
+    // the holes see the visitor's cookies, headers and query.
+    const headers = new Headers(req.headers);
+    for (const h of RESUME_DROP) headers.delete(h);
+    headers.set("next-resume", "1");
+    headers.set("content-type", "application/x-www-form-urlencoded");
+    const inner = new Request(self.origin + wirePath(pathname) + (q === -1 ? "" : target.slice(q)), {
+      method: "POST",
+      headers,
+      body: state,
+      signal: req.signal,
+    });
+    const res = await bridge(inner, { requestIP: () => server.requestIP(req) });
+
+    const type = res.headers.get("content-type") || "";
+    const usable =
+      res.status === 200 && res.body && /^text\/html/i.test(type) && !res.headers.has("content-encoding");
+    const holes = usable ? await holesOnly(res.body) : null;
+    if (!holes) {
+      if (res.body && !res.bodyUsed) res.body.cancel().catch(() => {});
+      if (usable) {
+        console.warn(`next-bun-compile: PPR resume for ${pathname} rendered a whole document — not sent`);
+      }
+      // The edge only needs to know this resume failed: it ends the page
+      // at the shell. No status or header of a failed resume reaches the
+      // visitor, whose response head left with the shell.
+      return new Response(null, { status: res.status === 200 ? 502 : res.status, headers: stamp });
+    }
+    return new Response(holes, {
+      status: 200,
+      headers: { ...stamp, "Content-Type": type },
+    });
+  };
+  return { routes, control };
 }
 
 /* ---------------------------------------------------------------- *
@@ -1125,10 +1422,22 @@ async function start(opts) {
     ),
   ]);
 
+  const ppr = buildPprRoutes({
+    baseDir,
+    guards: shellGuards,
+    trailingSlash: !!nextConfig?.trailingSlash,
+    bridge: bridgeLazy,
+  });
+  if (ppr.control.count > 0) {
+    console.log(
+      `next-bun-compile: PPR contract serving ${ppr.control.count} shell(s) at /_ppr/shell`
+    );
+  }
   const routes = {
     ...tier1Routes,
     ...tier2Routes,
     ...buildShellRoutes(baseDir, shellGuards),
+    ...ppr.routes,
   };
   const tier2Paths = new Set(Object.keys(tier2Routes));
 
@@ -1244,6 +1553,7 @@ async function start(opts) {
         err && err.message
       );
       l1Enabled = false;
+      ppr.control.shellsOn = false;
       const shellKeys = Object.keys(routes).filter((k) =>
         k.startsWith(SHELL_PREFIX)
       );
@@ -1283,7 +1593,9 @@ async function start(opts) {
   return server;
 }
 
-module.exports = { start };
+// The PPR contract's selection is also run at build time (src/generate.ts), on the
+// copy of this file that ships in the binary.
+module.exports = { start, selectPprShells, pprBuild, PPR_BYPASS };
 // Test-only escape hatch for unit-testing the fetch→node bridge. Not a public
 // API — may change or disappear in any release without notice.
 module.exports._internal = {

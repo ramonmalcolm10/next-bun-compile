@@ -44,6 +44,16 @@ and `Location` have nowhere to go, and the visitor is left holding the
 shell's Suspense fallbacks. Route only pages whose response head is a
 foregone conclusion.
 
+## Building a platform integration?
+
+This Worker needs no input from the build: it discovers shells by asking
+the endpoint and remembering 404s. A platform that runs the build can
+skip discovery. Every build also writes `ppr.json` next to the binary
+and, with `PPR_TOKEN` set, serves the PPR contract's `/_ppr/shell` and
+`/_ppr/resume`: the exact list of shell paths, the build id to drop
+stale shells by, and a resume that takes the state back as a raw body.
+See [Edge PPR → The PPR contract](https://ramonmalcolm10.github.io/next-bun-compile/guides/edge-ppr/#the-ppr-contract).
+
 ## Setup (once, ever)
 
 1. **Origin**: set `NBC_PPR_SHELL=1` (or `NBC_PPR_SHELL=<token>` to

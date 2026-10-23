@@ -1,7 +1,17 @@
-import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join } from "node:path";
-import { generateEntryPoint } from "./generate.js";
+import {
+  buildPprMarker,
+  PPR_MARKER_FILE,
+  generateEntryPoint,
+} from "./generate.js";
 import { compile } from "./compile.js";
 
 export interface RunBuildOptions {
@@ -152,5 +162,16 @@ export async function runBuild(options: RunBuildOptions): Promise<string> {
   const outfile = resolveOutfile(projectDir, options);
   mkdirSync(dirname(outfile), { recursive: true });
   compile({ serverDir, outfile, extraArgs: resolveExtraArgs(options) });
+  // Next to the binary, so a platform that ships the output dir gets it
+  // with the binary (NBC_OUT=.output → .output/ppr.json). Written last:
+  // a marker only ever describes a binary that exists.
+  const marker = buildPprMarker(serverDir, distDir);
+  writeFileSync(
+    join(dirname(outfile), PPR_MARKER_FILE),
+    JSON.stringify(marker, null, 2) + "\n"
+  );
+  console.log(
+    `next-bun-compile: ${PPR_MARKER_FILE} lists ${marker.shells.length} PPR shell path(s)`
+  );
   return outfile;
 }
