@@ -1,15 +1,18 @@
 /**
- * Cloudflare Worker serving PPR shells from the edge against any origin
- * that speaks the PPR contract (v1), such as a next-bun-compile binary
- * run with PPR_TOKEN — self-populating edition.
+ * Cloudflare Worker serving pages from the edge against any origin that
+ * speaks the edge contract (v2), such as a next-bun-compile binary run
+ * with EDGE_TOKEN — self-populating edition. A static page is served
+ * whole; a PPR page as its shell, with the origin rendering only the
+ * holes onto the same response.
  *
  * No KV, no build-time push pipeline, no marker: on a cache miss the
  * request passes through to the origin unchanged (never slower than no
- * worker), while the shell is fetched once in the background from the
+ * worker), while the page is fetched once in the background from the
  * origin's contract endpoint:
  *
- *   GET  /_ppr/shell?path=<decoded path>     →  { v, build, html, state }
- *   POST /_ppr/resume?url=<path and query>   →  the holes only
+ *   GET  /_edge/page?path=<decoded path>     →  { v, build, html, state,
+ *                                                complete?, headers? }
+ *   POST /_edge/resume?url=<path and query>  →  the holes only
  *
  * and stored in `caches.default` — Cloudflare's native zone cache,
  * nothing to provision or administer. Warm requests stream the cached
@@ -17,17 +20,20 @@
  * at the origin.
  *
  * Staleness is handled without help from the deploy:
- *   - every resume answers with the origin's PPR-Build, and holes are
+ *   - every resume answers with the origin's Edge-Build, and holes are
  *     appended only when it is the cached shell's build — a shell from
  *     another deploy is evicted and that one visitor keeps the shell's
  *     Suspense fallbacks, never mixed builds;
- *   - a warm hit older than SHELL_REVALIDATE_SECONDS re-checks the shell
- *     with If-None-Match, so a regenerated shell reaches the edge too.
+ *   - a warm hit older than SHELL_REVALIDATE_SECONDS re-checks the page
+ *     with If-None-Match, so a regenerated page reaches the edge too. A
+ *     static page has no resume to carry the build, so this check is
+ *     also what replaces one from an earlier deploy: until it runs, the
+ *     old page may be served. Purge on deploy to make that immediate.
  *   A purge-on-deploy job still helps (it clears tombstones as well), but
  *   correctness no longer depends on it.
  *
  * Required secret:
- *   PPR_TOKEN — the same value the origin runs with. Sent as PPR-Token;
+ *   EDGE_TOKEN — the same value the origin runs with. Sent as Edge-Token;
  *               without it the origin's endpoints don't exist (404).
  *
  * ── Which routes may be listed in wrangler.toml ──────────────────────
@@ -40,7 +46,7 @@
  *
  * The origin enforces the statically-provable half of that on its own:
  * a contract origin withholds a shell for any page a proxy matcher or a
- * response-altering routing rule covers, so /_ppr/shell 404s, this
+ * response-altering routing rule covers, so /_edge/page 404s, this
  * Worker tombstones it, and the route passes through for good. Auth
  * gates are covered by that.
  *
@@ -64,7 +70,7 @@
 const SHELL_TTL = 3600;
 const REVALIDATE_AFTER_SECONDS = 60;
 
-// The origin marks every /_ppr/ answer private/no-store so no cache on
+// The origin marks every /_edge/ answer private/no-store so no cache on
 // the way can hold a tokened response — only this worker-private copy
 // may, so every cached shell is re-wrapped on the way in. ETag carries
 // over to drive conditional revalidation.
@@ -72,7 +78,7 @@ const shellHeaders = (src) => {
   const headers = {
     "content-type": "application/json",
     "cache-control": `public, max-age=${SHELL_TTL}`,
-    "x-ppr-cached-at": String(Date.now()),
+    "x-edge-cached-at": String(Date.now()),
   };
   const etag = src.headers.get("etag");
   if (etag) headers.etag = etag;
@@ -80,14 +86,14 @@ const shellHeaders = (src) => {
 };
 
 const fetchShell = (origin, path, env, etag) =>
-  fetch(`${origin}/_ppr/shell?path=${encodeURIComponent(path)}`, {
+  fetch(`${origin}/_edge/page?path=${encodeURIComponent(path)}`, {
     // A freshness check must never be answered by a copy on the way:
     // without this the zone could hand back the very shell we are trying
     // to replace.
     cache: "no-store",
     headers: {
       accept: "application/json",
-      "ppr-token": env.PPR_TOKEN,
+      "edge-token": env.EDGE_TOKEN,
       ...(etag ? { "if-none-match": etag } : {}),
     },
   });
@@ -112,11 +118,11 @@ export default {
     const url = new URL(req.url);
     // The origin's contract endpoints are the edge's to call, never a
     // visitor's.
-    if (url.pathname.startsWith("/_ppr/")) {
+    if (url.pathname.startsWith("/_edge/")) {
       return new Response(null, { status: 404 });
     }
-    if (!env.PPR_TOKEN) {
-      console.log("PPR_TOKEN is not set — passing everything through");
+    if (!env.EDGE_TOKEN) {
+      console.log("EDGE_TOKEN is not set — passing everything through");
       return passThrough();
     }
     if (req.method !== "GET") return passThrough();
@@ -160,7 +166,7 @@ export default {
     // stores nothing, so the shell re-warms on every request and is
     // never served, with no error raised anywhere. A synthetic key is
     // judged only on the response it is handed.
-    const cacheKey = new Request(`${url.origin}/__ppr-shell${url.pathname}`);
+    const cacheKey = new Request(`${url.origin}/__edge-page${url.pathname}`);
     const cached = await caches.default.match(cacheKey);
 
     if (!cached) {
@@ -177,7 +183,7 @@ export default {
             // it refuses to hand to a CDN (see above). It will keep
             // saying 404 until the next deploy, so record that, or this
             // warm re-runs on every document load. The contract answers a
-            // wrong PPR-Token with a 404 too, so if every route
+            // wrong Edge-Token with a 404 too, so if every route
             // tombstones, check the token matches the origin's. The
             // tombstone ages out with SHELL_TTL, or a purge clears it.
             await caches.default.put(
@@ -231,7 +237,7 @@ export default {
       (Number.isFinite(configured) && configured > 0
         ? configured
         : REVALIDATE_AFTER_SECONDS) * 1000;
-    const cachedAt = Number(cached.headers.get("x-ppr-cached-at") || 0);
+    const cachedAt = Number(cached.headers.get("x-edge-cached-at") || 0);
     const recheck = Date.now() - cachedAt > revalidateAfter;
 
     let entry;
@@ -247,7 +253,8 @@ export default {
     }
     if (
       !entry ||
-      entry.v !== 1 ||
+      entry.v !== 2 ||
+      (entry.headers != null && typeof entry.headers !== "object") ||
       typeof entry.html !== "string" ||
       typeof entry.state !== "string" ||
       !entry.build
@@ -297,6 +304,22 @@ export default {
       );
     }
 
+    // The headers the page goes out with, as the origin listed them; the
+    // contract allows only ones fixed for the build.
+    const pageHeaders = entry.headers || {};
+
+    // A static page: the whole document, nothing to resume.
+    if (entry.complete === true) {
+      return new Response(entry.html, {
+        status: 200,
+        headers: {
+          ...pageHeaders,
+          "content-type": "text/html; charset=utf-8",
+          "x-edge-build": entry.build,
+        },
+      });
+    }
+
     // The dynamic holes are per-user — the origin needs the original
     // headers (cookies included) to render THIS visitor's content. They
     // flow only worker → origin, the same path they already travel;
@@ -305,14 +328,14 @@ export default {
     // must come back as plain bytes to append.
     const resumeHeaders = new Headers(req.headers);
     for (const name of [...resumeHeaders.keys()]) {
-      if (name.startsWith("ppr-")) resumeHeaders.delete(name);
+      if (name.startsWith("edge-")) resumeHeaders.delete(name);
     }
     resumeHeaders.delete("accept-encoding");
-    resumeHeaders.set("ppr-token", env.PPR_TOKEN);
-    resumeHeaders.set("ppr-build", entry.build);
+    resumeHeaders.set("edge-token", env.EDGE_TOKEN);
+    resumeHeaders.set("edge-build", entry.build);
     resumeHeaders.set("content-type", "application/octet-stream");
     const resume = fetch(
-      `${url.origin}/_ppr/resume?url=${encodeURIComponent(path + url.search)}`,
+      `${url.origin}/_edge/resume?url=${encodeURIComponent(path + url.search)}`,
       {
         method: "POST",
         cache: "no-store",
@@ -330,7 +353,7 @@ export default {
           await writer.write(new TextEncoder().encode(entry.html));
           writer.releaseLock();
           const res = await resume;
-          const build = res.headers.get("ppr-build");
+          const build = res.headers.get("edge-build");
           const type = res.headers.get("content-type") || "";
           if (res.status === 200 && build === entry.build && type.startsWith("text/html") && res.body) {
             await res.body.pipeTo(writable);
@@ -357,18 +380,12 @@ export default {
     return new Response(readable, {
       status: 200,
       headers: {
+        ...pageHeaders,
         "content-type": "text/html; charset=utf-8",
         // The combined stream contains per-request content — neither
         // the edge cache nor the browser may store it.
         "cache-control": "private, no-store",
-        // Worker-served documents never transit the origin/gateway, so
-        // its security headers must be mirrored here. Keep in sync with
-        // the gateway's ResponseHeaderModifier set.
-        "strict-transport-security": "max-age=31536000",
-        "x-content-type-options": "nosniff",
-        "x-frame-options": "DENY",
-        "referrer-policy": "same-origin",
-        "x-ppr-shell-build": entry.build,
+        "x-edge-build": entry.build,
       },
     });
   },

@@ -623,8 +623,9 @@ function shellResponder(source, render) {
   let payload = "";
   let etag = "";
   let headers = null;
-  return async (req) => {
-    const pair = await source();
+  return async (req, server) => {
+    const pair = await source(req, server);
+    if (!pair) return null;
     if (pair !== seen) {
       seen = pair;
       const out = render(pair);
@@ -811,9 +812,6 @@ function listShellRoutes(baseDir, guards = []) {
 function buildShellRoutes(baseDir, guards = [], buildId = readBuildId(baseDir)) {
   const raw = process.env.NBC_PPR_SHELL;
   if (!raw) return {};
-  console.warn(
-    "next-bun-compile: ⚠ NBC_PPR_SHELL and /_nbc/ppr-shell are deprecated and will be removed in v3. Use the PPR contract instead: set PPR_TOKEN and serve /_ppr/shell and /_ppr/resume (see the Edge PPR guide)."
-  );
   const token = raw === "1" || raw === "true" ? null : raw;
   const { routes: list, excluded, fallbacks } = listShellRoutes(baseDir, guards);
   const routes = {};
@@ -845,25 +843,27 @@ function buildShellRoutes(baseDir, guards = [], buildId = readBuildId(baseDir)) 
 }
 
 /* ---------------------------------------------------------------- *
- * The PPR contract (v1): /_ppr/shell and /_ppr/resume behind PPR_TOKEN
+ * The edge contract (v2): /_edge/page and /_edge/resume behind EDGE_TOKEN
  *
  * One protocol between a framework and any edge: the build writes
- * ppr.json (which decoded paths have shells, this build's id, which
- * requests to leave alone), the shell endpoint serves { v, build, html,
- * state } as JSON, and the resume endpoint renders only the holes. Next's
- * own resume protocol (a form-encoded POST to the page with
+ * edge.json (which decoded paths have a shell, which are static pages
+ * served whole, this build's id, which requests to leave alone), the page
+ * endpoint serves { v, build, html, state } as JSON, with complete: true
+ * for a static page, and the resume endpoint renders only a shell's holes.
+ * Next's own resume protocol (a form-encoded POST to the page with
  * next-resume: 1) stays behind the resume endpoint.
  *
- * The endpoints exist only with PPR_TOKEN set and a matching PPR-Token
- * header; every other request under /_ppr/ is a 404, so Next never sees
+ * The endpoints exist only with EDGE_TOKEN set and a matching Edge-Token
+ * header; every other request under /_edge/ is a 404, so Next never sees
  * the prefix and the endpoints are invisible wherever the binary runs.
  * ---------------------------------------------------------------- */
-const PPR_MAX_SHELLS = 200;
-const PPR_MAX_PATH_BYTES = 200;
-const PPR_BUILD_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const EDGE_MAX_PATHS = 200;
+const EDGE_MAX_PATH_BYTES = 200;
+const EDGE_MAX_HEADERS = 16;
+const EDGE_BUILD_RE = /^[A-Za-z0-9._-]{1,128}$/;
 // Next's own requests on a page's path that aren't a visitor's document
 // load: client navigations, prefetches, server actions, draft mode.
-const PPR_BYPASS = {
+const EDGE_BYPASS = {
   headers: [
     "RSC",
     "Next-Router-Prefetch",
@@ -874,40 +874,103 @@ const PPR_BYPASS = {
   query: ["_rsc"],
   cookies: ["__prerender_bypass"],
 };
+// The response headers an edge may send with a page it serves. A page
+// that goes out with any other is left with the origin.
+const EDGE_HEADERS = [
+  "content-language",
+  "link",
+  "cache-control",
+  "x-robots-tag",
+  "content-security-policy",
+  "permissions-policy",
+  "referrer-policy",
+  "strict-transport-security",
+  "x-frame-options",
+  "x-content-type-options",
+  "cross-origin-opener-policy",
+  "cross-origin-embedder-policy",
+  "cross-origin-resource-policy",
+  "x-dns-prefetch-control",
+];
+const EDGE_HEADER_SET = new Set(EDGE_HEADERS);
+// Next's bookkeeping on a prerender (x-nextjs-stale-time, x-next-cache-tags,
+// ...): never a header the page needs, and Next sets it per response.
+const NEXT_OWN_HEADER = /^x-next(js)?-/;
+
+/**
+ * Whether a next.config headers() rule can travel with a page: every
+ * header it adds is on the contract's list, and nothing about it depends
+ * on the request (a has/missing condition, or a value built from the
+ * path's parameters). Any other rule guards the pages it matches.
+ */
+function edgeHeaderRuleOk(rule) {
+  if (!rule || rule.conditional) return false;
+  for (const [k, v] of Object.entries(rule.headers || {})) {
+    if (!EDGE_HEADER_SET.has(k.toLowerCase())) return false;
+    if (/\$\d|\$\{?[A-Za-z_]|:[A-Za-z_]\w*[*+?]?(?=$|[\s/;,'"])/.test(String(v))) return false;
+  }
+  return true;
+}
+
+/**
+ * The headers a page goes out with from the edge: those its prerender
+ * recorded and those the headers() rules matching it add, later rules
+ * winning as in Next. Null when one is outside the contract's list or
+ * there are too many: the page isn't the edge's to serve.
+ */
+function edgeHeadersFor(pathname, recorded, rules) {
+  const out = {};
+  for (const [k, v] of Object.entries(recorded || {})) {
+    const lc = k.toLowerCase();
+    if (NEXT_OWN_HEADER.test(lc) || lc === "content-type" || lc === "vary") continue;
+    if (!EDGE_HEADER_SET.has(lc)) return null;
+    out[lc] = String(v);
+  }
+  for (const rule of rules) {
+    if (!rule.re.test(pathname)) continue;
+    for (const [k, v] of Object.entries(rule.headers)) out[k.toLowerCase()] = String(v);
+  }
+  return Object.keys(out).length > EDGE_MAX_HEADERS ? null : out;
+}
 
 /**
  * The build id as the contract carries it, in the marker and on both
- * endpoints: BUILD_ID plus a digest of every listed shell and its state.
+ * endpoints: BUILD_ID plus a digest of every page an edge may store, each
+ * shell with its state and each static page, with their headers.
  *
  * BUILD_ID alone isn't enough. A custom generateBuildId (a git SHA, say)
  * stays the same when the same commit is rebuilt with different build-time
- * data, such as a CMS publish or a changed env var, so new shells would
- * ship under the old id and an edge would resume a stale one against them.
- * The digest changes whenever a shell does. An id outside the contract's
- * alphabet, or too long to carry the digest, becomes the digest alone.
+ * data, such as a CMS publish or a changed env var, so new pages would
+ * ship under the old id and an edge would keep serving the stale ones.
+ * The digest changes whenever a stored page does. An id outside the
+ * contract's alphabet, or too long to carry the digest, becomes the
+ * digest alone.
  *
  * The build computes this once and stamps it into the binary
- * (globalThis.__nbcPprBuild). Recomputing at boot would read shells that
+ * (globalThis.__nbcEdgeBuild). Recomputing at boot would read pages that
  * ISR may since have rewritten in a reused NBC_RUNTIME_DIR, and the binary
  * would stop matching its own marker.
  */
-function pprBuild(baseDir, shells = []) {
-  if (typeof globalThis.__nbcPprBuild === "string") return globalThis.__nbcPprBuild;
+function edgeBuild(baseDir, shells = [], statics = []) {
+  if (typeof globalThis.__nbcEdgeBuild === "string") return globalThis.__nbcEdgeBuild;
   const id = readBuildId(baseDir);
   if (!id) return id;
   const h = crypto.createHash("sha256").update(id);
   for (const s of shells) {
-    h.update(`\0${s.path}\0${s.pair.shell}\0${s.pair.postponed}`);
+    h.update(`\0s\0${s.path}\0${s.pair.shell}\0${s.pair.postponed}\0${JSON.stringify(s.headers)}`);
+  }
+  for (const p of statics) {
+    h.update(`\0p\0${p.path}\0${p.html}\0${JSON.stringify(p.headers)}`);
   }
   const digest = h.digest("hex");
   const tagged = `${id}.${digest.slice(0, 12)}`;
-  return PPR_BUILD_RE.test(tagged) ? tagged : digest.slice(0, 32);
+  return EDGE_BUILD_RE.test(tagged) ? tagged : digest.slice(0, 32);
 }
 
 // Decoded, absolute, and unchanged by normalisation: no query or
 // fragment, no empty, `.` or `..` segment, nothing a client would send
 // differently. The trailing slash is the app's own setting.
-function validPprPath(p) {
+function validEdgePath(p) {
   if (!p.startsWith("/") || /[?#\\\x00-\x1f\x7f]/.test(p)) return false;
   if (p === "/") return true;
   const body = p.endsWith("/") ? p.slice(1, -1) : p.slice(1);
@@ -915,46 +978,138 @@ function validPprPath(p) {
 }
 
 /**
- * The contract's shell list: listShellRoutes' selection (same guards,
- * no fallback shells), as decoded paths in the form the app serves them,
- * within the contract's limits. Past the cap the shallowest paths win:
- * listing pages and section roots ahead of the long tail a
- * generateStaticParams fans out into. The build writes the marker from
- * this and boot serves exactly this, so the endpoint refuses precisely
- * what the marker leaves out.
+ * The form the app answers with 200, decoded once: Next's pathnames may
+ * carry percent-escapes, the contract's lists never do. Null when a
+ * segment won't decode or decodes to a `/`.
  */
-function selectPprShells(baseDir, guards = [], { trailingSlash = false } = {}) {
-  const { routes } = listShellRoutes(baseDir, guards);
-  const byPath = new Map();
-  const invalid = [];
-  const tooLong = [];
-  for (const r of routes) {
-    const p = trailingSlash && r.routePath !== "/" ? r.routePath + "/" : r.routePath;
-    if (!validPprPath(p)) invalid.push(p);
-    else if (Buffer.byteLength(p) > PPR_MAX_PATH_BYTES) tooLong.push(p);
-    else if (!byPath.has(p)) byPath.set(p, r);
+function servedPath(p, trailingSlash) {
+  let decoded = p;
+  if (p.includes("%")) {
+    try {
+      const segs = p.split("/").map((s) => decodeURIComponent(s));
+      if (segs.some((s) => s.includes("/"))) return null;
+      decoded = segs.join("/");
+    } catch {
+      return null;
+    }
   }
+  return trailingSlash && decoded !== "/" && !decoded.endsWith("/") ? decoded + "/" : decoded;
+}
+
+// Past the cap the shallowest paths win: listing pages and section roots
+// ahead of the long tail a generateStaticParams fans out into.
+function capShallowest(byPath) {
   const depth = (p) => p.split("/").length;
   const sorted = [...byPath.keys()].sort(
     (a, b) => depth(a) - depth(b) || a.length - b.length || (a < b ? -1 : 1)
   );
   return {
-    shells: sorted.slice(0, PPR_MAX_SHELLS).map((p) => ({ path: p, ...byPath.get(p) })),
-    overCap: sorted.slice(PPR_MAX_SHELLS),
-    invalid,
-    tooLong,
+    kept: sorted.slice(0, EDGE_MAX_PATHS).map((p) => ({ path: p, ...byPath.get(p) })),
+    overCap: sorted.slice(EDGE_MAX_PATHS),
+  };
+}
+
+function readRecordedHeaders(metaPath) {
+  try {
+    return JSON.parse(fs.readFileSync(metaPath, "utf-8")).headers || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The contract's two lists, from the tree at baseDir and the build's
+ * edge input (src/generate.ts: the guards, the headers() rules that can
+ * travel with a page, and the prerendered static pages):
+ *
+ * - shells: listShellRoutes' selection (no fallback shells), unguarded;
+ * - static: the build's fully static prerenders, unguarded, answering
+ *   200 with nothing but listed headers.
+ *
+ * Both as decoded paths in the form the app serves them, within the
+ * contract's limits. The build writes the marker from this and boot
+ * serves exactly this, so the endpoint refuses precisely what the marker
+ * leaves out.
+ */
+function selectEdgePages(baseDir, input = {}, { trailingSlash = false } = {}) {
+  const guards = input.guards || [];
+  const covered = shellGuard(guards);
+  const rules = [];
+  for (const r of input.headerRules || []) {
+    try {
+      rules.push({ re: new RegExp(r.sourceRegex), headers: r.headers || {} });
+    } catch {}
+  }
+  const out = {
+    invalid: [],
+    tooLong: [],
+    otherHeaders: [],
+    guarded: 0,
+    candidates: 0,
+  };
+  const admit = (byPath, p, entry) => {
+    if (p == null || !validEdgePath(p)) out.invalid.push(p ?? "(undecodable)");
+    else if (Buffer.byteLength(p) > EDGE_MAX_PATH_BYTES) out.tooLong.push(p);
+    else if (!byPath.has(p)) byPath.set(p, entry);
+  };
+
+  const { routes, excluded } = listShellRoutes(baseDir, guards);
+  out.guarded += excluded;
+  out.candidates += routes.length + excluded;
+  const shellPaths = new Map();
+  for (const r of routes) {
+    const p = servedPath(r.routePath, trailingSlash);
+    const headers = edgeHeadersFor(p ?? r.routePath, readRecordedHeaders(r.metaPath), rules);
+    if (!headers) {
+      out.otherHeaders.push(p ?? r.routePath);
+      continue;
+    }
+    admit(shellPaths, p, { ...r, headers });
+  }
+
+  const staticPaths = new Map();
+  for (const s of input.statics || []) {
+    out.candidates++;
+    const p = servedPath(s.path, trailingSlash);
+    if (covered(s.path) || (p && covered(p))) {
+      out.guarded++;
+      continue;
+    }
+    if (s.status !== 200) continue;
+    if (p && shellPaths.has(p)) continue;
+    const headers = edgeHeadersFor(p ?? s.path, s.headers, rules);
+    if (!headers) {
+      out.otherHeaders.push(p ?? s.path);
+      continue;
+    }
+    let html;
+    try {
+      html = fs.readFileSync(path.join(baseDir, ".next", s.file), "utf-8");
+    } catch {
+      continue;
+    }
+    admit(staticPaths, p, { routePath: s.path, html, headers, tags: s.tags || [] });
+  }
+
+  const shells = capShallowest(shellPaths);
+  const statics = capShallowest(staticPaths);
+  return {
+    ...out,
+    shells: shells.kept,
+    static: statics.kept,
+    overCap: [...shells.overCap, ...statics.overCap],
   };
 }
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest();
 
-/** A constant-time PPR-Token check. An unset or empty PPR_TOKEN matches
+/** A constant-time Edge-Token check. An unset or empty EDGE_TOKEN matches
  *  nothing, so the endpoints never exist by accident. */
-function pprTokenCheck(expected) {
+function edgeTokenCheck(expected) {
   if (!expected) return () => false;
   const want = sha256(expected);
   return (req) => {
-    const got = req.headers.get("ppr-token");
+    const got = req.headers.get("edge-token");
     return !!got && crypto.timingSafeEqual(want, sha256(got));
   };
 }
@@ -999,60 +1154,153 @@ async function holesOnly(body) {
 // Accept-Encoding goes because the edge compresses the whole page once:
 // a compressed resume would be gzip appended to plain HTML.
 const RESUME_DROP = [
-  "ppr-token",
-  "ppr-build",
+  "edge-token",
+  "edge-build",
   "accept-encoding",
   "content-type",
   "content-length",
   "transfer-encoding",
 ];
+// What a static page's re-render through Next doesn't take from the
+// edge's request: the edge's own headers, and anything that would make
+// the answer one visitor's (it carries no cookies, but never trust that).
+const PAGE_DROP = ["edge-token", "edge-build", "accept-encoding", "cookie", "if-none-match", "accept"];
 
-function buildPprRoutes({ baseDir, guards, trailingSlash, bridge }) {
-  const authorized = pprTokenCheck(process.env.PPR_TOKEN);
-  const selected = selectPprShells(baseDir, guards, { trailingSlash }).shells;
-  const build = pprBuild(baseDir, selected);
-  const notFound = () =>
-    new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
+/**
+ * A static page's current document. Until Next invalidates it, the
+ * prerender the build listed, from memory. Once revalidatePath or
+ * revalidateTag has touched it, Next's own answer for the path: the edge
+ * revalidates by ETag, so a regenerated page reaches it, and anything but
+ * a plain 200 HTML document is a 404, which evicts the page at the edge.
+ */
+function staticSource(page, bridge) {
+  let current = { html: page.html };
+  return async (req, server) => {
+    if (!page.stale) return current;
+    const self = new URL(req.url);
+    const headers = new Headers(req.headers);
+    for (const h of PAGE_DROP) headers.delete(h);
+    headers.set("accept", "text/html");
+    const res = await bridge(
+      new Request(self.origin + wirePath(page.path), { headers, signal: req.signal }),
+      { requestIP: () => server.requestIP(req) }
+    );
+    const type = res.headers.get("content-type") || "";
+    if (
+      res.status !== 200 ||
+      !/^text\/html/i.test(type) ||
+      res.headers.has("set-cookie") ||
+      res.headers.has("content-encoding")
+    ) {
+      if (res.body && !res.bodyUsed) res.body.cancel().catch(() => {});
+      return null;
+    }
+    const html = await res.text();
+    // A stable object for an unchanged page keeps its ETag, so the edge's
+    // check costs a 304.
+    if (html !== current.html) current = { html };
+    return current;
+  };
+}
+
+function buildEdgeRoutes({ baseDir, edge, trailingSlash, bridge }) {
+  const authorized = edgeTokenCheck(process.env.EDGE_TOKEN);
+  const selected = selectEdgePages(baseDir, edge, { trailingSlash });
+  const build = edgeBuild(baseDir, selected.shells, selected.static);
+  const unstored = { "Cache-Control": "private, no-store" };
+  const notFound = () => new Response(null, { status: 404, headers: unstored });
   // Registered unconditionally: the prefix is reserved, so a catch-all
   // page or a rewrite can never claim it.
-  const routes = { "/_ppr/*": notFound };
-  const control = { shellsOn: true, count: 0 };
-  if (!process.env.PPR_TOKEN || !build) return { routes, control };
+  const routes = { "/_edge/*": notFound };
+  const statics = new Map();
+  const byRoute = new Map();
+  const byTag = new Map();
+  const control = {
+    shellsOn: true,
+    shells: 0,
+    static: 0,
+    // Next invalidated a page: a static one is Next's to answer from now on.
+    invalidate(tags, pathnameKey) {
+      const mark = (p) => {
+        for (const s of byRoute.get(p) ?? []) s.stale = true;
+      };
+      if (typeof pathnameKey === "string") mark(pathnameKey);
+      for (const tag of Array.isArray(tags) ? tags : tags ? [tags] : []) {
+        if (typeof tag !== "string") continue;
+        for (const s of byTag.get(tag) ?? []) s.stale = true;
+        if (tag.startsWith("_N_T_")) {
+          const p = tag.slice("_N_T_".length);
+          mark(p === "/index" ? "/" : p);
+        }
+      }
+    },
+  };
+  if (!process.env.EDGE_TOKEN || !build) return { routes, control };
 
+  const headersOf = (h) => (Object.keys(h).length ? { headers: h } : {});
+  const answer = { "Content-Type": "application/json", ...unstored, "Edge-Build": build };
   const shells = new Map();
-  for (const s of selected) {
+  for (const s of selected.shells) {
     shells.set(
       s.path,
       shellResponder(shellSource(s.metaPath, s.htmlPath, s.routePath, s.pair), (pair) => ({
-        payload: JSON.stringify({ v: 1, build, html: pair.shell, state: pair.postponed }),
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "private, no-store",
-          "PPR-Build": build,
-        },
+        payload: JSON.stringify({
+          v: 2,
+          build,
+          html: pair.shell,
+          state: pair.postponed,
+          ...headersOf(s.headers),
+        }),
+        headers: answer,
       }))
     );
   }
-  control.count = shells.size;
+  for (const s of selected.static) {
+    const page = { path: s.path, html: s.html, stale: false };
+    if (!byRoute.has(s.routePath)) byRoute.set(s.routePath, []);
+    byRoute.get(s.routePath).push(page);
+    for (const tag of s.tags) {
+      if (!byTag.has(tag)) byTag.set(tag, []);
+      byTag.get(tag).push(page);
+    }
+    statics.set(
+      s.path,
+      shellResponder(staticSource(page, bridge), (doc) => ({
+        payload: JSON.stringify({
+          v: 2,
+          build,
+          html: doc.html,
+          state: "",
+          complete: true,
+          ...headersOf(s.headers),
+        }),
+        headers: answer,
+      }))
+    );
+  }
+  control.shells = shells.size;
+  control.static = statics.size;
 
-  routes["/_ppr/shell"] = async (req) => {
+  routes["/_edge/page"] = async (req, server) => {
     if (!authorized(req) || (req.method !== "GET" && req.method !== "HEAD")) {
       return notFound();
     }
-    const respond = control.shellsOn && shells.get(new URL(req.url).searchParams.get("path"));
-    return respond ? respond(req) : notFound();
+    const p = new URL(req.url).searchParams.get("path");
+    const respond = control.shellsOn && (shells.get(p) || statics.get(p));
+    const res = respond ? await respond(req, server) : null;
+    return res || notFound();
   };
 
-  routes["/_ppr/resume"] = async (req, server) => {
+  routes["/_edge/resume"] = async (req, server) => {
     if (!authorized(req) || req.method !== "POST") return notFound();
     const self = new URL(req.url);
     const target = self.searchParams.get("url") || "";
     const q = target.indexOf("?");
     const pathname = q === -1 ? target : target.slice(0, q);
-    // Only a listed path: any other resume is either not a PPR page here
+    // Only a listed shell: any other resume is either not a PPR page here
     // or one Next would answer with a whole document.
-    if (!shells.has(pathname)) return notFound();
-    const stamp = { "Cache-Control": "private, no-store", "PPR-Build": build };
+    if (!control.shellsOn || !shells.has(pathname)) return notFound();
+    const stamp = { ...unstored, "Edge-Build": build };
     const state = await req.text();
     if (!state) return new Response(null, { status: 400, headers: stamp });
 
@@ -1078,7 +1326,7 @@ function buildPprRoutes({ baseDir, guards, trailingSlash, bridge }) {
     if (!holes) {
       if (res.body && !res.bodyUsed) res.body.cancel().catch(() => {});
       if (usable) {
-        console.warn(`next-bun-compile: PPR resume for ${pathname} rendered a whole document — not sent`);
+        console.warn(`next-bun-compile: edge resume for ${pathname} rendered a whole document — not sent`);
       }
       // The edge only needs to know this resume failed: it ends the page
       // at the shell. No status or header of a failed resume reaches the
@@ -1270,6 +1518,7 @@ async function start(opts) {
     baseDir,
     enableL1 = true,
     shellGuards = [],
+    edge = {},
   } = opts;
   if (gzippedAssets) gzippedAssetSet = gzippedAssets;
 
@@ -1471,22 +1720,23 @@ async function start(opts) {
     ),
   ]);
 
-  const ppr = buildPprRoutes({
+  const edgeRoutes = buildEdgeRoutes({
     baseDir,
-    guards: shellGuards,
+    edge,
     trailingSlash: !!nextConfig?.trailingSlash,
     bridge: bridgeLazy,
   });
-  if (ppr.control.count > 0) {
+  const edgeControl = edgeRoutes.control;
+  if (edgeControl.shells + edgeControl.static > 0) {
     console.log(
-      `next-bun-compile: PPR contract serving ${ppr.control.count} shell(s) at /_ppr/shell`
+      `next-bun-compile: edge contract serving ${edgeControl.shells} shell(s) and ${edgeControl.static} static page(s) at /_edge/page`
     );
   }
   const routes = {
     ...tier1Routes,
     ...tier2Routes,
     ...buildShellRoutes(baseDir, shellGuards),
-    ...ppr.routes,
+    ...edgeRoutes.routes,
   };
   const tier2Paths = new Set(Object.keys(tier2Routes));
 
@@ -1542,6 +1792,7 @@ async function start(opts) {
   // so dropping the entry left it dropped until reboot — forcing an edge
   // worker onto origin RTT for the life of the process.
   const onInvalidate = (tags, pathnameKey) => {
+    edgeControl.invalidate(tags, pathnameKey);
     let changed = false;
     if (typeof pathnameKey === "string") {
       changed = dropPage(pathnameKey) || changed;
@@ -1602,7 +1853,7 @@ async function start(opts) {
         err && err.message
       );
       l1Enabled = false;
-      ppr.control.shellsOn = false;
+      edgeControl.shellsOn = false;
       const shellKeys = Object.keys(routes).filter((k) =>
         k.startsWith(SHELL_PREFIX)
       );
@@ -1642,9 +1893,16 @@ async function start(opts) {
   return server;
 }
 
-// The PPR contract's selection is also run at build time (src/generate.ts), on the
-// copy of this file that ships in the binary.
-module.exports = { start, listShellRoutes, selectPprShells, pprBuild, PPR_BYPASS };
+// The edge contract's selection is also run at build time (src/generate.ts),
+// on the copy of this file that ships in the binary.
+module.exports = {
+  start,
+  listShellRoutes,
+  selectEdgePages,
+  edgeBuild,
+  edgeHeaderRuleOk,
+  EDGE_BYPASS,
+};
 // Test-only escape hatch for unit-testing the fetch→node bridge. Not a public
 // API — may change or disappear in any release without notice.
 module.exports._internal = {

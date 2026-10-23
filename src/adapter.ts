@@ -40,6 +40,7 @@ type AdapterRoute = {
   status?: number;
   priority?: boolean;
   has?: unknown[];
+  missing?: unknown[];
 };
 
 type AdapterStaticFile = {
@@ -71,6 +72,17 @@ export type AdapterSnapshot = {
    *  (redirect, rewrite, header injection) — paths they match must
    *  keep flowing through Next. */
   routingRules: string[];
+  /** The routing rules that only add response headers (next.config
+   *  `headers()`), with what they add: the edge contract can carry some
+   *  headers with a page, so these needn't guard it. */
+  headerRules: Array<{
+    sourceRegex: string;
+    headers: Record<string, string>;
+    /** Has a `has`/`missing` condition: depends on the request. */
+    conditional: boolean;
+  }>;
+  /** routingRules minus headerRules: redirects and rewrites. */
+  otherRules: string[];
   prerenders: Array<{
     pathname: string;
     /** file path relative to distDir */
@@ -273,6 +285,8 @@ const adapter = {
     };
   }) {
     const routingRules: string[] = [];
+    const headerRules: AdapterSnapshot["headerRules"] = [];
+    const otherRules: string[] = [];
     for (const key of [
       "beforeMiddleware",
       "beforeFiles",
@@ -301,6 +315,15 @@ const adapter = {
           (headerKeys.length > 0 || route.destination || route.status)
         ) {
           routingRules.push(route.sourceRegex);
+          if (headerKeys.length > 0 && !route.destination && !route.status) {
+            headerRules.push({
+              sourceRegex: route.sourceRegex,
+              headers: route.headers ?? {},
+              conditional: !!(route.has?.length || route.missing?.length),
+            });
+          } else {
+            otherRules.push(route.sourceRegex);
+          }
         }
       }
     }
@@ -343,6 +366,8 @@ const adapter = {
         .map((m) => m.sourceRegex)
         .filter((r): r is string => !!r),
       routingRules,
+      headerRules,
+      otherRules,
       prerenders,
       staticFiles,
     };

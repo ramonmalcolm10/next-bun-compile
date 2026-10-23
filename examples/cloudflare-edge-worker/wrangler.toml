@@ -1,4 +1,4 @@
-name = "ppr-shell-worker"
+name = "edge-worker"
 main = "worker.js"
 compatibility_date = "2026-07-01"
 
@@ -10,9 +10,9 @@ routes = [
   { pattern = "example.com/dashboard*", zone_name = "example.com" },
 ]
 
-# Required: the same value the origin runs with (PPR_TOKEN=<token>).
+# Required: the same value the origin runs with (EDGE_TOKEN=<token>).
 # Keep it a secret, not a plain var:
-#   wrangler secret put PPR_TOKEN
+#   wrangler secret put EDGE_TOKEN
 #
 # Optional:
 # [vars]

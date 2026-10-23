@@ -109,7 +109,7 @@ jobs:
           - label: "pinned"
             next: ""
           # Next's newest release: catches build-layout changes the pin
-          # can't, as when 16.4 moved prerendered pages and left ppr.json
+          # can't, as when 16.4 moved prerendered pages and left the marker
           # with no shells.
           - label: "latest"
             next: "latest"

@@ -303,6 +303,9 @@ config = config.replace('cacheComponents: true,', '''cacheComponents: true,
 open('next.config.ts','w').write(config)
 EOF
 rmrf_retry .next server
+# A v1 marker from an earlier build in the same output dirs: this build
+# must remove it, or an edge would call endpoints that no longer exist.
+mkdir -p dist .output && echo '{"v":1}' | tee dist/ppr.json > .output/ppr.json
 bunx next build >"$WORK/build2.log" 2>&1 || { tail -10 "$WORK/build2.log"; exit 1; }
 expect "rule-covered page excluded from tiers" grep -q "Serving 11 assets + 3 prerendered pages" "$WORK/build2.log"
 boot "$APP"
@@ -311,26 +314,39 @@ expect "custom header applied via Next" test "$HDR" = "1"
 expect "uncovered page still tier-served" test "$(code_of http://127.0.0.1:$PORT/)" = "200"
 shutdown_server
 
-echo "== PPR contract (/_ppr, ppr.json) =="
-# The framework-neutral conformance script: it reads only the marker and
-# speaks only the contract's endpoints, so passing here is passing for any
-# edge that runs it.
+echo "== edge contract (/_edge, edge.json) =="
+# The framework-neutral conformance script (rsc-kit's, a copy kept here):
+# it reads only the marker and speaks only the contract's endpoints, so
+# passing here is passing for any edge that runs it.
 TOKEN=$(openssl rand -hex 32)
-boot "$APP" PPR_TOKEN="$TOKEN"
+boot "$APP" EDGE_TOKEN="$TOKEN"
 expect "marker lists /ppr, never the proxy-covered /ppr-guarded" python3 -c "
 import json
-m = json.load(open('$APP/dist/ppr.json'))
-assert m['v'] == 1 and m['build'], m
+m = json.load(open('$APP/dist/edge.json'))
+assert m['v'] == 2 and m['build'], m
 assert '/ppr' in m['shells'] and '/ppr-guarded' not in m['shells'], m['shells']
 "
-expect "marker also at .output/ppr.json, where the contract has builders look" cmp "$APP/dist/ppr.json" "$APP/.output/ppr.json"
-expect "build carries a digest of the shells" grep -q '"build": "[A-Za-z0-9_-]*\.[0-9a-f]\{12\}"' "$APP/dist/ppr.json"
-expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded --query '/search?utm_source=ppr-check'
-expect "the example Cloudflare worker serves shells and appends holes" bun "$PKG_DIR/test/regression/cloudflare-worker.mjs" "$PKG_DIR/examples/cloudflare-ppr-worker/worker.js" "http://127.0.0.1:$PORT" "$TOKEN"
+expect "static lists the frozen /, never ISR /cached or /action, whose header rule is off the list" python3 -c "
+import json
+m = json.load(open('$APP/dist/edge.json'))
+assert '/' in m['static'], m['static']
+assert '/cached' not in m['static'] and '/action' not in m['static'], m['static']
+assert not set(m['static']) & set(m['shells']), m
+"
+expect "marker also at .output/edge.json, where the contract has builders look" cmp "$APP/dist/edge.json" "$APP/.output/edge.json"
+expect "no v1 marker left beside it" test ! -e "$APP/dist/ppr.json" -a ! -e "$APP/.output/ppr.json"
+expect "build carries a digest of the stored pages" grep -q '"build": "[A-Za-z0-9_-]*\.[0-9a-f]\{12\}"' "$APP/dist/edge.json"
+expect "conforms to the edge contract" env EDGE_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/edge-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded --guarded /action --query '/search?utm_source=edge-check'
+expect "the example Cloudflare worker serves pages and appends holes" bun "$PKG_DIR/test/regression/cloudflare-worker.mjs" "$PKG_DIR/examples/cloudflare-edge-worker/worker.js" "http://127.0.0.1:$PORT" "$TOKEN"
 # Beyond the script: an empty state, and the rest of the reserved prefix.
-expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "400"
-expect "an unknown /_ppr/ path is a 404 even with the token" test "$(code_of -H "PPR-Token: $TOKEN" http://127.0.0.1:$PORT/_ppr/x)" = "404"
-expect "a GET to the resume endpoint is a 404" test "$(code_of -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "404"
+expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "Edge-Token: $TOKEN" "http://127.0.0.1:$PORT/_edge/resume?url=%2Fppr")" = "400"
+expect "a static page has no resume" test "$(code_of -X POST -H "Edge-Token: $TOKEN" --data x "http://127.0.0.1:$PORT/_edge/resume?url=%2F")" = "404"
+expect "an unknown /_edge/ path is a 404 even with the token" test "$(code_of -H "Edge-Token: $TOKEN" http://127.0.0.1:$PORT/_edge/x)" = "404"
+expect_sh "a 404 under /_edge/ is private, no-store" "curl -s -D- -o /dev/null http://127.0.0.1:$PORT/_edge/x | tr -d '\r' | grep -qi '^cache-control: private, no-store'"
+expect "a GET to the resume endpoint is a 404" test "$(code_of -H "Edge-Token: $TOKEN" "http://127.0.0.1:$PORT/_edge/resume?url=%2Fppr")" = "404"
+curl -s -o /dev/null -X POST http://127.0.0.1:$PORT/api/revalidate-path
+expect_sh "a revalidated static page is re-rendered, still whole" "curl -s -H 'Edge-Token: $TOKEN' 'http://127.0.0.1:$PORT/_edge/page?path=%2F' | python3 -c 'import json,sys; m=json.load(sys.stdin); assert m[\"complete\"] is True and m[\"state\"] == \"\" and \"vps-deploy example\" in m[\"html\"], m'"
+expect "v1's endpoints are gone" test "$(code_of -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/shell?path=%2Fppr")" = "404"
 shutdown_server
 
 echo "== NBC_RUNTIME_DIR isolation =="
@@ -344,7 +360,7 @@ expect "static metadata seeds+module present in tree" test "$(code_of http://127
 expect "deploy dir untouched (read-only-fs safe)" test "$(ls -A "$DEPLOY" | wc -l | tr -d ' ')" = "1"
 expect "runtime files extracted to NBC_RUNTIME_DIR" test -d "$RUNTIME/.next"
 expect "shell endpoint off by default → 404" test "$(code_of http://127.0.0.1:$PORT/_nbc/ppr-shell/ppr)" = "404"
-expect "PPR contract off without PPR_TOKEN → 404" test "$(code_of -H 'PPR-Token: x' "http://127.0.0.1:$PORT/_ppr/shell?path=%2Fppr")" = "404"
+expect "edge contract off without EDGE_TOKEN → 404" test "$(code_of -H 'Edge-Token: x' "http://127.0.0.1:$PORT/_edge/page?path=%2Fppr")" = "404"
 shutdown_server
 
 echo "== PPR shell endpoint (edge-shell protocol) =="

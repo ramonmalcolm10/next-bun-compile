@@ -2,14 +2,16 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join } from "node:path";
 import {
-  buildPprMarker,
-  PPR_MARKER_FILE,
+  buildEdgeMarker,
+  EDGE_MARKER_FILE,
+  LEGACY_MARKER_FILE,
   generateEntryPoint,
 } from "./generate.js";
 import { compile } from "./compile.js";
@@ -163,24 +165,22 @@ export async function runBuild(options: RunBuildOptions): Promise<string> {
   mkdirSync(dirname(outfile), { recursive: true });
   compile({ serverDir, outfile, extraArgs: resolveExtraArgs(options) });
   // Next to the binary, so a platform that ships the output dir gets it
-  // with the binary, and at .output/ppr.json, where the PPR contract has
+  // with the binary, and at .output/edge.json, where the edge contract has
   // every framework write it for a builder to find. The same file when
   // NBC_OUT=.output. Written last: a marker only ever describes a binary
   // that exists.
-  const marker = buildPprMarker(serverDir, distDir);
+  const marker = buildEdgeMarker(serverDir, distDir);
   const json = JSON.stringify(marker, null, 2) + "\n";
-  const markerPaths = [
-    ...new Set([
-      join(dirname(outfile), PPR_MARKER_FILE),
-      join(projectDir, ".output", PPR_MARKER_FILE),
-    ]),
-  ];
-  for (const p of markerPaths) {
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, json);
+  const markerDirs = [...new Set([dirname(outfile), join(projectDir, ".output")])];
+  for (const dir of markerDirs) {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, EDGE_MARKER_FILE), json);
+    // An earlier build's v1 marker would send an edge to endpoints this
+    // binary no longer serves.
+    rmSync(join(dir, LEGACY_MARKER_FILE), { force: true });
   }
   console.log(
-    `next-bun-compile: ${PPR_MARKER_FILE} lists ${marker.shells.length} PPR shell path(s)`
+    `next-bun-compile: ${EDGE_MARKER_FILE} lists ${marker.shells.length} shell(s) and ${marker.static.length} static page(s)`
   );
   return outfile;
 }
