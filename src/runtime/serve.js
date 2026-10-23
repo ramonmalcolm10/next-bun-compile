@@ -786,6 +786,9 @@ function listShellRoutes(baseDir, guards = []) {
 function buildShellRoutes(baseDir, guards = [], buildId = readBuildId(baseDir)) {
   const raw = process.env.NBC_PPR_SHELL;
   if (!raw) return {};
+  console.warn(
+    "next-bun-compile: ⚠ NBC_PPR_SHELL and /_nbc/ppr-shell are deprecated and will be removed in v3. Use the PPR contract instead: set PPR_TOKEN and serve /_ppr/shell and /_ppr/resume (see the Edge PPR guide)."
+  );
   const token = raw === "1" || raw === "true" ? null : raw;
   const { routes: list, excluded, fallbacks } = listShellRoutes(baseDir, guards);
   const routes = {};
