@@ -97,10 +97,22 @@ jobs:
           echo "✅ vps-deploy compiles + boots on Next.js $(node -p "require('next/package.json').version")"
 
   regression:
-    name: Regression suite (hermetic, packed artifact)
+    name: Regression suite (Next.js ${{ matrix.label }})
     runs-on: ubuntu-latest
     needs: test
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The fixture's own pin (test/regression/fixture/package.json).
+          - label: "pinned"
+            next: ""
+          # Next's newest release: catches build-layout changes the pin
+          # can't, as when 16.4 moved prerendered pages and left ppr.json
+          # with no shells.
+          - label: "latest"
+            next: "latest"
     steps:
       - uses: actions/checkout@v4
 
@@ -111,6 +123,8 @@ jobs:
 
       - name: Run regression suite
         run: bun run test:regression
+        env:
+          NBC_TEST_NEXT: ${{ matrix.next }}
 
   e2e-sharp:
     name: E2E (sharp)
