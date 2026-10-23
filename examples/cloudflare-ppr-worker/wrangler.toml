@@ -10,8 +10,11 @@ routes = [
   { pattern = "example.com/dashboard*", zone_name = "example.com" },
 ]
 
-# Only needed when the origin endpoint runs in token mode
-# (NBC_PPR_SHELL=<token>). Prefer a secret over a plain var:
-#   wrangler secret put SHELL_TOKEN
+# Required: the same value the origin runs with (PPR_TOKEN=<token>).
+# Keep it a secret, not a plain var:
+#   wrangler secret put PPR_TOKEN
+#
+# Optional:
 # [vars]
-# SHELL_TOKEN = "..."
+# SHELL_REVALIDATE_SECONDS = "60"   # how stale a cached shell may get before a background re-check
+# SHELL_DEBUG = "1"                 # log which branch each request takes
