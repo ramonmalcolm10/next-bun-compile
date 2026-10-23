@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import {
   mkdirSync,
   writeFileSync,
@@ -8,6 +8,7 @@ import {
   rmSync,
   symlinkSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
   buildPprMarker,
@@ -1172,12 +1173,18 @@ describe("buildPprMarker", () => {
     html: "<html>shell</html>",
   });
 
-  /** A built tree whose server/app holds the given page pairs. */
+  /** A built tree holding the given page pairs: in server/app, or from
+   *  Next 16.4 in server/route-cache/APP_PAGE/<sha256 of source>/$/. */
   function build(
     name: string,
     pages: Record<string, string | null>,
     snapshot = {},
-    { buildId = "test-build-id", config = {} } = {}
+    {
+      buildId = "test-build-id",
+      config = {},
+      layout = "app" as "app" | "route-cache",
+      fallbacks = [] as string[],
+    } = {}
   ) {
     const root = join(tmpBase, name);
     const distDir = join(root, ".next");
@@ -1198,8 +1205,22 @@ describe("buildPprMarker", () => {
     };
     for (const [rel, postponed] of Object.entries(pages)) {
       const pair = pprPair(postponed);
-      files[`.next/standalone/.next/server/app/${rel}.meta`] = pair.meta;
-      files[`.next/standalone/.next/server/app/${rel}.html`] = pair.html;
+      let dir = ".next/standalone/.next/server/app";
+      if (layout === "route-cache") {
+        const sourceRoute = rel === "index" ? "/page" : `/${rel}/page`;
+        const hash = createHash("sha256").update(sourceRoute).digest("hex");
+        dir = `.next/standalone/.next/server/route-cache/APP_PAGE/${hash}/$`;
+        pair.meta = JSON.stringify({
+          ...JSON.parse(pair.meta),
+          routeCache: {
+            key: `/route-cache/APP_PAGE/${hash}/$/${rel}`,
+            owner: { kind: "APP_PAGE", sourceRoute },
+            isFallback: fallbacks.includes(rel),
+          },
+        });
+      }
+      files[`${dir}/${rel}.meta`] = pair.meta;
+      files[`${dir}/${rel}.html`] = pair.html;
     }
     scaffold(root, files);
     generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
@@ -1222,7 +1243,7 @@ describe("buildPprMarker", () => {
       { middlewareMatchers: ["^\\/guarded$"] }
     );
     expect(marker.v).toBe(1);
-    expect(marker.build).toBe("test-build-id");
+    expect(marker.build).toMatch(/^test-build-id\.[0-9a-f]{12}$/);
     // Decoded, as the contract matches them.
     expect(marker.shells).toEqual(["/ppr", "/has space", "/blog/hello/world"]);
     expect(marker.bypass.headers).toContain("RSC");
@@ -1243,7 +1264,26 @@ describe("buildPprMarker", () => {
   test("an empty list, still written, when no page has a shell", () => {
     const marker = build("marker-none", { static: null });
     expect(marker.shells).toEqual([]);
-    expect(marker.build).toBe("test-build-id");
+    expect(marker.build).toMatch(/^test-build-id\.[0-9a-f]{12}$/);
+  });
+
+  test("the build changes with the shells, not just with BUILD_ID", () => {
+    // A custom generateBuildId (a git SHA) rebuilt with new build-time data:
+    // same BUILD_ID, different shells, so the build must differ.
+    const a = build("marker-digest-a", { ppr: "state-1" });
+    const b = build("marker-digest-b", { ppr: "state-2" });
+    const c = build("marker-digest-c", { ppr: "state-1" });
+    expect(a.build).not.toBe(b.build);
+    expect(a.build).toBe(c.build);
+  });
+
+  test("the binary is stamped with the marker's build", () => {
+    const marker = build("marker-stamp", { ppr: "state" });
+    const entry = readFileSync(
+      join(tmpBase, "marker-stamp", ".next/standalone/server-entry.js"),
+      "utf-8"
+    );
+    expect(entry).toContain(`globalThis.__nbcPprBuild = ${JSON.stringify(marker.build)};`);
   });
 
   test("a build id outside the contract's alphabet becomes its digest", () => {
@@ -1259,6 +1299,39 @@ describe("buildPprMarker", () => {
   test("refuses every shell under basePath (matchers can't be placed)", () => {
     const marker = build("marker-basepath", { ppr: "state" }, { basePath: "/app" });
     expect(marker.shells).toEqual([]);
+  });
+
+  test("reads Next 16.4's route cache, fallbacks still withheld", () => {
+    const marker = build(
+      "marker-route-cache",
+      { index: "state", ppr: "state", "blog/hello": "state", "docs/[slug]": "state", "docs/odd": "state", static: null },
+      {},
+      { layout: "route-cache", fallbacks: ["docs/odd"] }
+    );
+    expect(marker.shells).toEqual(["/", "/ppr", "/blog/hello"]);
+  });
+
+  test("warns about a PPR page whose shell it can't find", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const page = (pathname: string, file: string | null) => ({
+        pathname, file, status: 200, revalidate: false, postponed: true, headers: {},
+      });
+      build("marker-unread", { ppr: "state" }, {
+        prerenders: [
+          page("/ppr", "server/app/ppr.html"),
+          page("/lost", "server/somewhere-new/lost.html"),
+          page("/lost.rsc", null),
+          page("/docs/[slug]", "server/somewhere-new/docs/[slug].html"),
+        ],
+      });
+      const said = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(said).toContain("1 PPR page(s) have no shell");
+      expect(said).toContain(": /lost.");
+      expect(said).not.toContain("/ppr");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("caps at 200 paths, shallowest first, and drops paths over 200 bytes", () => {

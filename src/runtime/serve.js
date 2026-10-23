@@ -522,7 +522,11 @@ function readShellPair(metaPath, htmlPath) {
     .split(",")
     .map((t) => t.trim())
     .filter(Boolean);
-  return { shell, postponed, tags };
+  // Next 16.4+ records which route owns the entry. Its incremental cache
+  // can't look the page up without it, and it marks fallback shells.
+  const rc = meta.routeCache;
+  const owner = rc && rc.owner && rc.owner.kind ? rc.owner : null;
+  return { shell, postponed, tags, owner, isFallback: !!(rc && rc.isFallback) };
 }
 
 function pairStamp(metaPath, htmlPath) {
@@ -546,13 +550,16 @@ function pairStamp(metaPath, htmlPath) {
 // The route's current pair as the cache handler holds it. Returns null
 // when Next hasn't booted, the handler has no entry yet (it fills on
 // demand, so the build output is still the truth), or the read fails.
-async function shellPairFromCache(route, fallbackTags) {
+async function shellPairFromCache(route, fallbackTags, owner) {
   const cache = incrementalCache;
   if (!cache) return null;
   try {
+    // From 16.4 Next keys a page by its owning route as well as its path,
+    // and throws without it — every read-back would silently miss.
     const res = await cache.get(route, {
       kind: "APP_PAGE",
       isRoutePPREnabled: true,
+      ...(owner && { route: owner }),
     });
     const value = res && res.value;
     if (!value || value.kind !== "APP_PAGE") return null;
@@ -579,7 +586,7 @@ async function shellPairFromCache(route, fallbackTags) {
   }
 }
 
-function shellSource(metaPath, htmlPath, route, pair) {
+function shellSource(metaPath, htmlPath, route, pair, owner = pair.owner) {
   let stamp = pairStamp(metaPath, htmlPath);
   let current = pair;
   const same = (a, b) =>
@@ -587,7 +594,7 @@ function shellSource(metaPath, htmlPath, route, pair) {
     a.postponed === b.postponed &&
     a.tags.join(",") === b.tags.join(",");
   return async () => {
-    const viaCache = await shellPairFromCache(route, current.tags);
+    const viaCache = await shellPairFromCache(route, current.tags, owner);
     if (viaCache) {
       // Adopt only on a real change: the ETag is computed from the pair,
       // and a stable ETag is what lets an edge revalidate for the price
@@ -719,10 +726,26 @@ function wirePath(p) {
  */
 function listShellRoutes(baseDir, guards = []) {
   const covered = shellGuard(guards);
-  const appDir = path.join(baseDir, ".next", "server", "app");
+  const serverDir = path.join(baseDir, ".next", "server");
+  // Where prerendered pages live: server/app/<page path> up to Next 16.3,
+  // and from 16.4 server/route-cache/APP_PAGE/<sha256 of the source
+  // route>/$/<page path> (Next's getRouteCacheKey). Below the root, both
+  // spell the page path the same way. The route cache is walked first: it
+  // is where Next writes a regeneration, so it wins a page found in both.
+  const roots = [];
+  const routeCache = path.join(serverDir, "route-cache", "APP_PAGE");
+  try {
+    for (const e of fs.readdirSync(routeCache, { withFileTypes: true })) {
+      if (e.isDirectory()) roots.push(path.join(routeCache, e.name, "$"));
+    }
+  } catch {}
+  roots.sort();
+  roots.push(path.join(serverDir, "app"));
   const routes = [];
+  const seen = new Set();
   let excluded = 0;
   let fallbacks = 0;
+  let root;
   const walk = (dir) => {
     let entries;
     try {
@@ -741,15 +764,17 @@ function listShellRoutes(baseDir, guards = []) {
       const pair = readShellPair(full, htmlPath);
       if (!pair) continue;
       const rel = path
-        .relative(appDir, full)
+        .relative(root, full)
         .slice(0, -".meta".length)
         .split(path.sep)
         .join("/");
-      if (isFallbackShell(rel)) {
+      const routePath = rel === "index" ? "/" : "/" + rel;
+      if (seen.has(routePath)) continue;
+      seen.add(routePath);
+      if (pair.isFallback || isFallbackShell(rel)) {
         fallbacks++;
         continue;
       }
-      const routePath = rel === "index" ? "/" : "/" + rel;
       // No route, so the endpoint 404s and the CDN passes through
       // permanently — the origin keeps owning this response head.
       if (covered(routePath)) {
@@ -759,7 +784,7 @@ function listShellRoutes(baseDir, guards = []) {
       routes.push({ rel, routePath, metaPath: full, htmlPath, pair });
     }
   };
-  walk(appDir);
+  for (root of roots) walk(root);
   routes.sort((a, b) => (a.routePath < b.routePath ? -1 : 1));
   return { routes, excluded, fallbacks };
 }
@@ -850,13 +875,33 @@ const PPR_BYPASS = {
   cookies: ["__prerender_bypass"],
 };
 
-/** The build id as the contract carries it, in the marker and on both
- *  endpoints. A custom generateBuildId outside the contract's alphabet
- *  becomes a stable digest of itself, computed here for both sides. */
-function pprBuild(baseDir) {
+/**
+ * The build id as the contract carries it, in the marker and on both
+ * endpoints: BUILD_ID plus a digest of every listed shell and its state.
+ *
+ * BUILD_ID alone isn't enough. A custom generateBuildId (a git SHA, say)
+ * stays the same when the same commit is rebuilt with different build-time
+ * data, such as a CMS publish or a changed env var, so new shells would
+ * ship under the old id and an edge would resume a stale one against them.
+ * The digest changes whenever a shell does. An id outside the contract's
+ * alphabet, or too long to carry the digest, becomes the digest alone.
+ *
+ * The build computes this once and stamps it into the binary
+ * (globalThis.__nbcPprBuild). Recomputing at boot would read shells that
+ * ISR may since have rewritten in a reused NBC_RUNTIME_DIR, and the binary
+ * would stop matching its own marker.
+ */
+function pprBuild(baseDir, shells = []) {
+  if (typeof globalThis.__nbcPprBuild === "string") return globalThis.__nbcPprBuild;
   const id = readBuildId(baseDir);
-  if (!id || PPR_BUILD_RE.test(id)) return id;
-  return crypto.createHash("sha256").update(id).digest("hex").slice(0, 32);
+  if (!id) return id;
+  const h = crypto.createHash("sha256").update(id);
+  for (const s of shells) {
+    h.update(`\0${s.path}\0${s.pair.shell}\0${s.pair.postponed}`);
+  }
+  const digest = h.digest("hex");
+  const tagged = `${id}.${digest.slice(0, 12)}`;
+  return PPR_BUILD_RE.test(tagged) ? tagged : digest.slice(0, 32);
 }
 
 // Decoded, absolute, and unchanged by normalisation: no query or
@@ -964,7 +1009,8 @@ const RESUME_DROP = [
 
 function buildPprRoutes({ baseDir, guards, trailingSlash, bridge }) {
   const authorized = pprTokenCheck(process.env.PPR_TOKEN);
-  const build = pprBuild(baseDir);
+  const selected = selectPprShells(baseDir, guards, { trailingSlash }).shells;
+  const build = pprBuild(baseDir, selected);
   const notFound = () =>
     new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
   // Registered unconditionally: the prefix is reserved, so a catch-all
@@ -974,7 +1020,7 @@ function buildPprRoutes({ baseDir, guards, trailingSlash, bridge }) {
   if (!process.env.PPR_TOKEN || !build) return { routes, control };
 
   const shells = new Map();
-  for (const s of selectPprShells(baseDir, guards, { trailingSlash }).shells) {
+  for (const s of selected) {
     shells.set(
       s.path,
       shellResponder(shellSource(s.metaPath, s.htmlPath, s.routePath, s.pair), (pair) => ({
@@ -1598,7 +1644,7 @@ async function start(opts) {
 
 // The PPR contract's selection is also run at build time (src/generate.ts), on the
 // copy of this file that ships in the binary.
-module.exports = { start, selectPprShells, pprBuild, PPR_BYPASS };
+module.exports = { start, listShellRoutes, selectPprShells, pprBuild, PPR_BYPASS };
 // Test-only escape hatch for unit-testing the fetch→node bridge. Not a public
 // API — may change or disappear in any release without notice.
 module.exports._internal = {

@@ -114,10 +114,12 @@ expect_sh "PPR streams shell + resumed hole" "grep -q 'static shell' <<<'$BODY' 
 # serving a cached shell POSTs the route with `next-resume: 1` and the
 # postponedState blob as the body; the origin must render only the
 # deferred holes, never a second shell. The blob lives in the page's
-# .meta file, extracted next to the binary at boot.
+# .meta file, extracted next to the binary at boot: server/app/ppr.meta,
+# or from Next 16.4 server/route-cache/APP_PAGE/<hash>/$/ppr.meta.
 python3 - >"$WORK/postponed.txt" <<'PYEOF'
-import json
-print(json.load(open('.next/server/app/ppr.meta'))['postponed'], end='')
+import glob, json
+meta = (glob.glob('.next/server/route-cache/APP_PAGE/*/$/ppr.meta') + ['.next/server/app/ppr.meta'])[0]
+print(json.load(open(meta))['postponed'], end='')
 PYEOF
 # The resumed stream legitimately carries the shell's text inside the
 # escaped RSC flight payload (hydration data) — only rendered shell
@@ -156,12 +158,17 @@ expect "gzip negotiation on tier page" test "$ENC" = "1"
 # passes because nothing was ever stored to contradict it.
 prime() { local p="$1"; shift; for _ in 1 2 3; do curl -s -o /dev/null "$@" "http://127.0.0.1:$PORT$p"; done; }
 
+# RSC requests carry ?_rsc, as the client router sends them: from Next 16.4
+# one without it is a 307 to add it, which would satisfy the negative
+# checks below without ever storing or reading an RSC variant. The L1 key
+# is the pathname alone, so the query lands in the same slot.
+#
 # /cached is warm with HTML → an RSC request must not be answered from it.
-V_RSC=$(curl -s -D- -o /dev/null -H 'RSC: 1' -H 'Accept-Encoding: identity' "http://127.0.0.1:$PORT/cached" | tr -d '\r')
+V_RSC=$(curl -s -D- -o /dev/null -H 'RSC: 1' -H 'Accept-Encoding: identity' "http://127.0.0.1:$PORT/cached?_rsc" | tr -d '\r')
 expect_sh "RSC request never served HTML after plain traffic" "echo '$V_RSC' | grep -qi '^content-type: text/x-component'"
 
 # /cached-variant is cold → prime it with RSC only, then ask plainly.
-prime /cached-variant -H 'RSC: 1'
+prime '/cached-variant?_rsc' -H 'RSC: 1'
 V_HTML=$(curl -s -D- -o /dev/null -H 'Accept-Encoding: identity' "http://127.0.0.1:$PORT/cached-variant" | tr -d '\r')
 expect_sh "plain request never served an RSC payload after RSC traffic" "echo '$V_HTML' | grep -qi '^content-type: text/html'"
 
@@ -177,7 +184,7 @@ expect_sh "plain request never served an RSC payload after RSC traffic" "echo '$
 # client would revalidate successfully and reuse a body it cannot parse.
 V_ETAG=$(echo "$V_HTML" | grep -i '^etag:' | cut -d' ' -f2)
 expect_sh "cached route serves an ETag (so the next check is load-bearing)" "test -n '$V_ETAG'"
-expect "HTML ETag does not 304 an RSC request" test "$(code_of -H 'RSC: 1' -H "If-None-Match: $V_ETAG" http://127.0.0.1:$PORT/cached)" != "304"
+expect "HTML ETag does not 304 an RSC request" test "$(code_of -H 'RSC: 1' -H "If-None-Match: $V_ETAG" "http://127.0.0.1:$PORT/cached?_rsc")" = "200"
 
 ACTION_ID=$(curl -s http://127.0.0.1:$PORT/action | grep -o 'name="\$ACTION_ID_[^"]*"' | head -1 | cut -d'"' -f2)
 expect_sh "server action POST executes (no-JS form)" "test -n '$ACTION_ID' && test \$(curl -s -o /dev/null -w '%{http_code}' -X POST -F '$ACTION_ID=' http://127.0.0.1:$PORT/action) = 200"
@@ -310,6 +317,8 @@ m = json.load(open('$APP/dist/ppr.json'))
 assert m['v'] == 1 and m['build'], m
 assert '/ppr' in m['shells'] and '/ppr-guarded' not in m['shells'], m['shells']
 "
+expect "marker also at .output/ppr.json, where the contract has builders look" cmp "$APP/dist/ppr.json" "$APP/.output/ppr.json"
+expect "build carries a digest of the shells" grep -q '"build": "[A-Za-z0-9_-]*\.[0-9a-f]\{12\}"' "$APP/dist/ppr.json"
 expect "conforms to the PPR contract" env PPR_TOKEN="$TOKEN" bun "$PKG_DIR/test/regression/ppr-conformance.mjs" "$APP/dist" "http://127.0.0.1:$PORT" --unlisted /cached --unlisted /docs/x --guarded /ppr-guarded --query '/search?utm_source=ppr-check'
 # Beyond the script: an empty state, and the rest of the reserved prefix.
 expect "an empty resume body is a 400, not a crash" test "$(code_of -X POST -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/resume?url=%2Fppr")" = "400"

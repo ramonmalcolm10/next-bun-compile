@@ -96,14 +96,16 @@ a framework and an edge: one marker, one shell endpoint, one resume
 endpoint, one build header. An edge that implements it serves any
 framework that does, with no per-framework code.
 
-**The marker.** Every build writes `ppr.json` next to the binary
-(`dist/` by default, so `NBC_OUT=.output` puts it at
-`.output/ppr.json`), with `"shells": []` when no page qualifies:
+**The marker.** Every build writes `ppr.json` to `.output/ppr.json` in
+the project, where the contract has a builder look for it, and next to
+the binary (`dist/` by default), so it ships with the binary. With
+`NBC_OUT=.output` the two are one file. `"shells": []` when no page
+qualifies:
 
 ```json
 {
   "v": 1,
-  "build": "Q6p5InH-AoAKW6ZLAyNXg",
+  "build": "Q6p5InH-AoAKW6ZLAyNXg.3f9c0a1b2d4e",
   "shells": ["/pricing", "/blog/hello-world"],
   "bypass": {
     "headers": ["RSC", "Next-Router-Prefetch", "Next-Router-Segment-Prefetch", "Next-Router-State-Tree", "Next-Action"],
@@ -120,8 +122,14 @@ framework that does, with no per-framework code.
   pages, fallback shells, paths a client can't send unchanged, and
   anything past the limits (200 paths of at most 200 bytes, shallowest
   kept, with a build warning naming the rest).
-- `build` is `BUILD_ID`, or a digest of it when a custom
-  `generateBuildId` uses characters outside `[A-Za-z0-9._-]`.
+- `build` is `BUILD_ID` plus a digest of every listed shell and its
+  state (`Q6p5InH-AoAKW6ZLAyNXg.3f9c0a1b2d4e`), so it changes whenever a
+  shell does. That matters with a custom `generateBuildId`: one that
+  returns the git SHA keeps its id when the same commit is rebuilt with
+  new build-time data (a CMS publish, a changed env var). The build
+  stamps the value into the binary, so `PPR-Build` always matches the
+  marker. An id outside `[A-Za-z0-9._-]`, or too long to carry the
+  digest, becomes the digest alone.
 - `bypass` names Next's own requests on a page's path (client
   navigations, prefetches, actions, draft mode), which an edge passes to
   the origin untouched.
