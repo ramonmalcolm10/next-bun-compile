@@ -75,13 +75,19 @@ APP="$WORK/app"
 mkdir -p "$APP"
 cp -R "$FIXTURE_DIR/." "$APP/"
 cd "$APP"
-python3 - "$TARBALL" <<'EOF'
+# NBC_TEST_NEXT swaps the fixture's pinned Next.js (e.g. "latest"), so CI
+# can run the same checks against Next's newest release: a build-layout
+# change there (16.4 moved prerendered pages) is invisible on the pin.
+python3 - "$TARBALL" "${NBC_TEST_NEXT:-}" <<'EOF'
 import json, sys
 p = json.load(open('package.json'))
 p['dependencies']['next-bun-compile'] = 'file:' + sys.argv[1]
+if sys.argv[2]:
+    p['dependencies']['next'] = sys.argv[2]
 json.dump(p, open('package.json','w'), indent=2)
 EOF
 bun install >/dev/null 2>&1
+echo "  (Next.js $(node -p "require('next/package.json').version"))"
 
 echo "== build (adapter, single command) =="
 # NEXT_DEPLOYMENT_ID exercises the internal skew-header routing rules —
