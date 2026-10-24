@@ -94,7 +94,7 @@ echo "== build (adapter, single command) =="
 # a catch-all that once disabled the tiers entirely (0 assets + 0 pages).
 BUILD_LOG="$WORK/build.log"
 NEXT_DEPLOYMENT_ID=testdpl bunx next build >"$BUILD_LOG" 2>&1 || { tail -10 "$BUILD_LOG"; exit 1; }
-expect "tier eligibility: 11 assets + 4 pages frozen (deploymentId set)" grep -q "Serving 11 assets + 4 prerendered pages" "$BUILD_LOG"
+expect "tier eligibility: 11 assets + 5 pages frozen (deploymentId set)" grep -q "Serving 11 assets + 5 prerendered pages" "$BUILD_LOG"
 expect "binary produced by next build alone" test -f dist/app
 
 echo "== behavior =="
@@ -298,7 +298,10 @@ python3 - <<'EOF'
 config = open('next.config.ts').read()
 config = config.replace('cacheComponents: true,', '''cacheComponents: true,
   async headers() {
-    return [{ source: "/action", headers: [{ key: "X-Custom-Policy", value: "test" }] }];
+    return [
+      { source: "/action", headers: [{ key: "X-Custom-Policy", value: "test" }] },
+      { source: "/framed", headers: [{ key: "X-Frame-Options", value: "DENY" }] },
+    ];
   },''')
 open('next.config.ts','w').write(config)
 EOF
@@ -307,7 +310,7 @@ rmrf_retry .next server
 # must remove it, or an edge would call endpoints that no longer exist.
 mkdir -p dist .output && echo '{"v":1}' | tee dist/ppr.json > .output/ppr.json
 bunx next build >"$WORK/build2.log" 2>&1 || { tail -10 "$WORK/build2.log"; exit 1; }
-expect "rule-covered page excluded from tiers" grep -q "Serving 11 assets + 3 prerendered pages" "$WORK/build2.log"
+expect "rule-covered pages excluded from tiers" grep -q "Serving 11 assets + 3 prerendered pages" "$WORK/build2.log"
 boot "$APP"
 HDR=$(curl -s -D- -o /dev/null http://127.0.0.1:$PORT/action | grep -ci 'x-custom-policy: test' || true)
 expect "custom header applied via Next" test "$HDR" = "1"
@@ -331,8 +334,10 @@ import json
 m = json.load(open('$APP/dist/edge.json'))
 assert '/' in m['static'], m['static']
 assert '/cached' not in m['static'] and '/action' not in m['static'], m['static']
+assert '/framed' in m['static'], m['static']
 assert not set(m['static']) & set(m['shells']), m
 "
+expect_sh "an allowed header rule travels with its page" "curl -s -H 'Edge-Token: $TOKEN' 'http://127.0.0.1:$PORT/_edge/page?path=%2Fframed' | python3 -c 'import json,sys; h={k.lower():v for k,v in (json.load(sys.stdin).get(\"headers\") or {}).items()}; assert h.get(\"x-frame-options\") == \"DENY\", h'"
 expect "marker also at .output/edge.json, where the contract has builders look" cmp "$APP/dist/edge.json" "$APP/.output/edge.json"
 expect "no v1 marker left beside it" test ! -e "$APP/dist/ppr.json" -a ! -e "$APP/.output/ppr.json"
 expect "build carries a digest of the stored pages" grep -q '"build": "[A-Za-z0-9_-]*\.[0-9a-f]\{12\}"' "$APP/dist/edge.json"
