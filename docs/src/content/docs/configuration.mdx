@@ -29,6 +29,7 @@ time so container boots skip extraction. See
 | `NBC_OUT`                  | `dist`         | Directory for the compiled binary (created if missing), relative to the project or absolute. See [Where the binary appears](#where-the-binary-appears). |
 | `NBC_BINARY`               | `app`          | Filename of the compiled binary.                                  |
 | `NBC_BUILD_ARGS`           | —              | Extra flags appended to the `bun build` invocation, whitespace-separated. See [Extra build flags](#extra-build-flags). |
+| `NBC_REQUEST_HOOK`         | unset          | Module, relative to the project, whose default export runs before Next on each request that reaches it. See [Request hook](#request-hook). |
 | `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
 
 ## Extra build flags
@@ -61,6 +62,45 @@ The ~6 ms saved on the entry graph disappears behind the ~145 ms spent
 requiring Next off the extracted tree. It is worth enabling only if your app is
 served entirely from Tier 1 / Tier 2 routes and never initialises Next, in
 which case you only ever pay the first row.
+
+## Request hook
+
+`NBC_REQUEST_HOOK` names a module that is bundled into the binary and runs
+before Next on every request that reaches Next. Embedded static assets and
+pages served from memory never reach it. Its default export receives the
+`Request` and Bun's `server`, and returns one of:
+
+- a `Response`: sent as is, and Next never sees the request;
+- a function: called exactly once when Next is done with the request, meaning
+  the handler has settled and the response has closed (on a client abort these
+  can come in either order), or at once if the handler throws;
+- nothing: the request goes to Next as usual.
+
+That is enough for admission control. Queued renders are what take a
+process down in a traffic flood, and this caps them per process and sheds
+the rest at once:
+
+```ts
+// server/admission.ts
+const CAP = Number(process.env.RENDER_CAP ?? 24);
+let inFlight = 0;
+
+export default function onRequest(request: Request) {
+  if (request.method !== "GET") return;
+  if (!(request.headers.get("accept") ?? "").includes("text/html")) return;
+  if (inFlight >= CAP) {
+    return new Response("Busy", { status: 503, headers: { "Retry-After": "5" } });
+  }
+  inFlight++;
+  return () => inFlight--;
+}
+```
+
+```bash
+NBC_REQUEST_HOOK=server/admission.ts next build
+```
+
+A missing module fails the build. A hook that throws fails that request.
 
 ## `next.config.ts` options
 

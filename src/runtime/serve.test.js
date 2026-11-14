@@ -335,3 +335,115 @@ test("cgroup read works against the real filesystem", () => {
   expect(budget).toBeGreaterThanOrEqual(8 * 1024 * 1024);
   expect(budget).toBeLessThanOrEqual(512 * 1024 * 1024);
 });
+
+/** Hook counting what it admits; release() calls are recorded per request. */
+function countingHook({ cap = Infinity } = {}) {
+  const state = { inFlight: 0, releases: 0, shed: 0 };
+  const onRequest = () => {
+    if (state.inFlight >= cap) {
+      state.shed++;
+      return new Response("busy", { status: 503 });
+    }
+    state.inFlight++;
+    return () => {
+      state.inFlight--;
+      state.releases++;
+    };
+  };
+  return { state, onRequest };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 20));
+
+test("request hook can answer a request before Next runs", async () => {
+  let ran = false;
+  const bridge = _internal.createBridge(
+    () => () => { ran = true; },
+    () => new Response("busy", { status: 503, headers: { "retry-after": "5" } })
+  );
+  const response = await bridge(new Request("http://localhost/"), undefined);
+  expect(response.status).toBe(503);
+  expect(response.headers.get("retry-after")).toBe("5");
+  expect(ran).toBe(false);
+});
+
+test("request hook release runs once, after the response finishes", async () => {
+  const { state, onRequest } = countingHook();
+  let finish;
+  const handler = (nodeReq, nodeRes) =>
+    new Promise((resolve) => {
+      nodeRes.writeHead(200, { "content-type": "text/html" });
+      nodeRes.write("<shell>");
+      finish = () => {
+        nodeRes.end("</html>");
+        resolve();
+      };
+    });
+  const bridge = _internal.createBridge(() => handler, onRequest);
+  const response = await bridge(new Request("http://localhost/"), undefined);
+  // headers are out, the body is still streaming: still in flight
+  expect(state.inFlight).toBe(1);
+  finish();
+  expect(await response.text()).toBe("<shell></html>");
+  await tick();
+  expect(state.inFlight).toBe(0);
+  expect(state.releases).toBe(1);
+});
+
+test("request hook release runs once on a client abort mid-stream", async () => {
+  const { state, onRequest } = countingHook();
+  let timer;
+  let finish;
+  const handler = (nodeReq, nodeRes) =>
+    new Promise((resolve) => {
+      nodeRes.writeHead(200, { "content-type": "text/html" });
+      timer = setInterval(() => nodeRes.write("<chunk>"), 5);
+      finish = resolve;
+    });
+  const ac = new AbortController();
+  const bridge = _internal.createBridge(() => handler, onRequest);
+  await bridge(new Request("http://localhost/", { signal: ac.signal }), undefined);
+  ac.abort();
+  await tick();
+  // the response closed, but Next is still rendering: the slot stays taken
+  expect(state.inFlight).toBe(1);
+  clearInterval(timer);
+  finish();
+  await tick();
+  expect(state.inFlight).toBe(0);
+  expect(state.releases).toBe(1);
+});
+
+test("request hook release runs once when the handler throws", async () => {
+  const { state, onRequest } = countingHook();
+  const bridge = _internal.createBridge(
+    () => async () => { throw new Error("render failed"); },
+    onRequest
+  );
+  await expect(bridge(new Request("http://localhost/"), undefined)).rejects.toThrow("render failed");
+  await tick();
+  expect(state.inFlight).toBe(0);
+  expect(state.releases).toBe(1);
+});
+
+test("request hook sheds past its cap and admits again after release", async () => {
+  const { state, onRequest } = countingHook({ cap: 1 });
+  let finish;
+  const handler = (nodeReq, nodeRes) =>
+    new Promise((resolve) => {
+      nodeRes.writeHead(200);
+      finish = () => { nodeRes.end("ok"); resolve(); };
+    });
+  const bridge = _internal.createBridge(() => handler, onRequest);
+  const first = await bridge(new Request("http://localhost/a"), undefined);
+  const second = await bridge(new Request("http://localhost/b"), undefined);
+  expect(second.status).toBe(503);
+  finish();
+  await first.text();
+  await tick();
+  const third = await bridge(new Request("http://localhost/c"), undefined);
+  expect(third.status).toBe(200);
+  finish();
+  await third.text();
+  expect(state.shed).toBe(1);
+});

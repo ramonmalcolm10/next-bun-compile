@@ -306,12 +306,26 @@ rmrf_retry .next server
 # A v1 marker from an earlier build in the same output dirs: this build
 # must remove it, or an edge would call endpoints that no longer exist.
 mkdir -p dist .output && echo '{"v":1}' | tee dist/ppr.json > .output/ppr.json
-bunx next build >"$WORK/build2.log" 2>&1 || { tail -10 "$WORK/build2.log"; exit 1; }
+# This build also carries a request hook, which has to reach the binary
+# through the bundler: a TypeScript module named only by NBC_REQUEST_HOOK.
+mkdir -p hooks && cat > hooks/on-request.ts <<'EOF'
+export default function onRequest(request: Request) {
+  if (request.headers.get("x-test-shed") === "1") {
+    return new Response("shed", { status: 503, headers: { "Retry-After": "5" } });
+  }
+  const path = new URL(request.url).pathname;
+  return () => console.log(`nbc-test: released ${path}`);
+}
+EOF
+NBC_REQUEST_HOOK=hooks/on-request.ts bunx next build >"$WORK/build2.log" 2>&1 || { tail -10 "$WORK/build2.log"; exit 1; }
 expect "rule-covered page excluded from tiers" grep -q "Serving 11 assets + 3 prerendered pages" "$WORK/build2.log"
 boot "$APP"
 HDR=$(curl -s -D- -o /dev/null http://127.0.0.1:$PORT/action | grep -ci 'x-custom-policy: test' || true)
 expect "custom header applied via Next" test "$HDR" = "1"
 expect "uncovered page still tier-served" test "$(code_of http://127.0.0.1:$PORT/)" = "200"
+expect "request hook answers before Next" test "$(code_of -H 'x-test-shed: 1' http://127.0.0.1:$PORT/action)" = "503"
+sleep 0.5
+expect_sh "request hook release runs once per Next request" "test \$(grep -c 'nbc-test: released /action' '$SERVER_LOG') = 1"
 shutdown_server
 
 echo "== edge contract (/_edge, edge.json) =="

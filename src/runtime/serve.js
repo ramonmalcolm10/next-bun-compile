@@ -214,8 +214,39 @@ class NodeResponseShim extends Writable {
   }
 }
 
-function createBridge(getHandler) {
+const NO_RELEASE = { done: () => {}, fail: () => {} };
+
+/**
+ * The app's NBC_REQUEST_HOOK runs before Next sees a request. It may
+ * answer the request itself (return a Response) or return a function,
+ * called once when Next is done with the request: both the handler has
+ * settled and the response has closed, which on a client abort can be
+ * in either order. Enough for admission control without wrapping Next.
+ */
+async function admit(onRequest, request, server) {
+  if (!onRequest) return NO_RELEASE;
+  const result = await onRequest(request, server);
+  if (result instanceof Response) return { response: result };
+  if (typeof result !== "function") return NO_RELEASE;
+  let pending = 2;
+  const fire = () => {
+    if (pending <= 0) return;
+    pending = 0;
+    result();
+  };
+  return {
+    done: () => {
+      if (--pending === 0) result();
+    },
+    // A failed request may never close its response: release at once.
+    fail: fire,
+  };
+}
+
+function createBridge(getHandler, onRequest = null) {
   return async function bridge(request, server) {
+    const admission = await admit(onRequest, request, server);
+    if (admission.response) return admission.response;
     const remoteAddr =
       (server && server.requestIP(request)?.address) || "127.0.0.1";
     const req = makeNodeRequest(request, remoteAddr);
@@ -235,7 +266,9 @@ function createBridge(getHandler) {
           })
         );
       });
+      res.once("close", admission.done);
       res.on("error", (err) => {
+        admission.fail();
         if (!settled) {
           settled = true;
           reject(err);
@@ -246,12 +279,15 @@ function createBridge(getHandler) {
         req.destroy();
         res.destroy();
       });
-      Promise.resolve(getHandler()(req, res)).catch((err) => {
-        if (!settled) {
-          settled = true;
-          reject(err);
-        }
-      });
+      Promise.resolve(getHandler()(req, res))
+        .catch((err) => {
+          admission.fail();
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        })
+        .finally(admission.done);
     });
   };
 }
@@ -1519,6 +1555,7 @@ async function start(opts) {
     enableL1 = true,
     shellGuards = [],
     edge = {},
+    onRequest = null,
   } = opts;
   if (gzippedAssets) gzippedAssetSet = gzippedAssets;
 
@@ -1572,7 +1609,7 @@ async function start(opts) {
     return handlerPromise;
   };
   let handler = null;
-  const bridge = createBridge(() => handler);
+  const bridge = createBridge(() => handler, onRequest);
   const bridgeLazy = async (req, server) => {
     if (!handler) handler = await getHandlerOnce();
     return bridge(req, server);

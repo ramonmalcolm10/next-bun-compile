@@ -100,6 +100,45 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain('const nextConfig = {"assetPrefix":""}');
   });
 
+  test("NBC_REQUEST_HOOK bundles the app's hook into the entry", () => {
+    const setup = (name: string, files: Record<string, string> = {}) => {
+      const root = join(tmpBase, name);
+      const distDir = join(root, ".next");
+      const standaloneDir = join(distDir, "standalone");
+      scaffold(root, {
+        ".next/required-server-files.json": MOCK_RSF,
+        ".next/BUILD_ID": "test-build-id",
+        ".next/nbc-adapter-outputs.json": mockSnapshot(),
+        ".next/standalone/server.js": MOCK_SERVER_JS,
+        ".next/standalone/.next/BUILD_ID": "test-build-id",
+        ".next/standalone/.next/server/chunks/ssr.js": `// no externals`,
+        ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+        ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+        ...files,
+      });
+      return () => {
+        generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
+        return readFileSync(join(standaloneDir, "server-entry.js"), "utf-8");
+      };
+    };
+
+    expect(setup("hook-off")()).toContain("const __NBC_ON_REQUEST = null;");
+
+    process.env.NBC_REQUEST_HOOK = "server/on-request.ts";
+    try {
+      const entry = setup("hook-on", {
+        "server/on-request.ts": "export default () => {};",
+      })();
+      expect(entry).toContain(JSON.stringify(join(tmpBase, "hook-on", "server/on-request.ts")));
+      expect(entry).toContain("onRequest: __NBC_ON_REQUEST");
+
+      // a typo must fail the build, not ship a binary without its gate
+      expect(setup("hook-missing")).toThrow("NBC_REQUEST_HOOK");
+    } finally {
+      delete process.env.NBC_REQUEST_HOOK;
+    }
+  });
+
   test("monorepo layout: returns nested serverDir", () => {
     const root = join(tmpBase, "monorepo");
     const distDir = join(root, ".next");

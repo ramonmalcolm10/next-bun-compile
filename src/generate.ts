@@ -9,7 +9,7 @@ import {
   copyFileSync,
   type Stats,
 } from "node:fs";
-import { join, relative, basename } from "node:path";
+import { join, relative, basename, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { createRequire } from "node:module";
@@ -1065,8 +1065,24 @@ function computeStaticTiers(args: {
   });
 }
 
+/**
+ * NBC_REQUEST_HOOK names a module, relative to the project, whose default
+ * export runs before Next on every request that reaches it. It is bundled
+ * into the binary like the entry itself.
+ */
+export function resolveRequestHook(projectDir: string): string | null {
+  const value = process.env.NBC_REQUEST_HOOK;
+  if (!value) return null;
+  const hookPath = resolve(projectDir, value);
+  if (!existsSync(hookPath)) {
+    throw new Error(`NBC_REQUEST_HOOK: ${hookPath} does not exist`);
+  }
+  return hookPath;
+}
+
 export function generateEntryPoint(options: GenerateOptions): string {
   const { standaloneDir, serverDir, distDir, projectDir } = options;
+  const requestHook = resolveRequestHook(projectDir);
 
   generateStubs(standaloneDir);
   patchRequireHook(standaloneDir);
@@ -1619,6 +1635,11 @@ const __NBC_SHELL_GUARDS = ${JSON.stringify(shellGuards)};
 // The edge contract's input: its guards, the headers() rules that travel
 // with a page, and the static pages it may list.
 const __NBC_EDGE = ${JSON.stringify(edgeInput)};
+const __NBC_ON_REQUEST = ${
+    requestHook
+      ? `(() => { const m = require(${JSON.stringify(requestHook)}); const fn = m.default ?? m; if (typeof fn !== "function") throw new Error("NBC_REQUEST_HOOK must export a function"); return fn; })()`
+      : "null"
+  };
 
 // Image-build hook: \`server --extract\` materializes the runtime tree and
 // exits. A later boot with the same NBC_RUNTIME_DIR hits the manifest
@@ -1644,6 +1665,7 @@ extractAssets().then(() => {
     staticPages: __NBC_STATIC_PAGES,
     shellGuards: __NBC_SHELL_GUARDS,
     edge: __NBC_EDGE,
+    onRequest: __NBC_ON_REQUEST,
     // serve.js resolves .next/... and Next's own dir option off this, so
     // it is the app dir, not the extraction root (same unless monorepo).
     baseDir: appDir,
