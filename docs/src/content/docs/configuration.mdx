@@ -29,6 +29,7 @@ time so container boots skip extraction. See
 | `NBC_OUT`                  | `dist`         | Directory for the compiled binary (created if missing), relative to the project or absolute. See [Where the binary appears](#where-the-binary-appears). |
 | `NBC_BINARY`               | `app`          | Filename of the compiled binary.                                  |
 | `NBC_BUILD_ARGS`           | —              | Extra flags appended to the `bun build` invocation, whitespace-separated. See [Extra build flags](#extra-build-flags). |
+| `NBC_PRIVATE_SOURCEMAPS`   | `0`            | Set to `1` to leave `.map` files under `.next/static` out of the binary, so they 404 instead of being served. They stay on disk for an error tracker. See [Private browser sourcemaps](#private-browser-sourcemaps). |
 | `NEXT_BUN_COMPILE_VERBOSE` | `0`            | Set to `1` to print the alias-resolution table at build time.     |
 
 ## Extra build flags
@@ -61,6 +62,23 @@ The ~6 ms saved on the entry graph disappears behind the ~145 ms spent
 requiring Next off the extracted tree. It is worth enabling only if your app is
 served entirely from Tier 1 / Tier 2 routes and never initialises Next, in
 which case you only ever pay the first row.
+
+## Private browser sourcemaps
+
+With `productionBrowserSourceMaps: true`, Next writes a `.map` next to every
+client chunk, and the binary serves them like any other static asset, as `next
+start` does. Anyone can then read your original client source.
+
+To resolve client stack traces without publishing the source, build with
+`NBC_PRIVATE_SOURCEMAPS=1`: the maps are not embedded and their URLs 404, while
+the files stay in `.next/static` for your error tracker to upload or read.
+
+```bash
+NBC_PRIVATE_SOURCEMAPS=1 next build
+```
+
+Turbopack can name a map differently from its chunk; the chunk's trailing
+`//# sourceMappingURL=` comment is the link between the two.
 
 ## `next.config.ts` options
 

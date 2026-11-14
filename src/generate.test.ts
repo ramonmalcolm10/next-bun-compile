@@ -100,6 +100,40 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain('const nextConfig = {"assetPrefix":""}');
   });
 
+  test("NBC_PRIVATE_SOURCEMAPS=1 keeps browser sourcemaps out of the served assets", () => {
+    const build = (name: string) => {
+      const root = join(tmpBase, name);
+      const distDir = join(root, ".next");
+      const standaloneDir = join(distDir, "standalone");
+      scaffold(root, {
+        ".next/required-server-files.json": MOCK_RSF,
+        ".next/BUILD_ID": "test-build-id",
+        ".next/nbc-adapter-outputs.json": mockSnapshot(),
+        ".next/static/chunks/app.js": "//# sourceMappingURL=app.js.map",
+        ".next/static/chunks/app.js.map": "{}",
+        ".next/standalone/server.js": MOCK_SERVER_JS,
+        ".next/standalone/.next/BUILD_ID": "test-build-id",
+        ".next/standalone/.next/server/chunks/ssr.js": `// no externals`,
+        ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+        ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+      });
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
+      return readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+    };
+
+    const served = build("maps-public");
+    expect(served).toContain("/_next/static/chunks/app.js.map");
+
+    process.env.NBC_PRIVATE_SOURCEMAPS = "1";
+    try {
+      const assets = build("maps-private");
+      expect(assets).toContain("/_next/static/chunks/app.js\"");
+      expect(assets).not.toContain("/_next/static/chunks/app.js.map");
+    } finally {
+      delete process.env.NBC_PRIVATE_SOURCEMAPS;
+    }
+  });
+
   test("monorepo layout: returns nested serverDir", () => {
     const root = join(tmpBase, "monorepo");
     const distDir = join(root, ".next");

@@ -1074,7 +1074,12 @@ export function generateEntryPoint(options: GenerateOptions): string {
 
   // Discover assets
   const staticDir = join(distDir, "static");
-  const staticFiles = walkDir(staticDir).map((f) => ({
+  // With NBC_PRIVATE_SOURCEMAPS=1, productionBrowserSourceMaps output stays
+  // on disk (for an error tracker to read or upload) but is not served.
+  const privateSourcemaps = process.env.NBC_PRIVATE_SOURCEMAPS === "1";
+  const staticFiles = walkDir(staticDir)
+    .filter((f) => !(privateSourcemaps && f.relativePath.endsWith(".map")))
+    .map((f) => ({
     ...f,
     urlPath: `/_next/static/${f.relativePath.replace(/\\/g, "/")}`,
   }));
