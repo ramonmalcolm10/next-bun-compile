@@ -1074,10 +1074,22 @@ export function generateEntryPoint(options: GenerateOptions): string {
 
   // Discover assets
   const staticDir = join(distDir, "static");
-  const staticFiles = walkDir(staticDir).map((f) => ({
-    ...f,
-    urlPath: `/_next/static/${f.relativePath.replace(/\\/g, "/")}`,
-  }));
+  // With NBC_PRIVATE_SOURCEMAPS=1, productionBrowserSourceMaps output stays
+  // on disk (for an error tracker to read or upload) but is not served.
+  const privateSourcemaps = process.env.NBC_PRIVATE_SOURCEMAPS === "1";
+  const allStaticFiles = walkDir(staticDir);
+  const staticFiles = allStaticFiles
+    .filter((f) => !(privateSourcemaps && f.relativePath.endsWith(".map")))
+    .map((f) => ({
+      ...f,
+      urlPath: `/_next/static/${f.relativePath.replace(/\\/g, "/")}`,
+    }));
+  const privateMaps = allStaticFiles.length - staticFiles.length;
+  if (privateMaps > 0) {
+    console.log(
+      `next-bun-compile: NBC_PRIVATE_SOURCEMAPS — leaving ${privateMaps} browser sourcemap(s) out of the binary; they stay in ${staticDir}`
+    );
+  }
 
   const publicDir = join(projectDir, "public");
   const publicFiles = walkDir(publicDir).map((f) => ({

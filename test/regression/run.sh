@@ -597,14 +597,23 @@ EOF
 python3 - <<'EOF'
 config = open('next.config.ts').read()
 config = config.replace('cacheComponents: true,',
-  'cacheComponents: true,\n  cacheHandler: process.cwd() + "/cache-handler.mjs",')
+  'cacheComponents: true,\n  cacheHandler: process.cwd() + "/cache-handler.mjs",\n  productionBrowserSourceMaps: true,')
 open('next.config.ts','w').write(config)
 EOF
 rmrf_retry .next server
-bunx next build >"$WORK/build3.log" 2>&1 || { tail -10 "$WORK/build3.log"; exit 1; }
+# Browser sourcemaps on, kept private: the maps stay on disk, not in the binary.
+NBC_PRIVATE_SOURCEMAPS=1 bunx next build >"$WORK/build3.log" 2>&1 || { tail -10 "$WORK/build3.log"; exit 1; }
 expect "build announces the tier-off failsafe" grep -q "custom cacheHandler detected" "$WORK/build3.log"
 boot "$APP"
 expect_sh "no frozen pages at runtime (failsafe active)" "grep -q '0 prerendered pages served from memory' '$SERVER_LOG'"
+MAP=$(cd .next/static && find . -name '*.js.map' | head -1 | sed 's#^\./##')
+expect "browser sourcemaps written to disk" test -n "$MAP"
+expect "build says the sourcemaps were left out" grep -q "leaving [0-9]* browser sourcemap(s) out of the binary" "$WORK/build3.log"
+expect "a private sourcemap is a 404" test "$(code_of "http://127.0.0.1:$PORT/_next/static/$MAP")" = "404"
+# Turbopack names a map apart from its chunk; the chunk's
+# sourceMappingURL comment is the only link between them.
+CHUNK=$(cd .next/static && grep -rl --include='*.js' "sourceMappingURL=$(basename "$MAP")" . | head -1 | sed 's#^\./##')
+expect "its chunk is still served" test -n "$CHUNK" -a "$(code_of "http://127.0.0.1:$PORT/_next/static/$CHUNK")" = "200"
 C1=$(curl -s http://127.0.0.1:$PORT/cached | grep -o 'stamp: <!-- -->[0-9]*')
 curl -s -X POST http://127.0.0.1:$PORT/api/revalidate >/dev/null
 sleep 1
