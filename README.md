@@ -58,15 +58,15 @@ boot skips extraction too.
 
 ## Deploying
 
-[Homeport](https://homeport.sh/) deploys Next.js and next-bun-compile apps
-without setup. It serves PPR shells and static pages from its edge through
-the [edge contract](https://ramonmalcolm10.github.io/next-bun-compile/guides/edge-ppr/),
-and purges them the moment you revalidate. See
-[Deploy with Homeport](https://ramonmalcolm10.github.io/next-bun-compile/recipes/homeport/).
-
-Prefer running it yourself? The binary needs nothing installed: see the
+The binary runs anywhere and needs nothing installed: a VPS, a container
+platform, Kubernetes, your own hardware. See the
 [VPS](https://ramonmalcolm10.github.io/next-bun-compile/recipes/vps-deploy/)
 and [Docker](https://ramonmalcolm10.github.io/next-bun-compile/guides/docker/) guides.
+
+For a hosted option, [Homeport](https://homeport.sh/) (by the same author)
+deploys Next.js and next-bun-compile apps without setup, serves PPR shells
+and static pages from its edge, and purges them the moment you revalidate.
+See [Deploy with Homeport](https://ramonmalcolm10.github.io/next-bun-compile/recipes/homeport/).
 
 ## Documentation
 
