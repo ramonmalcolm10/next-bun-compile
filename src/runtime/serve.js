@@ -1164,6 +1164,128 @@ const RESUME_DROP = [
 // What a static page's re-render through Next doesn't take from the
 // edge's request: the edge's own headers, and anything that would make
 // the answer one visitor's (it carries no cookies, but never trust that).
+// ── CDN purge ────────────────────────────────────────────────────────
+// With CDN_PURGE_URL set (a platform sets it), every revalidateTag and
+// revalidatePath is POSTed there as {tags, paths}, so an edge holding a
+// page drops or re-checks it at once instead of on its next ETag check.
+// Pages say which tags they carry in Cache-Tag on /_edge/page.
+
+const CDN_MAX_TAG = 1024;
+const CDN_MAX_ENTRIES = 100;
+const CDN_MAX_PATH = 2048;
+
+/**
+ * A Next tag as a purge names it and Cache-Tag carries it. Next already
+ * percent-encodes non-ASCII; space, tab and comma, which it leaves, are
+ * encoded the same way, so a tag is visible ASCII and never splits the
+ * comma-separated header. Both sides use this, so they always agree.
+ */
+function cdnTag(tag) {
+  let t;
+  try {
+    t = tag.replace(/[^\x21-\x2b\x2d-\x7e]/g, (c) => encodeURIComponent(c));
+  } catch {
+    return null; // a lone surrogate
+  }
+  return t.length > 0 && t.length <= CDN_MAX_TAG ? t : null;
+}
+
+const CDN_MAX_CACHE_TAGS = 128;
+
+/**
+ * A page's Cache-Tag value, or null when it has no tags. Past the edge's
+ * 128 the rest are left off; a purge by path still reaches the page.
+ */
+function cdnCacheTag(tags) {
+  const out = [...new Set((tags || []).map(cdnTag).filter(Boolean))].slice(0, CDN_MAX_CACHE_TAGS);
+  return out.length ? out.join(",") : null;
+}
+
+/**
+ * The purge requests for a revalidation's tags, at most CDN_MAX_ENTRIES
+ * tags and paths each. revalidatePath('/x') arrives as `_N_T_/x` and is
+ * purged as the path, in the form the app serves it. A `/layout` or
+ * `/page` tag (revalidatePath with a type) stays a tag: every page's
+ * Cache-Tag carries its implicit tags, so the edge can match it.
+ */
+function cdnPurgeBodies(tags, trailingSlash) {
+  const tagSet = new Set();
+  const pathSet = new Set();
+  const addTag = (t) => {
+    const v = cdnTag(t);
+    if (v) tagSet.add(v);
+  };
+  const addPath = (p) => {
+    if (p.includes("[")) return; // a route pattern, not a page
+    const served = servedPath(p === "/index" ? "/" : p, trailingSlash);
+    if (served && served.length <= CDN_MAX_PATH && !/[?#\x00-\x1f\x7f]/.test(served)) {
+      pathSet.add(served);
+    }
+  };
+  for (const tag of Array.isArray(tags) ? tags : tags ? [tags] : []) {
+    if (typeof tag !== "string") continue;
+    if (!tag.startsWith("_N_T_")) {
+      addTag(tag);
+      continue;
+    }
+    const rest = tag.slice("_N_T_".length) || "/";
+    if (rest.endsWith("/layout") || rest.endsWith("/page")) {
+      addTag(tag);
+      // `/x/page` is revalidatePath('/x', 'page') or a page at /x/page;
+      // the tag covers the second, the path the first.
+      if (rest.endsWith("/page")) addPath(rest.slice(0, -"/page".length) || "/");
+    } else {
+      addPath(rest);
+    }
+  }
+  const entries = [
+    ...[...tagSet].map((v) => ["tags", v]),
+    ...[...pathSet].map((v) => ["paths", v]),
+  ];
+  const bodies = [];
+  for (let i = 0; i < entries.length; i += CDN_MAX_ENTRIES) {
+    const body = {};
+    for (const [k, v] of entries.slice(i, i + CDN_MAX_ENTRIES)) (body[k] ??= []).push(v);
+    bodies.push(body);
+  }
+  return bodies;
+}
+
+/**
+ * The revalidation hook's purge: fire-and-forget, never blocking or
+ * failing the revalidation. A 429 is retried once after its Retry-After
+ * (at most a minute); anything else that isn't a 202 is logged.
+ */
+function cdnPurger(url, trailingSlash) {
+  if (!url) return () => {};
+  const send = async (body, retried) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.body) res.body.cancel().catch(() => {});
+    if (res.status === 429 && !retried) {
+      const after = Number(res.headers.get("retry-after"));
+      const wait = Math.min(Number.isFinite(after) && after >= 0 ? after : 1, 60);
+      await new Promise((r) => setTimeout(r, wait * 1000));
+      return send(body, true);
+    }
+    if (res.status !== 202) {
+      const n = (body.tags?.length ?? 0) + (body.paths?.length ?? 0);
+      console.warn(`next-bun-compile: CDN purge of ${n} tag(s) and path(s) answered ${res.status}`);
+    }
+  };
+  return (tags) => {
+    for (const body of cdnPurgeBodies(tags, trailingSlash)) {
+      send(body, false).catch((err) =>
+        console.warn(`next-bun-compile: CDN purge failed: ${err && err.message}`)
+      );
+    }
+  };
+}
+
 const PAGE_DROP = ["edge-token", "edge-build", "accept-encoding", "cookie", "if-none-match", "accept"];
 
 /**
@@ -1239,6 +1361,11 @@ function buildEdgeRoutes({ baseDir, edge, trailingSlash, bridge }) {
 
   const headersOf = (h) => (Object.keys(h).length ? { headers: h } : {});
   const answer = { "Content-Type": "application/json", ...unstored, "Edge-Build": build };
+  // The page's Next tags, which a CDN purge names (see cdnPurger).
+  const withTags = (tags) => {
+    const tag = cdnCacheTag(tags);
+    return tag ? { ...answer, "Cache-Tag": tag } : answer;
+  };
   const shells = new Map();
   for (const s of selected.shells) {
     shells.set(
@@ -1251,12 +1378,13 @@ function buildEdgeRoutes({ baseDir, edge, trailingSlash, bridge }) {
           state: pair.postponed,
           ...headersOf(s.headers),
         }),
-        headers: answer,
+        headers: withTags(pair.tags),
       }))
     );
   }
   for (const s of selected.static) {
     const page = { path: s.path, html: s.html, stale: false };
+    const staticHeaders = withTags(s.tags);
     if (!byRoute.has(s.routePath)) byRoute.set(s.routePath, []);
     byRoute.get(s.routePath).push(page);
     for (const tag of s.tags) {
@@ -1274,7 +1402,7 @@ function buildEdgeRoutes({ baseDir, edge, trailingSlash, bridge }) {
           complete: true,
           ...headersOf(s.headers),
         }),
-        headers: answer,
+        headers: staticHeaders,
       }))
     );
   }
@@ -1727,6 +1855,7 @@ async function start(opts) {
     bridge: bridgeLazy,
   });
   const edgeControl = edgeRoutes.control;
+  const cdnPurge = cdnPurger(process.env.CDN_PURGE_URL, !!nextConfig?.trailingSlash);
   if (edgeControl.shells + edgeControl.static > 0) {
     console.log(
       `next-bun-compile: edge contract serving ${edgeControl.shells} shell(s) and ${edgeControl.static} static page(s) at /_edge/page`
@@ -1835,6 +1964,9 @@ async function start(opts) {
         try {
           onInvalidate(args[0], null);
         } catch {}
+        try {
+          cdnPurge(args[0]);
+        } catch {}
         return origRevalidateTag.apply(this, args);
       };
       const origSet = IncCache.prototype.set;
@@ -1915,4 +2047,8 @@ module.exports._internal = {
   createL1Store,
   readCgroupLimit,
   resolveL1Budget,
+  cdnTag,
+  cdnCacheTag,
+  cdnPurgeBodies,
+  cdnPurger,
 };

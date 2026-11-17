@@ -56,6 +56,18 @@ resolution for the bundled server core entirely — the code is already in the
 binary, and `--extract` can pre-materialise the runtime tree at image build so
 boot skips extraction too.
 
+## Deploying
+
+[Homeport](https://homeport.sh/) deploys Next.js and next-bun-compile apps
+without setup. It serves PPR shells and static pages from its edge through
+the [edge contract](https://ramonmalcolm10.github.io/next-bun-compile/guides/edge-ppr/),
+and purges them the moment you revalidate. See
+[Deploy with Homeport](https://ramonmalcolm10.github.io/next-bun-compile/recipes/homeport/).
+
+Prefer running it yourself? The binary needs nothing installed: see the
+[VPS](https://ramonmalcolm10.github.io/next-bun-compile/recipes/vps-deploy/)
+and [Docker](https://ramonmalcolm10.github.io/next-bun-compile/guides/docker/) guides.
+
 ## Documentation
 
 Everything else lives on the docs site, kept in sync with the code:
@@ -67,7 +79,7 @@ Everything else lives on the docs site, kept in sync with the code:
 | [How it works](https://ramonmalcolm10.github.io/next-bun-compile/how-it-works/) | Asset embedding, the extracted runtime tree, module stubs, the resolver hook. |
 | [Troubleshooting](https://ramonmalcolm10.github.io/next-bun-compile/troubleshooting/) | Dynamic `require()` (pino and friends), resolution failures, debug mode. |
 | [Guides](https://ramonmalcolm10.github.io/next-bun-compile/guides/docker/) | Docker, monorepos, cross-compilation, `transpilePackages`, edge PPR. |
-| [Recipes](https://ramonmalcolm10.github.io/next-bun-compile/recipes/vps-deploy/) | VPS deploy, distroless + sharp, monorepo + sharp. |
+| [Recipes](https://ramonmalcolm10.github.io/next-bun-compile/recipes/vps-deploy/) | Homeport, VPS deploy, distroless + sharp, monorepo + sharp. |
 
 ## Support
 

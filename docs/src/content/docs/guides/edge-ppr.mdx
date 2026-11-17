@@ -154,6 +154,35 @@ POST /_edge/resume?url=<path and query> →  the holes only (text/html)  + Edge-
   under `/_edge/` is a 404, so the endpoints are invisible wherever the
   binary runs.
 
+### Instant purge (`CDN_PURGE_URL`)
+
+An edge re-checks a stored page with its ETag, so a revalidation shows
+there on the next check. A platform that wants it at once sets
+`CDN_PURGE_URL`: every `revalidateTag` and `revalidatePath` is then
+POSTed to it as ([Homeport](https://homeport.sh/) sets it for you)
+
+```json
+{ "tags": ["posts"], "paths": ["/blog/"] }
+```
+
+- `revalidatePath('/x')` is sent as the path `/x`, in the form the app
+  serves it (with `trailingSlash`, `/x/`). A typed one,
+  `revalidatePath('/x', 'layout')`, is sent as Next's tag
+  (`_N_T_/x/layout`), which every page under `/x` carries.
+- Every `/_edge/page` answer carries the page's Next tags in
+  `Cache-Tag`, comma-separated, so the edge can tell which pages a tag
+  names. Tags are sent percent-encoded wherever they hold a space, comma
+  or non-ASCII character, the same in both places.
+- At most 100 tags and paths go in one POST; more are split over
+  several. The answer should be a 202. A 429 is retried once after its
+  `Retry-After`; anything else is logged.
+- It never holds up or fails the revalidation, and without the variable
+  nothing is sent.
+
+With more than one copy of the app, a revalidation reaches the others
+only through a shared cache handler; see
+[Custom cache handlers](/next-bun-compile/configuration/#custom-cache-handlers).
+
 The binary runs the contract's conformance script in its regression
 suite (`test/regression/edge-conformance.mjs`, kept in step with
 rsc-kit's). It checks, among the rest, that a static page is byte for

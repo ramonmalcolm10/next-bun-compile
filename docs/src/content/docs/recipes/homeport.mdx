@@ -1,0 +1,28 @@
+---
+title: Deploy with Homeport
+description: Homeport deploys Next.js and next-bun-compile apps without setup, and serves their PPR shells and static pages from its edge.
+---
+
+[Homeport](https://homeport.sh/) deploys Next.js apps, including ones
+built with next-bun-compile, without any setup on your side: no
+Dockerfile, no systemd unit, no CDN worker to write.
+
+What it does for a next-bun-compile app:
+
+- **Serves pages from its edge.** Homeport speaks the
+  [edge contract](/next-bun-compile/guides/edge-ppr/#the-edge-contract):
+  it reads the build's `edge.json`, stores the static pages and PPR
+  shells it lists, and sends only the dynamic holes to your app. It sets
+  `EDGE_TOKEN` for you.
+- **Purges on revalidation.** It sets
+  [`CDN_PURGE_URL`](/next-bun-compile/guides/edge-ppr/#instant-purge-cdn_purge_url),
+  so a `revalidateTag` or `revalidatePath` reaches the edge at once
+  instead of on its next check.
+
+Nothing in your app changes: build it as in
+[Getting started](/next-bun-compile/getting-started/), then follow
+[homeport.sh](https://homeport.sh/) to deploy it.
+
+Running more than one copy with on-demand revalidation? Give every copy
+a shared cache handler; see
+[Custom cache handlers](/next-bun-compile/configuration/#custom-cache-handlers).
