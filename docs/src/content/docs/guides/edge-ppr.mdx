@@ -112,6 +112,14 @@ runs on every page, named):
   stamps the value into the binary, so `Edge-Build` always matches the
   marker. An id outside `[A-Za-z0-9._-]`, or too long to carry the
   digest, becomes the digest alone.
+- `nonceShells`, the contract's list for shells under a nonce-based
+  Content-Security-Policy, is never written. Next owns the policy: an
+  app sets a nonce in its proxy (middleware), which keeps the pages it
+  covers off the edge like any other proxy-covered page, and a PPR
+  shell is prerendered without a nonce. Those pages are served by the
+  binary, with the nonce Next renders them with. A policy without a
+  nonce (hashes, `'self'`) set by a `headers()` rule travels with the
+  page like any other listed header.
 - `bypass` names Next's own requests on a page's path (client
   navigations, prefetches, actions, draft mode), which an edge passes to
   the origin untouched.
@@ -119,7 +127,7 @@ runs on every page, named):
 **Headers.** A page goes out with only the headers on the contract's
 list, fixed for the build: `content-language`, `link`, `cache-control`,
 `x-robots-tag`, the security headers (`content-security-policy`,
-`permissions-policy`, `referrer-policy`, `strict-transport-security`,
+`content-security-policy-report-only`, `permissions-policy`, `referrer-policy`, `strict-transport-security`,
 `x-frame-options`, `x-content-type-options`, the three `cross-origin-*`
 policies) and `x-dns-prefetch-control`, at most 16. A `headers()` rule in
 `next.config` that sets only listed headers, unconditionally, travels
@@ -153,6 +161,39 @@ POST /_edge/resume?url=<path and query> →  the holes only (text/html)  + Edge-
 - Without `EDGE_TOKEN`, or with a missing or wrong header, everything
   under `/_edge/` is a 404, so the endpoints are invisible wherever the
   binary runs.
+
+### Instant purge (`CDN_PURGE_URL`)
+
+An edge re-checks a stored page with its ETag, so a revalidation shows
+there on the next check. A platform that wants it at once sets
+`CDN_PURGE_URL`: every `revalidateTag` and `revalidatePath` is then
+POSTed to it as
+
+```json
+{ "tags": ["posts"], "paths": ["/blog/"] }
+```
+
+- `revalidatePath('/x')` is sent as the path `/x`, in the form the app
+  serves it (with `trailingSlash`, `/x/`). A typed one,
+  `revalidatePath('/x', 'layout')`, is sent as Next's tag
+  (`_N_T_/x/layout`), which every page under `/x` carries.
+- Every `/_edge/page` answer carries the page's Next tags in
+  `Cache-Tag`, comma-separated, so the edge can tell which pages a tag
+  names. Tags are sent percent-encoded wherever they hold a space, comma
+  or non-ASCII character, the same in both places.
+- At most 100 tags and paths go in one POST; more are split over
+  several. The answer should be a 202. A 429 is retried once after its
+  `Retry-After`; anything else is logged.
+- It never holds up or fails the revalidation, and without the variable
+  nothing is sent.
+
+Any platform or CDN can provide the endpoint; [Homeport](https://homeport.sh/)
+is one that sets it for you
+([details](/next-bun-compile/recipes/homeport/)).
+
+With more than one copy of the app, a revalidation reaches the others
+only through a shared cache handler; see
+[Custom cache handlers](/next-bun-compile/configuration/#custom-cache-handlers).
 
 The binary runs the contract's conformance script in its regression
 suite (`test/regression/edge-conformance.mjs`, kept in step with

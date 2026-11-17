@@ -322,7 +322,11 @@ echo "== edge contract (/_edge, edge.json) =="
 # it reads only the marker and speaks only the contract's endpoints, so
 # passing here is passing for any edge that runs it.
 TOKEN=$(openssl rand -hex 32)
-boot "$APP" EDGE_TOKEN="$TOKEN"
+# A stand-in for a platform's purge endpoint: it records each POST body.
+PURGE_PORT=$((PORT+1)); PURGES="$WORK/purges.jsonl"; : >"$PURGES"
+bun -e "Bun.serve({port:$PURGE_PORT, async fetch(r){require('fs').appendFileSync('$PURGES', JSON.stringify(await r.json())+'\n'); return new Response(null,{status:202})}})" &
+PURGE_PID=$!
+boot "$APP" EDGE_TOKEN="$TOKEN" CDN_PURGE_URL="http://127.0.0.1:$PURGE_PORT/purge"
 expect "marker lists /ppr, never the proxy-covered /ppr-guarded" python3 -c "
 import json
 m = json.load(open('$APP/dist/edge.json'))
@@ -349,8 +353,16 @@ expect "a static page has no resume" test "$(code_of -X POST -H "Edge-Token: $TO
 expect "an unknown /_edge/ path is a 404 even with the token" test "$(code_of -H "Edge-Token: $TOKEN" http://127.0.0.1:$PORT/_edge/x)" = "404"
 expect_sh "a 404 under /_edge/ is private, no-store" "curl -s -D- -o /dev/null http://127.0.0.1:$PORT/_edge/x | tr -d '\r' | grep -qi '^cache-control: private, no-store'"
 expect "a GET to the resume endpoint is a 404" test "$(code_of -H "Edge-Token: $TOKEN" "http://127.0.0.1:$PORT/_edge/resume?url=%2Fppr")" = "404"
+expect_sh "a static page's answer carries its Next tags in Cache-Tag" "curl -s -D- -o /dev/null -H 'Edge-Token: $TOKEN' 'http://127.0.0.1:$PORT/_edge/page?path=%2F' | tr -d '\r' | grep -i '^cache-tag:' | grep -q '_N_T_/,'"
+expect_sh "a shell's answer carries its cacheTag in Cache-Tag" "curl -s -D- -o /dev/null -H 'Edge-Token: $TOKEN' 'http://127.0.0.1:$PORT/_edge/page?path=%2Fppr-cached' | tr -d '\r' | grep -i '^cache-tag:' | grep -q 'ppr-shell-demo'"
 curl -s -o /dev/null -X POST http://127.0.0.1:$PORT/api/revalidate-path
 expect_sh "a revalidated static page is re-rendered, still whole" "curl -s -H 'Edge-Token: $TOKEN' 'http://127.0.0.1:$PORT/_edge/page?path=%2F' | python3 -c 'import json,sys; m=json.load(sys.stdin); assert m[\"complete\"] is True and m[\"state\"] == \"\" and \"vps-deploy example\" in m[\"html\"], m'"
+sleep 0.5
+expect_sh "revalidatePath('/') is purged as the path /" "grep -q '\"paths\":\\[\"/\"\\]' '$PURGES'"
+curl -s -o /dev/null -X POST http://127.0.0.1:$PORT/api/revalidate-shell
+sleep 0.5
+expect_sh "revalidateTag is purged as the tag" "grep -q '\"tags\":\\[\"ppr-shell-demo\"\\]' '$PURGES'"
+kill "$PURGE_PID" 2>/dev/null || true
 expect "v1's endpoints are gone" test "$(code_of -H "PPR-Token: $TOKEN" "http://127.0.0.1:$PORT/_ppr/shell?path=%2Fppr")" = "404"
 shutdown_server
 

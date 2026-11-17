@@ -1,0 +1,44 @@
+---
+title: Deploy with Homeport
+description: One way to deploy — Homeport runs Next.js and next-bun-compile apps without setup and serves their PPR shells and static pages from its edge.
+---
+
+A next-bun-compile binary runs anywhere: a VPS, a container platform,
+Kubernetes, your own hardware. The [VPS](/next-bun-compile/recipes/vps-deploy/)
+and [Docker](/next-bun-compile/guides/docker/) guides cover running it
+yourself. Nothing in the package depends on any host.
+
+[Homeport](https://homeport.sh/) is one hosted option, made by the same
+author. It deploys Next.js apps, including ones built with
+next-bun-compile, with no Dockerfile, no systemd unit and no CDN worker
+to write. Your app doesn't change: build it as in
+[Getting started](/next-bun-compile/getting-started/), then follow
+[homeport.sh](https://homeport.sh/) to deploy it.
+
+## What it does for the binary
+
+- **Serves pages from its edge.** Homeport speaks the
+  [edge contract](/next-bun-compile/guides/edge-ppr/#the-edge-contract):
+  it reads the build's `edge.json`, stores the static pages and PPR
+  shells it lists, and sends only the dynamic holes to your app.
+- **Purges on revalidation.** A `revalidateTag` or `revalidatePath`
+  reaches the edge at once through
+  [`CDN_PURGE_URL`](/next-bun-compile/guides/edge-ppr/#instant-purge-cdn_purge_url),
+  instead of on its next check.
+
+On Homeport you don't set either variable:
+
+- **`EDGE_TOKEN`**: Homeport creates one for your app on its first
+  release whose `edge.json` lists pages. It keeps the same token across
+  releases and shows it in your app's variables. If you set your own,
+  Homeport keeps yours; it must be 32–128 lowercase hex characters, or
+  the edge won't serve your pages and every request goes to the app.
+- **`CDN_PURGE_URL`**: Homeport gives it to every process when it starts
+  (web, workers, cron and the release step), as a private address only
+  your app can reach. It isn't stored in your variables. Apps served
+  under a path prefix, or with no domain, don't get one; the binary then
+  skips the purge without an error.
+
+Running more than one copy with on-demand revalidation? Give every copy
+a shared cache handler; see
+[Custom cache handlers](/next-bun-compile/configuration/#custom-cache-handlers).
