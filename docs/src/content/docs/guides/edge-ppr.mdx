@@ -112,6 +112,14 @@ runs on every page, named):
   stamps the value into the binary, so `Edge-Build` always matches the
   marker. An id outside `[A-Za-z0-9._-]`, or too long to carry the
   digest, becomes the digest alone.
+- `nonceShells`, the contract's list for shells under a nonce-based
+  Content-Security-Policy, is never written. Next owns the policy: an
+  app sets a nonce in its proxy (middleware), which keeps the pages it
+  covers off the edge like any other proxy-covered page, and a PPR
+  shell is prerendered without a nonce. Those pages are served by the
+  binary, with the nonce Next renders them with. A policy without a
+  nonce (hashes, `'self'`) set by a `headers()` rule travels with the
+  page like any other listed header.
 - `bypass` names Next's own requests on a page's path (client
   navigations, prefetches, actions, draft mode), which an edge passes to
   the origin untouched.
@@ -119,7 +127,7 @@ runs on every page, named):
 **Headers.** A page goes out with only the headers on the contract's
 list, fixed for the build: `content-language`, `link`, `cache-control`,
 `x-robots-tag`, the security headers (`content-security-policy`,
-`permissions-policy`, `referrer-policy`, `strict-transport-security`,
+`content-security-policy-report-only`, `permissions-policy`, `referrer-policy`, `strict-transport-security`,
 `x-frame-options`, `x-content-type-options`, the three `cross-origin-*`
 policies) and `x-dns-prefetch-control`, at most 16. A `headers()` rule in
 `next.config` that sets only listed headers, unconditionally, travels

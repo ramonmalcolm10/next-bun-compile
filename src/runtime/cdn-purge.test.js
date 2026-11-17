@@ -85,3 +85,10 @@ test("without CDN_PURGE_URL nothing is sent", async () => {
   await Bun.sleep(50);
   expect(s.seen.length).toBe(0);
 });
+
+test("a report-only policy may travel with an edge page", () => {
+  const { edgeHeaderRuleOk } = require("./serve.js");
+  expect(
+    edgeHeaderRuleOk({ headers: { "Content-Security-Policy-Report-Only": "default-src 'self'" } })
+  ).toBe(true);
+});

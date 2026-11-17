@@ -882,6 +882,7 @@ const EDGE_HEADERS = [
   "cache-control",
   "x-robots-tag",
   "content-security-policy",
+  "content-security-policy-report-only",
   "permissions-policy",
   "referrer-policy",
   "strict-transport-security",
