@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, join } from "node:path";
+import path, { dirname, isAbsolute, join, parse } from "node:path";
 import {
   buildEdgeMarker,
   EDGE_MARKER_FILE,
@@ -83,6 +83,36 @@ export function resolveExtraArgs(
 }
 
 /**
+ * Maps a file emitted by nodeFileTrace (relative to the trace root) to its
+ * source path on disk and destination path under standaloneDir.
+ *
+ * Re-anchors at the first node_modules segment so hoisted-store and
+ * monorepo layouts all land under the tree's own node_modules root.
+ * On Windows, paths from nodeFileTrace contain backslashes and the drive
+ * root (e.g. C:\) must be joined properly. Null for a file outside
+ * node_modules, or one whose destination would leave standaloneDir.
+ */
+export function resolveServerRuntimePath(
+  file: string,
+  root: string,
+  standaloneDir: string,
+  pathImpl = path
+): { src: string; dest: string } | null {
+  // Resolved, not joined: a path nft hands back absolute (another drive)
+  // stays as it is instead of being glued under root.
+  const src = pathImpl.resolve(root, file);
+  const normalized = src.replace(/\\/g, "/");
+  // A whole segment: "my_node_modules/" is not where a package tree starts.
+  const idx = normalized.indexOf("/node_modules/");
+  if (idx === -1) return null;
+  const dest = pathImpl.join(standaloneDir, normalized.slice(idx + 1));
+  // Files are copied here at build time; never outside the tree.
+  const rel = pathImpl.relative(standaloneDir, dest);
+  if (!rel || rel.startsWith("..") || pathImpl.isAbsolute(rel)) return null;
+  return { src, dest };
+}
+
+/**
  * The server orchestration graph the runtime boots (router-server →
  * next-server chain) is loaded at runtime from the extracted tree via
  * computed requires — the bundler never sees it, so no framework code is
@@ -108,8 +138,9 @@ async function ensureServerRuntime(
       "next/dist/server/lib/incremental-cache/file-system-cache.js"
     ),
   ];
+  const root = parse(path.resolve(projectDir)).root;
   const { fileList } = await nodeFileTrace(entries, {
-    base: "/",
+    base: root,
     ignore: [
       "**/*.d.ts",
       "**/*.map",
@@ -126,12 +157,9 @@ async function ensureServerRuntime(
 
   let copied = 0;
   for (const f of fileList) {
-    const src = "/" + f;
-    // Re-anchor at the first node_modules segment so hoisted-store and
-    // monorepo layouts all land under the tree's own node_modules root.
-    const idx = src.indexOf("/node_modules/");
-    if (idx === -1) continue;
-    const dest = join(standaloneDir, src.slice(idx + 1));
+    const target = resolveServerRuntimePath(f, root, standaloneDir);
+    if (!target) continue;
+    const { src, dest } = target;
     try {
       if (statSync(src).isDirectory()) continue;
     } catch {

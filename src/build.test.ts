@@ -1,5 +1,10 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { resolveExtraArgs, resolveOutfile } from "./build.js";
+import path from "node:path";
+import {
+  resolveExtraArgs,
+  resolveOutfile,
+  resolveServerRuntimePath,
+} from "./build.js";
 
 const original = process.env.NBC_BUILD_ARGS;
 
@@ -96,5 +101,68 @@ describe("resolveOutfile", () => {
     expect(resolveOutfile("/proj", { out: ".", binaryName: "server" })).toBe(
       "/proj/server"
     );
+  });
+});
+
+describe("resolveServerRuntimePath", () => {
+  test("re-anchors Windows traced files under standaloneDir preserving drive root", () => {
+    const res = resolveServerRuntimePath(
+      "Users\\user\\project\\node_modules\\next\\dist\\server\\lib\\router-server.js",
+      "C:\\",
+      "C:\\standalone",
+      path.win32
+    );
+    expect(res).toEqual({
+      src: "C:\\Users\\user\\project\\node_modules\\next\\dist\\server\\lib\\router-server.js",
+      dest: "C:\\standalone\\node_modules\\next\\dist\\server\\lib\\router-server.js",
+    });
+  });
+
+  test("re-anchors hoisted monorepo node_modules on Windows", () => {
+    const res = resolveServerRuntimePath(
+      "repo\\packages\\app\\node_modules\\.pnpm\\next@16.2.7\\node_modules\\next\\dist\\server.js",
+      "C:\\",
+      "C:\\repo\\apps\\web\\.next\\standalone",
+      path.win32
+    );
+    expect(res?.dest).toBe(
+      "C:\\repo\\apps\\web\\.next\\standalone\\node_modules\\.pnpm\\next@16.2.7\\node_modules\\next\\dist\\server.js"
+    );
+  });
+
+  test("re-anchors a POSIX trace path", () => {
+    expect(
+      resolveServerRuntimePath(
+        "srv/mono/node_modules/.bun/next@16/node_modules/next/dist/server/lib/router-server.js",
+        "/",
+        "/srv/mono/offline-ui/.next/standalone",
+        path.posix
+      )
+    ).toEqual({
+      src: "/srv/mono/node_modules/.bun/next@16/node_modules/next/dist/server/lib/router-server.js",
+      dest: "/srv/mono/offline-ui/.next/standalone/node_modules/.bun/next@16/node_modules/next/dist/server/lib/router-server.js",
+    });
+  });
+
+  test("keeps a path nft returns on another drive", () => {
+    expect(
+      resolveServerRuntimePath("D:\\cache\\node_modules\\next\\index.js", "C:\\", "C:\\standalone", path.win32)
+    ).toEqual({
+      src: "D:\\cache\\node_modules\\next\\index.js",
+      dest: "C:\\standalone\\node_modules\\next\\index.js",
+    });
+  });
+
+  test("node_modules must be a whole path segment", () => {
+    expect(
+      resolveServerRuntimePath("proj\\my_node_modules\\x.js", "C:\\", "C:\\standalone", path.win32)
+    ).toBeNull();
+    expect(resolveServerRuntimePath("proj\\app\\page.js", "C:\\", "C:\\standalone", path.win32)).toBeNull();
+  });
+
+  test("never writes outside the tree", () => {
+    expect(
+      resolveServerRuntimePath("proj/node_modules/../../../etc/passwd", "/", "/srv/standalone", path.posix)
+    ).toBeNull();
   });
 });
