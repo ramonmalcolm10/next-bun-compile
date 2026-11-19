@@ -89,7 +89,8 @@ export function resolveExtraArgs(
  * Re-anchors at the first node_modules segment so hoisted-store and
  * monorepo layouts all land under the tree's own node_modules root.
  * On Windows, paths from nodeFileTrace contain backslashes and the drive
- * root (e.g. C:\) must be joined properly.
+ * root (e.g. C:\) must be joined properly. Null for a file outside
+ * node_modules, or one whose destination would leave standaloneDir.
  */
 export function resolveServerRuntimePath(
   file: string,
@@ -97,13 +98,18 @@ export function resolveServerRuntimePath(
   standaloneDir: string,
   pathImpl = path
 ): { src: string; dest: string } | null {
-  const normalized = file.replace(/\\/g, "/");
-  const idx = normalized.indexOf("node_modules/");
+  // Resolved, not joined: a path nft hands back absolute (another drive)
+  // stays as it is instead of being glued under root.
+  const src = pathImpl.resolve(root, file);
+  const normalized = src.replace(/\\/g, "/");
+  // A whole segment: "my_node_modules/" is not where a package tree starts.
+  const idx = normalized.indexOf("/node_modules/");
   if (idx === -1) return null;
-  return {
-    dest: pathImpl.join(standaloneDir, normalized.slice(idx)),
-    src: pathImpl.join(root, file),
-  };
+  const dest = pathImpl.join(standaloneDir, normalized.slice(idx + 1));
+  // Files are copied here at build time; never outside the tree.
+  const rel = pathImpl.relative(standaloneDir, dest);
+  if (!rel || rel.startsWith("..") || pathImpl.isAbsolute(rel)) return null;
+  return { src, dest };
 }
 
 /**
@@ -132,7 +138,7 @@ async function ensureServerRuntime(
       "next/dist/server/lib/incremental-cache/file-system-cache.js"
     ),
   ];
-  const root = parse(projectDir).root;
+  const root = parse(path.resolve(projectDir)).root;
   const { fileList } = await nodeFileTrace(entries, {
     base: root,
     ignore: [

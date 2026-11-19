@@ -129,4 +129,40 @@ describe("resolveServerRuntimePath", () => {
       "C:\\repo\\apps\\web\\.next\\standalone\\node_modules\\.pnpm\\next@16.2.7\\node_modules\\next\\dist\\server.js"
     );
   });
+
+  test("re-anchors a POSIX trace path", () => {
+    expect(
+      resolveServerRuntimePath(
+        "srv/mono/node_modules/.bun/next@16/node_modules/next/dist/server/lib/router-server.js",
+        "/",
+        "/srv/mono/offline-ui/.next/standalone",
+        path.posix
+      )
+    ).toEqual({
+      src: "/srv/mono/node_modules/.bun/next@16/node_modules/next/dist/server/lib/router-server.js",
+      dest: "/srv/mono/offline-ui/.next/standalone/node_modules/.bun/next@16/node_modules/next/dist/server/lib/router-server.js",
+    });
+  });
+
+  test("keeps a path nft returns on another drive", () => {
+    expect(
+      resolveServerRuntimePath("D:\\cache\\node_modules\\next\\index.js", "C:\\", "C:\\standalone", path.win32)
+    ).toEqual({
+      src: "D:\\cache\\node_modules\\next\\index.js",
+      dest: "C:\\standalone\\node_modules\\next\\index.js",
+    });
+  });
+
+  test("node_modules must be a whole path segment", () => {
+    expect(
+      resolveServerRuntimePath("proj\\my_node_modules\\x.js", "C:\\", "C:\\standalone", path.win32)
+    ).toBeNull();
+    expect(resolveServerRuntimePath("proj\\app\\page.js", "C:\\", "C:\\standalone", path.win32)).toBeNull();
+  });
+
+  test("never writes outside the tree", () => {
+    expect(
+      resolveServerRuntimePath("proj/node_modules/../../../etc/passwd", "/", "/srv/standalone", path.posix)
+    ).toBeNull();
+  });
 });
