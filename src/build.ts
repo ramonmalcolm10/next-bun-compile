@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, join } from "node:path";
+import path, { dirname, isAbsolute, join, parse } from "node:path";
 import {
   buildEdgeMarker,
   EDGE_MARKER_FILE,
@@ -83,6 +83,30 @@ export function resolveExtraArgs(
 }
 
 /**
+ * Maps a file emitted by nodeFileTrace (relative to the trace root) to its
+ * source path on disk and destination path under standaloneDir.
+ *
+ * Re-anchors at the first node_modules segment so hoisted-store and
+ * monorepo layouts all land under the tree's own node_modules root.
+ * On Windows, paths from nodeFileTrace contain backslashes and the drive
+ * root (e.g. C:\) must be joined properly.
+ */
+export function resolveServerRuntimePath(
+  file: string,
+  root: string,
+  standaloneDir: string,
+  pathImpl = path
+): { src: string; dest: string } | null {
+  const normalized = file.replace(/\\/g, "/");
+  const idx = normalized.indexOf("node_modules/");
+  if (idx === -1) return null;
+  return {
+    dest: pathImpl.join(standaloneDir, normalized.slice(idx)),
+    src: pathImpl.join(root, file),
+  };
+}
+
+/**
  * The server orchestration graph the runtime boots (router-server →
  * next-server chain) is loaded at runtime from the extracted tree via
  * computed requires — the bundler never sees it, so no framework code is
@@ -108,8 +132,9 @@ async function ensureServerRuntime(
       "next/dist/server/lib/incremental-cache/file-system-cache.js"
     ),
   ];
+  const root = parse(projectDir).root;
   const { fileList } = await nodeFileTrace(entries, {
-    base: "/",
+    base: root,
     ignore: [
       "**/*.d.ts",
       "**/*.map",
@@ -126,12 +151,9 @@ async function ensureServerRuntime(
 
   let copied = 0;
   for (const f of fileList) {
-    const src = "/" + f;
-    // Re-anchor at the first node_modules segment so hoisted-store and
-    // monorepo layouts all land under the tree's own node_modules root.
-    const idx = src.indexOf("/node_modules/");
-    if (idx === -1) continue;
-    const dest = join(standaloneDir, src.slice(idx + 1));
+    const target = resolveServerRuntimePath(f, root, standaloneDir);
+    if (!target) continue;
+    const { src, dest } = target;
     try {
       if (statSync(src).isDirectory()) continue;
     } catch {

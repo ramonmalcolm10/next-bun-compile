@@ -1,5 +1,10 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { resolveExtraArgs, resolveOutfile } from "./build.js";
+import path from "node:path";
+import {
+  resolveExtraArgs,
+  resolveOutfile,
+  resolveServerRuntimePath,
+} from "./build.js";
 
 const original = process.env.NBC_BUILD_ARGS;
 
@@ -95,6 +100,33 @@ describe("resolveOutfile", () => {
     // Documented escape hatch for anyone whose deploy scripts expect it.
     expect(resolveOutfile("/proj", { out: ".", binaryName: "server" })).toBe(
       "/proj/server"
+    );
+  });
+});
+
+describe("resolveServerRuntimePath", () => {
+  test("re-anchors Windows traced files under standaloneDir preserving drive root", () => {
+    const res = resolveServerRuntimePath(
+      "Users\\user\\project\\node_modules\\next\\dist\\server\\lib\\router-server.js",
+      "C:\\",
+      "C:\\standalone",
+      path.win32
+    );
+    expect(res).toEqual({
+      src: "C:\\Users\\user\\project\\node_modules\\next\\dist\\server\\lib\\router-server.js",
+      dest: "C:\\standalone\\node_modules\\next\\dist\\server\\lib\\router-server.js",
+    });
+  });
+
+  test("re-anchors hoisted monorepo node_modules on Windows", () => {
+    const res = resolveServerRuntimePath(
+      "repo\\packages\\app\\node_modules\\.pnpm\\next@16.2.7\\node_modules\\next\\dist\\server.js",
+      "C:\\",
+      "C:\\repo\\apps\\web\\.next\\standalone",
+      path.win32
+    );
+    expect(res?.dest).toBe(
+      "C:\\repo\\apps\\web\\.next\\standalone\\node_modules\\.pnpm\\next@16.2.7\\node_modules\\next\\dist\\server.js"
     );
   });
 });
