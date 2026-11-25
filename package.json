@@ -19,7 +19,7 @@
     "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
     "test:regression": "bun run build && bash test/regression/run.sh",
-    "postinstall": "bun -e \"try{require('fs').symlinkSync('..','node_modules/next-bun-compile')}catch{}\""
+    "prepare": "bun -e \"try{require('fs').symlinkSync('..','node_modules/next-bun-compile')}catch{}\""
   },
   "peerDependencies": {
     "next": ">=16.2.0"
