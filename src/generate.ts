@@ -1054,7 +1054,7 @@ function computeStaticTiers(args: {
   const snapshot = readAdapterSnapshot(distDir);
   if (!snapshot) {
     throw new Error(
-      "next-bun-compile: adapter outputs not found for this build. Build through the adapter: set `adapterPath: \"next-bun-compile/adapter\"` in next.config (or NEXT_ADAPTER_PATH=next-bun-compile/adapter) and run `next build`."
+      "next-bun-compile: adapter outputs not found for this build. Build through the adapter: set `adapterPath: \"next-bun-compile\"` in next.config (or NEXT_ADAPTER_PATH=next-bun-compile) and run `next build`."
     );
   }
   return computeStaticTiersFromSnapshot(snapshot, {
@@ -1326,9 +1326,12 @@ export function generateEntryPoint(options: GenerateOptions): string {
       "/"
     );
     imports.push(
-      `import ${varName} from "./${importPath}" with { type: "file" };`
+      `import ${varName} from ${JSON.stringify("./" + importPath)} with { type: "file" };`
     );
-    mapEntries.push(`  ["${asset.urlPath}", ${varName}],`);
+    // JSON-encoded: urlPath and importPath come from file names (public/
+    // included), and a quote or backslash in one must not break — or
+    // inject into — the generated module.
+    mapEntries.push(`  [${JSON.stringify(asset.urlPath)}, ${varName}],`);
   }
 
   writeFileSync(

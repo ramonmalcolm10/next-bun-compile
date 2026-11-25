@@ -266,6 +266,38 @@ describe("generateEntryPoint", () => {
     ).toThrow("adapter outputs not found");
   });
 
+  test("missing-adapter error points at a specifier the package exports", () => {
+    const root = join(tmpBase, "missing-hint");
+    const distDir = join(root, ".next");
+    const standaloneDir = join(distDir, "standalone");
+
+    scaffold(root, {
+      ".next/required-server-files.json": MOCK_RSF,
+      ".next/BUILD_ID": "test-build-id",
+      ".next/standalone/.next/BUILD_ID": "test-build-id",
+      ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+    });
+
+    let message = "";
+    try {
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    // Every specifier the hint names must resolve through package.json
+    // "exports" — following the hint must not end in MODULE_NOT_FOUND.
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8")
+    );
+    const named = [...message.matchAll(/next-bun-compile(\/[\w./-]+)?/g)].map(
+      (m) => "." + (m[1] ?? "")
+    );
+    expect(named.length).toBeGreaterThan(0);
+    for (const subpath of named) {
+      expect(Object.keys(pkg.exports)).toContain(subpath);
+    }
+  });
+
   test("throws when adapter outputs are from a previous build", () => {
     const root = join(tmpBase, "stale");
     const distDir = join(root, ".next");
@@ -1143,6 +1175,44 @@ describe("generateEntryPoint", () => {
     expect(entry).toContain("gzippedAssets");
     expect(entry).toContain("gunzipSync");
   });
+});
+
+describe("generateEntryPoint: file names in generated code", () => {
+  // A quote can't appear in a Windows file name. (Backslashes never reach
+  // the generated code: paths are normalised to "/" first.)
+  test.skipIf(process.platform === "win32")(
+    "a public file name with quotes is JSON-encoded, not injected",
+    () => {
+      const root = join(tmpBase, "hostile-names");
+      const distDir = join(root, ".next");
+      const standaloneDir = join(distDir, "standalone");
+      const injected = 'x",globalThis.__nbcPwned=1,"y.txt';
+
+      scaffold(root, {
+        ".next/required-server-files.json": MOCK_RSF,
+        ".next/BUILD_ID": "test-build-id",
+        ".next/nbc-adapter-outputs.json": mockSnapshot(),
+        ".next/standalone/server.js": MOCK_SERVER_JS,
+        ".next/standalone/.next/BUILD_ID": "test-build-id",
+        ".next/standalone/.next/server/chunks/ssr.js": `// no externals`,
+        ".next/standalone/node_modules/next/package.json": MOCK_NEXT_PKG,
+        ".next/standalone/node_modules/next/dist/server/require-hook.js": MOCK_REQUIRE_HOOK,
+        [`public/${injected}`]: "a",
+      });
+
+      generateEntryPoint({ standaloneDir, serverDir: standaloneDir, distDir, projectDir: root });
+      const assets = readFileSync(join(standaloneDir, "assets.generated.js"), "utf-8");
+
+      // Still a valid module (scan throws on a syntax error), and each
+      // import specifier is the real file, not a truncated fragment.
+      const { imports } = new Bun.Transpiler({ loader: "js" }).scan(assets);
+      expect(imports.some((i) => i.path.endsWith(`/public/${injected}`))).toBe(true);
+
+      // The map keys are the URL paths, encoded as string literals.
+      expect(assets).toContain(JSON.stringify(`/${injected}`));
+      expect(assets).not.toContain(`["/${injected}"`);
+    }
+  );
 });
 
 describe("shouldCompressEmbeddedAsset", () => {
